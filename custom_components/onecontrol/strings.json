@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Select OneControl Gateway",
+        "description": "Choose a discovered OneControl BLE gateway to set up.",
+        "data": {
+          "address": "Gateway"
+        }
+      },
+      "confirm": {
+        "title": "Configure {name}",
+        "description": "Enter the 6-digit PIN from the sticker on your OneControl gateway.",
+        "data": {
+          "gateway_pin": "Gateway PIN",
+          "bluetooth_pin": "Bluetooth PIN (legacy gateways only)"
+        }
+      }
+    },
+    "error": {
+      "invalid_pin": "PIN must be exactly 6 digits"
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured",
+      "no_devices_found": "No OneControl gateways found. Make sure Bluetooth is enabled and the gateway is powered on."
+    }
+  }
+}
