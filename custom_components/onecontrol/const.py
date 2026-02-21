@@ -17,6 +17,9 @@ DATA_SERVICE_UUID = f"00000030{UUID_BASE}"
 DATA_WRITE_CHAR_UUID = f"00000033{UUID_BASE}"
 DATA_READ_CHAR_UUID = f"00000034{UUID_BASE}"
 
+CAN_SERVICE_UUID = f"00000000{UUID_BASE}"
+CAN_WRITE_CHAR_UUID = f"00000001{UUID_BASE}"
+
 DISCOVERY_SERVICE_UUID = f"00000041{UUID_BASE}"
 
 # ---------------------------------------------------------------------------
@@ -28,10 +31,10 @@ LIPPERT_MANUFACTURER_ID = 0x0499  # 1177 decimal — Lippert Components
 # TEA Encryption Constants
 # ---------------------------------------------------------------------------
 TEA_DELTA: int = 0x9E3779B9
-TEA_CONSTANT_1: int = 0x43729561  # 1131376761
-TEA_CONSTANT_2: int = 0x7265746E  # 1919510376
-TEA_CONSTANT_3: int = 0x7421ED44  # 1948272964
-TEA_CONSTANT_4: int = 0x5378A963  # 1400073827
+TEA_CONSTANT_1: int = 0x436F7079  # 1131376761
+TEA_CONSTANT_2: int = 0x72696768  # 1919510376
+TEA_CONSTANT_3: int = 0x74204944  # 1948272964
+TEA_CONSTANT_4: int = 0x53736E63  # 1400073827
 TEA_ROUNDS: int = 32
 
 # Cipher for Step 1 (UNLOCK_STATUS / Data Service auth) — no PIN
@@ -52,6 +55,11 @@ AUTH_TIMEOUT = 10.0
 UNLOCK_VERIFY_DELAY = 0.5
 NOTIFICATION_ENABLE_DELAY = 0.2
 BLE_MTU_SIZE = 185
+HEARTBEAT_INTERVAL = 5.0  # GetDevices keepalive (Android: 5000ms)
+LOCKOUT_CLEAR_THROTTLE = 5.0  # Minimum time between lockout clear attempts
+RECONNECT_BACKOFF_BASE = 5.0  # Initial reconnect delay (doubles per failure)
+RECONNECT_BACKOFF_CAP = 120.0  # Maximum reconnect delay
+STALE_CONNECTION_TIMEOUT = 300.0  # 5 min without events → force reconnect
 
 # ---------------------------------------------------------------------------
 # Event Types (MyRvLink Protocol — first byte of decoded COBS frame)
@@ -75,6 +83,48 @@ EVENT_LEVELER = 0x10
 EVENT_SESSION_STATUS = 0x1A
 EVENT_TANK_SENSOR_V2 = 0x1B
 EVENT_REAL_TIME_CLOCK = 0x20
+
+# ---------------------------------------------------------------------------
+# Command Types (for outbound command builder)
+# ---------------------------------------------------------------------------
+CMD_GET_DEVICES = 0x01
+CMD_GET_DEVICES_METADATA = 0x02
+CMD_ACTION_SWITCH = 0x40
+CMD_ACTION_HBRIDGE = 0x41
+CMD_ACTION_GENERATOR = 0x42
+CMD_ACTION_DIMMABLE = 0x43
+CMD_ACTION_RGB = 0x44
+CMD_ACTION_HVAC = 0x45
+
+# ---------------------------------------------------------------------------
+# HVAC mode constants (from INTERNALS.md § HVAC Command)
+# ---------------------------------------------------------------------------
+HVAC_MODE_OFF = 0
+HVAC_MODE_HEAT = 1
+HVAC_MODE_COOL = 2
+HVAC_MODE_HEAT_COOL = 3
+HVAC_MODE_SCHEDULE = 4
+
+HVAC_SOURCE_GAS = 0
+HVAC_SOURCE_HEAT_PUMP = 1
+
+HVAC_FAN_AUTO = 0
+HVAC_FAN_HIGH = 1
+HVAC_FAN_LOW = 2
+
+# ---------------------------------------------------------------------------
+# Cover status byte values (state-only, no commands — INTERNALS.md § Cover)
+# ---------------------------------------------------------------------------
+COVER_STOPPED = 0xC0
+COVER_OPENING = 0xC2
+COVER_CLOSING = 0xC3
+
+# ---------------------------------------------------------------------------
+# Metadata protocol constants (INTERNALS.md § Device Metadata Retrieval)
+# ---------------------------------------------------------------------------
+METADATA_PROTOCOL_HOST = 1
+METADATA_PROTOCOL_IDS_CAN = 2
+METADATA_PAYLOAD_SIZE_FULL = 17
 
 # ---------------------------------------------------------------------------
 # Config entry data keys

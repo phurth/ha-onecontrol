@@ -12,7 +12,14 @@ from .coordinator import OneControlCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[str] = ["sensor"]
+PLATFORMS: list[str] = [
+    "binary_sensor",
+    "button",
+    "climate",
+    "light",
+    "sensor",
+    "switch",
+]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
