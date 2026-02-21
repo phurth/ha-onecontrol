@@ -119,7 +119,8 @@ async def async_get_config_entry_diagnostics(
     covers = {}
     for key, cover in coordinator.covers.items():
         covers[key] = {
-            "status_byte": cover.status_byte,
+            "status": cover.status,
+            "position": cover.position,
             "name": coordinator.device_name(cover.table_id, cover.device_id),
         }
 
