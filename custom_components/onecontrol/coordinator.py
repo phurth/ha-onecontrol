@@ -665,27 +665,35 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, RelayStatus):
             key = _device_key(event.table_id, event.device_id)
             self.relays[key] = event
-            # Fire HA event for DTC faults (only on change)
+            # Fire HA event for DTC faults (only on change, gas appliances only)
+            # Android behaviour: only publish DTC for devices with "gas" in name
             prev_dtc = self._last_dtc_codes.get(key, 0)
             self._last_dtc_codes[key] = event.dtc_code
             if event.dtc_code != prev_dtc and event.dtc_code and dtc_is_fault(event.dtc_code):
                 device_name = self.device_name(event.table_id, event.device_id)
                 dtc_name = dtc_get_name(event.dtc_code)
-                _LOGGER.warning(
-                    "DTC fault on %s: code=%d (%s)",
-                    device_name, event.dtc_code, dtc_name,
-                )
-                self.hass.bus.async_fire(
-                    "onecontrol_dtc_fault",
-                    {
-                        "device_key": key,
-                        "device_name": device_name,
-                        "dtc_code": event.dtc_code,
-                        "dtc_name": dtc_name,
-                        "table_id": event.table_id,
-                        "device_id": event.device_id,
-                    },
-                )
+                is_gas = "gas" in device_name.lower()
+                if is_gas:
+                    _LOGGER.warning(
+                        "DTC fault on %s: code=%d (%s)",
+                        device_name, event.dtc_code, dtc_name,
+                    )
+                    self.hass.bus.async_fire(
+                        "onecontrol_dtc_fault",
+                        {
+                            "device_key": key,
+                            "device_name": device_name,
+                            "dtc_code": event.dtc_code,
+                            "dtc_name": dtc_name,
+                            "table_id": event.table_id,
+                            "device_id": event.device_id,
+                        },
+                    )
+                else:
+                    _LOGGER.debug(
+                        "DTC on %s (non-gas, ignored): code=%d (%s)",
+                        device_name, event.dtc_code, dtc_name,
+                    )
 
         elif isinstance(event, DimmableLight):
             key = _device_key(event.table_id, event.device_id)
