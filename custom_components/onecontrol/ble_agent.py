@@ -83,46 +83,69 @@ if _DBUS_AVAILABLE:
         @method()  # type: ignore[misc]
         def RequestPinCode(self, device: "o") -> "s":  # type: ignore[name-defined]  # noqa: N802, F821
             """Legacy PIN code request (string)."""
-            _LOGGER.info("PIN Agent: RequestPinCode for %s → providing", device)
+            _LOGGER.info(
+                "PIN Agent: RequestPinCode for %s — providing %d-char string PIN "
+                "(BlueZ chose STRING pin path)",
+                device, len(self._pin_code),
+            )
             self._responded = True
             return self._pin_code
 
         @method()  # type: ignore[misc]
         def RequestPasskey(self, device: "o") -> "u":  # type: ignore[name-defined]  # noqa: N802, F821
             """Numeric passkey request (uint32)."""
-            _LOGGER.info("PIN Agent: RequestPasskey for %s → providing", device)
+            _LOGGER.info(
+                "PIN Agent: RequestPasskey for %s — providing uint32=%d "
+                "(BlueZ chose NUMERIC passkey path)",
+                device, self._passkey,
+            )
             self._responded = True
             return self._passkey
 
         @method()  # type: ignore[misc]
         def DisplayPasskey(self, device: "o", passkey: "u", entered: "q") -> None:  # type: ignore[name-defined]  # noqa: N802, F821
             """Display passkey to user (we just log it)."""
-            _LOGGER.debug("PIN Agent: DisplayPasskey %d (entered=%d)", passkey, entered)
+            _LOGGER.info(
+                "PIN Agent: DisplayPasskey %d (entered=%d) for %s "
+                "(BlueZ display-only — no response needed)",
+                passkey, entered, device,
+            )
 
         @method()  # type: ignore[misc]
         def DisplayPinCode(self, device: "o", pincode: "s") -> None:  # type: ignore[name-defined]  # noqa: N802, F821
             """Display PIN code to user."""
-            _LOGGER.debug("PIN Agent: DisplayPinCode %s", pincode)
+            _LOGGER.info(
+                "PIN Agent: DisplayPinCode '%s' for %s "
+                "(BlueZ display-only — no response needed)",
+                pincode, device,
+            )
 
         @method()  # type: ignore[misc]
         def RequestConfirmation(self, device: "o", passkey: "u") -> None:  # type: ignore[name-defined]  # noqa: N802, F821
             """Confirm passkey — auto-accept."""
-            _LOGGER.info("PIN Agent: RequestConfirmation %d for %s — accepting", passkey, device)
+            _LOGGER.info(
+                "PIN Agent: RequestConfirmation passkey=%d for %s — auto-accepting "
+                "(Just Works / numeric comparison)",
+                passkey, device,
+            )
 
         @method()  # type: ignore[misc]
         def RequestAuthorization(self, device: "o") -> None:  # type: ignore[name-defined]  # noqa: N802, F821
             """Authorize device — auto-accept."""
-            _LOGGER.info("PIN Agent: RequestAuthorization for %s", device)
+            _LOGGER.info("PIN Agent: RequestAuthorization for %s — auto-accepting", device)
 
         @method()  # type: ignore[misc]
         def AuthorizeService(self, device: "o", uuid: "s") -> None:  # type: ignore[name-defined]  # noqa: N802, F821
             """Authorize service — auto-accept."""
-            _LOGGER.debug("PIN Agent: AuthorizeService %s on %s", uuid, device)
+            _LOGGER.info("PIN Agent: AuthorizeService %s on %s — auto-accepting", uuid, device)
 
         @method()  # type: ignore[misc]
         def Cancel(self) -> None:  # noqa: N802
             """Pairing was cancelled."""
-            _LOGGER.warning("PIN Agent: Cancel — pairing cancelled")
+            _LOGGER.warning(
+                "PIN Agent: Cancel — pairing cancelled by BlueZ "
+                "(gateway may have rejected credentials or timed out)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +188,12 @@ async def pair_with_pin(
     passkey = int(pin) if pin.isdigit() else 0
     bus: Any = None
     agent_registered = False
+
+    _LOGGER.info(
+        "PIN pairing setup: address=%s, pin_length=%d, pin_is_numeric=%s, "
+        "passkey_uint32=%d, capability=KeyboardDisplay",
+        device_address, len(pin), pin.isdigit(), passkey,
+    )
 
     try:
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -221,10 +250,15 @@ async def pair_with_pin(
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            _LOGGER.error("PIN pairing timed out after %.0fs", timeout)
+            _LOGGER.error(
+                "PIN pairing timed out after %.0fs — agent responded: %s. "
+                "If agent never responded, BlueZ may not have reached the "
+                "passkey exchange (check gateway is discoverable/bondable).",
+                timeout, agent.responded,
+            )
             return False
         except Exception as exc:
-            _LOGGER.error("D-Bus Pair() call failed: %s", exc)
+            _LOGGER.error("D-Bus Pair() call failed: %s (type: %s)", exc, type(exc).__name__)
             return False
 
         if pair_reply.message_type == MessageType.ERROR:
@@ -234,8 +268,11 @@ async def pair_with_pin(
                 return True
             if "AuthenticationFailed" in error_name:
                 _LOGGER.error(
-                    "PIN pairing authentication failed — the gateway PIN may "
-                    "be incorrect. Check the 6-digit PIN on your gateway sticker."
+                    "PIN pairing AuthenticationFailed — agent responded: %s. "
+                    "If agent responded=True, the PIN was sent but rejected "
+                    "(wrong PIN?). If responded=False, BlueZ never asked for "
+                    "the PIN (pairing method mismatch?).",
+                    agent.responded,
                 )
                 return False
             _LOGGER.error(
