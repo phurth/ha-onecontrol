@@ -357,11 +357,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _do_connect(self) -> None:
         """Internal connect routine with retry logic."""
         max_attempts = 3
+        last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
                 await self._try_connect(attempt)
                 return
             except Exception as exc:
+                last_exc = exc
                 _LOGGER.warning(
                     "Connection attempt %d/%d failed: %s",
                     attempt, max_attempts, exc,
@@ -379,8 +381,40 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     delay = 3 * attempt
                     _LOGGER.info("Retrying in %ds...", delay)
                     await asyncio.sleep(delay)
-                else:
-                    raise
+
+        # All HA-routed attempts failed — try direct HCI adapters as fallback.
+        # This handles the case where the ESPHome BT proxy has no free slots
+        # but a local USB/onboard adapter can reach the gateway.
+        assert last_exc is not None
+        _LOGGER.warning(
+            "All %d HA-routed connection attempts failed for %s; "
+            "trying direct HCI adapter fallback",
+            max_attempts, self.address,
+        )
+        for adapter in ("hci0", "hci1", "hci2", "hci3"):
+            _LOGGER.info(
+                "Direct BLE connect to %s via %s", self.address, adapter,
+            )
+            try:
+                await self._try_connect_direct(adapter)
+                _LOGGER.info(
+                    "Direct connect succeeded via %s for %s",
+                    adapter, self.address,
+                )
+                return
+            except Exception as exc:
+                _LOGGER.debug("Direct connect via %s failed: %s", adapter, exc)
+                if self._client:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
+                self._connected = False
+                self._authenticated = False
+
+        # All paths exhausted
+        raise last_exc
 
     @property
     def is_pin_gateway(self) -> bool:
@@ -411,6 +445,35 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             disconnected_callback=self._on_disconnect,
             timeout=20.0,
         )
+
+        await self._finish_connect(client)
+
+    async def _try_connect_direct(self, adapter: str) -> None:
+        """Connect directly via a local HCI adapter, bypassing HA routing.
+
+        Used as fallback when the ESPHome BT proxy has no free connection
+        slots but a local USB/onboard adapter can reach the gateway.
+        """
+        _LOGGER.info(
+            "Direct connecting to OneControl %s via %s (method=%s)",
+            self.address, adapter, self._pairing_method,
+        )
+
+        # PIN gateway: D-Bus bonding still needed for local adapters
+        if self.is_pin_gateway:
+            await self._pair_pin_gateway()
+
+        client = BleakClient(
+            self.address,
+            disconnected_callback=self._on_disconnect,
+            timeout=20.0,
+            adapter=adapter,
+        )
+
+        await self._finish_connect(client)
+
+    async def _finish_connect(self, client: BleakClient) -> None:
+        """Complete connection: connect, pair, enumerate, authenticate."""
 
         # ── Connect ───────────────────────────────────────────────────
         # For PushButton gateways, hint that pairing should happen
