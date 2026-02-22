@@ -176,10 +176,10 @@ async def pair_with_pin(
         # ── Find device in BlueZ object tree ──────────────────────────
         device_path = await _find_device_path(bus, device_address)
         if not device_path:
-            _LOGGER.error(
-                "Device %s not found in BlueZ — PIN pairing is NOT supported "
-                "via ESPHome Bluetooth Proxy. Connect a direct USB Bluetooth "
-                "adapter to your Home Assistant host.",
+            _LOGGER.warning(
+                "Device %s not found in BlueZ object tree — D-Bus PIN pairing "
+                "unavailable. Will fall back to Bleak pair() after connect "
+                "(may work via ESPHome Bluetooth Proxy).",
                 device_address,
             )
             return False

@@ -27,9 +27,27 @@ You'll need the **6-digit PIN** from the sticker on your gateway.
 **Push-to-Pair gateways (newer, e.g. Unity X270D):**
 - Press the physical "Connect" button on your RV control panel
 - Enter the PIN when prompted
+- Works with ESPHome Bluetooth Proxy and direct USB adapters
 
 **Legacy PIN gateways (older):**
 - Enter the PIN when prompted (used for both BLE bonding and protocol auth)
+- See [PIN Gateway Notes](#pin-gateway-notes) below
+
+## PIN Gateway Notes
+
+Legacy (PIN-based) gateways require a passkey exchange during BLE bonding.
+The integration supports two pairing paths:
+
+1. **Direct USB Bluetooth adapter** — Preferred. The integration registers a
+   D-Bus BlueZ agent that provides the passkey automatically during bonding.
+2. **ESPHome Bluetooth Proxy** — Fallback. The integration attempts `pair()`
+   through the proxy's Bluetooth stack. **This is currently untested** — it
+   depends on whether the ESPHome proxy forwards passkey requests from the
+   ESP32's NimBLE stack. If you have a PIN gateway behind an ESPHome proxy,
+   please report your results.
+
+If PIN pairing fails, the integration will still attempt to connect — it may
+succeed if the device was previously bonded from another session.
 
 ## Supported Devices
 

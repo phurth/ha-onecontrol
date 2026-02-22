@@ -105,6 +105,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             CONF_BLUETOOTH_PIN, ""
         ) or self.gateway_pin
         self._pin_bond_attempted: bool = False  # track per-connection
+        self._pin_dbus_succeeded: bool = False  # D-Bus path succeeded?
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -434,8 +435,39 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.info("pair() not implemented — may already be bonded")
             except Exception as exc:
                 _LOGGER.warning("pair() failed: %s — continuing", exc)
-        else:
+        elif getattr(self, "_pin_dbus_succeeded", False):
             _LOGGER.info("PIN gateway — skipping Bleak pair() (already bonded via D-Bus)")
+        else:
+            # D-Bus path failed or unavailable — try Bleak pair() as fallback.
+            # This may work via ESPHome BT proxy if it supports passkey forwarding.
+            _LOGGER.info(
+                "PIN gateway — D-Bus bonding unavailable, attempting Bleak pair() "
+                "fallback for %s (may work via BT proxy)",
+                self.address,
+            )
+            try:
+                if hasattr(client, "pair"):
+                    paired = await client.pair()
+                    _LOGGER.info(
+                        "Bleak pair() fallback result: %s — "
+                        "if authentication fails, a direct USB Bluetooth "
+                        "adapter may be required for PIN gateways",
+                        paired,
+                    )
+                else:
+                    _LOGGER.warning("pair() not available on client wrapper")
+            except NotImplementedError:
+                _LOGGER.warning(
+                    "pair() not implemented on this backend — "
+                    "PIN gateway may fail to authenticate"
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Bleak pair() fallback failed: %s — "
+                    "a direct USB Bluetooth adapter may be required "
+                    "for PIN gateways",
+                    exc,
+                )
 
         await asyncio.sleep(0.5)
 
@@ -539,6 +571,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         during Device1.Pair().  After bonding, the subsequent Bleak
         connect() will use the established bond.
 
+        If D-Bus pairing is unavailable (e.g. ESPHome proxy), sets
+        _pin_dbus_succeeded = False so the post-connect path can
+        attempt a Bleak-level pair() fallback.
+
         Reference: Android BaseBleService.kt § createBond + pairingRequestReceiver
         """
         if self._pin_bond_attempted:
@@ -546,12 +582,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         self._pin_bond_attempted = True
+        self._pin_dbus_succeeded = False
 
         if not is_pin_pairing_supported():
             _LOGGER.warning(
-                "PIN pairing not supported on this platform — "
-                "requires Linux/HAOS with BlueZ and dbus-fast. "
-                "Gateway %s may fail to authenticate.",
+                "D-Bus PIN pairing not available on this platform — "
+                "will try Bleak pair() fallback after connect. "
+                "Gateway: %s",
                 self.address,
             )
             return
@@ -570,16 +607,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         if success:
-            _LOGGER.info("PIN bonding completed for %s", self.address)
+            _LOGGER.info("PIN bonding completed for %s via D-Bus", self.address)
+            self._pin_dbus_succeeded = True
         else:
             _LOGGER.warning(
-                "PIN bonding failed for %s — will attempt connection anyway "
-                "(device may already be bonded from a previous session)",
+                "D-Bus PIN bonding failed for %s — will try Bleak pair() "
+                "fallback after connect",
                 self.address,
             )
 
         # Short settle delay after bonding (matching Android GATT_SETTLE_DELAY)
-        await asyncio.sleep(1.0)
+        if self._pin_dbus_succeeded:
+            await asyncio.sleep(1.0)
 
     async def _remove_stale_bond(self) -> None:
         """Remove a stale bond and reset for re-pairing.
@@ -901,6 +940,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_requested = False
         self._has_can_write = False
         self._pin_bond_attempted = False  # Allow re-bonding on reconnect
+        self._pin_dbus_succeeded = False
 
         # Schedule automatic reconnection with exponential backoff
         self._schedule_reconnect()
