@@ -35,6 +35,7 @@ async def async_setup_entry(
 
     async_add_entities([
         OneControlClearLockoutButton(coordinator, address),
+        OneControlRefreshMetadataButton(coordinator, address),
     ])
 
 
@@ -76,3 +77,41 @@ class OneControlClearLockoutButton(
         """Send lockout clear sequence to gateway."""
         _LOGGER.info("Lockout clear button pressed")
         await self.coordinator.async_clear_lockout()
+
+
+class OneControlRefreshMetadataButton(
+    CoordinatorEntity[OneControlCoordinator], ButtonEntity
+):
+    """Button to re-request device metadata (friendly names) from the gateway.
+
+    If some devices show as "Device 0B:06" instead of their friendly name,
+    press this button to re-fetch metadata.  Matches the Android app's
+    "Refresh Metadata" feature.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Refresh Metadata"
+    _attr_icon = "mdi:refresh"
+
+    def __init__(self, coordinator: OneControlCoordinator, address: str) -> None:
+        super().__init__(coordinator)
+        mac = address.replace(":", "").lower()
+        self._attr_unique_id = f"{mac}_refresh_metadata"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            name=f"OneControl {address}",
+            manufacturer="Lippert / LCI",
+            model="BLE Gateway",
+            connections={("bluetooth", address)},
+        )
+
+    @property
+    def available(self) -> bool:
+        """Available when connected and authenticated."""
+        return self.coordinator.connected and self.coordinator.authenticated
+
+    async def async_press(self) -> None:
+        """Re-request device metadata from the gateway."""
+        _LOGGER.info("Refresh Metadata button pressed")
+        await self.coordinator.async_refresh_metadata()
