@@ -33,28 +33,18 @@ You'll need the **6-digit PIN** from the sticker on your gateway.
 
 ## Supported Devices
 
-- System voltage sensor
-- System temperature sensor
-- Relay switches (lights, appliances)
-- Tank level sensors
-- Dimmable lights
-- HVAC climate zones
-- Covers/slides (H-Bridge)
-
-## Development
-
-### Deploy to HA instance
-
-```bash
-./scripts/deploy.sh
-```
-
-### Run tests
-
-```bash
-pip install -r requirements_test.txt
-pytest tests/
-```
+- **Switches** — Relay-controlled devices (lights, water pump, water heaters, tank heater)
+- **Dimmable Lights** — Brightness control with Blink/Swell effects (Slow/Medium/Fast)
+- **RGB Lights** — Color control with 7 effects (Blink, Swell, Strobe, Color Cycle, etc.)
+- **HVAC Climate Zones** — Heat/Cool/Heat+Cool modes, fan speed, temperature setpoints
+- **Tank Sensors** — Fresh, grey, black tank levels (%)
+- **Cover/Slide Sensors** — H-Bridge status (Opening/Closing/Stopped) — state-only for safety
+- **Generator** — Start/stop control with status monitoring
+- **System Sensors** — Voltage, temperature, device count, table ID, protocol version
+- **In-Motion Lockout** — Safety binary sensor + clear button
+- **Data Health** — Binary sensor showing if gateway data stream is active
+- **Diagnostics** — One-click state dump from Settings → Devices & Services → OneControl → ⋮ → Download diagnostics
+- **DTC Fault Codes** — 1,934 diagnostic trouble codes with HA event firing for gas appliance faults
 
 ## License
 
