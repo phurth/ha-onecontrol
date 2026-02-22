@@ -12,8 +12,15 @@
         "title": "Configure {name}",
         "description": "Enter the 6-digit PIN from the sticker on your OneControl gateway.",
         "data": {
-          "gateway_pin": "Gateway PIN",
-          "bluetooth_pin": "Bluetooth PIN (legacy gateways only)"
+          "gateway_pin": "Gateway PIN"
+        }
+      },
+      "confirm_pin": {
+        "title": "Configure {name} (PIN Gateway)",
+        "description": "This is a legacy PIN-based gateway. Your gateway PIN is used for both Bluetooth bonding and protocol authentication.\n\n**Important:** PIN gateways require a direct USB Bluetooth adapter on your HA host. ESPHome Bluetooth Proxy is not supported for PIN pairing.",
+        "data": {
+          "gateway_pin": "Gateway PIN (from sticker)",
+          "bluetooth_pin": "Bluetooth PIN override (leave blank to use Gateway PIN)"
         }
       }
     },

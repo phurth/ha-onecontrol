@@ -127,6 +127,8 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
 
             if not pin or len(pin) != 6 or not pin.isdigit():
                 errors[CONF_GATEWAY_PIN] = "invalid_pin"
+            elif bt_pin and (len(bt_pin) != 6 or not bt_pin.isdigit()):
+                errors[CONF_BLUETOOTH_PIN] = "invalid_pin"
             else:
                 data = {
                     CONF_ADDRESS: self._address,
@@ -146,12 +148,22 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         fields: dict[Any, Any] = {
             vol.Required(CONF_GATEWAY_PIN, default=DEFAULT_GATEWAY_PIN): str,
         }
+
+        # For PIN gateways, show a separate step with extra context
+        step_id = "confirm"
         if self._pairing_method == PairingMethod.PIN:
             fields[vol.Optional(CONF_BLUETOOTH_PIN, default="")] = str
+            step_id = "confirm_pin"
 
         return self.async_show_form(
-            step_id="confirm",
+            step_id=step_id,
             data_schema=vol.Schema(fields),
             errors=errors,
             description_placeholders={"name": self._name or "OneControl"},
         )
+
+    async def async_step_confirm_pin(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the PIN-gateway confirmation step (delegates to confirm)."""
+        return await self.async_step_confirm(user_input)

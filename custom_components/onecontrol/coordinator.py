@@ -27,11 +27,14 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .ble_agent import is_pin_pairing_supported, pair_with_pin, remove_bond
 from .const import (
     AUTH_SERVICE_UUID,
     BLE_MTU_SIZE,
     CAN_WRITE_CHAR_UUID,
+    CONF_BLUETOOTH_PIN,
     CONF_GATEWAY_PIN,
+    CONF_PAIRING_METHOD,
     DATA_READ_CHAR_UUID,
     DATA_SERVICE_UUID,
     DATA_WRITE_CHAR_UUID,
@@ -93,6 +96,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
         self.address: str = entry.data[CONF_ADDRESS]
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
+
+        # ── PIN-based pairing (legacy gateways) ──────────────────────
+        self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
+        # Android uses gateway_pin for both BLE bonding AND protocol auth.
+        # bluetooth_pin is an optional override if the BLE PIN differs.
+        self._bluetooth_pin: str = entry.data.get(
+            CONF_BLUETOOTH_PIN, ""
+        ) or self.gateway_pin
+        self._pin_bond_attempted: bool = False  # track per-connection
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -367,11 +379,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else:
                     raise
 
+    @property
+    def is_pin_gateway(self) -> bool:
+        """True if this gateway uses PIN-based (legacy) BLE pairing."""
+        return self._pairing_method == "pin"
+
     async def _try_connect(self, attempt: int) -> None:
         """Single connection attempt — connect, pair, authenticate."""
         _LOGGER.info(
-            "Connecting to OneControl gateway %s (attempt %d)",
-            self.address, attempt,
+            "Connecting to OneControl gateway %s (attempt %d, method=%s)",
+            self.address, attempt, self._pairing_method,
         )
 
         device = bluetooth.async_ble_device_from_address(
@@ -382,33 +399,43 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"OneControl device {self.address} not found by HA Bluetooth"
             )
 
+        # ── PIN gateway: D-Bus bonding BEFORE Bleak connect ───────────
+        if self.is_pin_gateway:
+            await self._pair_pin_gateway()
+
         client = BleakClient(
             device,
             disconnected_callback=self._on_disconnect,
             timeout=20.0,
         )
 
-        # ── Connect with pairing ──────────────────────────────────────
-        if hasattr(client, "_pair_before_connect"):
+        # ── Connect ───────────────────────────────────────────────────
+        # For PushButton gateways, hint that pairing should happen
+        # during connect.  For PIN gateways the bond already exists.
+        if not self.is_pin_gateway and hasattr(client, "_pair_before_connect"):
             client._pair_before_connect = True
-            _LOGGER.info("BLE pair-before-connect enabled")
+            _LOGGER.debug("BLE pair-before-connect enabled (PushButton)")
 
         await client.connect()
         self._client = client
         self._connected = True
-        _LOGGER.info("Connected to %s (paired=%s)", self.address, client.is_connected)
+        _LOGGER.info("Connected to %s", self.address)
 
-        try:
-            _LOGGER.info("Requesting explicit BLE pair with %s", self.address)
-            if hasattr(client, "pair"):
-                paired = await client.pair()
-                _LOGGER.info("BLE pair() result: %s", paired)
-            else:
-                _LOGGER.debug("pair() not available on client wrapper")
-        except NotImplementedError:
-            _LOGGER.info("pair() not implemented on this backend — may already be bonded")
-        except Exception as exc:
-            _LOGGER.warning("pair() failed: %s — continuing", exc)
+        # ── Pairing (PushButton gateways only) ────────────────────────
+        if not self.is_pin_gateway:
+            try:
+                _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
+                if hasattr(client, "pair"):
+                    paired = await client.pair()
+                    _LOGGER.info("BLE pair() result: %s", paired)
+                else:
+                    _LOGGER.debug("pair() not available on client wrapper")
+            except NotImplementedError:
+                _LOGGER.info("pair() not implemented — may already be bonded")
+            except Exception as exc:
+                _LOGGER.warning("pair() failed: %s — continuing", exc)
+        else:
+            _LOGGER.info("PIN gateway — skipping Bleak pair() (already bonded via D-Bus)")
 
         await asyncio.sleep(0.5)
 
@@ -499,6 +526,77 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Subscribed to SEED (0x0011)")
         except BleakError as exc:
             _LOGGER.warning("Failed to subscribe SEED: %s", exc)
+
+    # ------------------------------------------------------------------
+    # PIN-based pairing (D-Bus agent)
+    # ------------------------------------------------------------------
+
+    async def _pair_pin_gateway(self) -> None:
+        """Handle PIN-based bonding via BlueZ D-Bus agent.
+
+        Called before Bleak client.connect() for legacy PIN gateways.
+        The D-Bus agent provides the passkey when BlueZ requests it
+        during Device1.Pair().  After bonding, the subsequent Bleak
+        connect() will use the established bond.
+
+        Reference: Android BaseBleService.kt § createBond + pairingRequestReceiver
+        """
+        if self._pin_bond_attempted:
+            _LOGGER.debug("PIN bonding already attempted this connection cycle")
+            return
+
+        self._pin_bond_attempted = True
+
+        if not is_pin_pairing_supported():
+            _LOGGER.warning(
+                "PIN pairing not supported on this platform — "
+                "requires Linux/HAOS with BlueZ and dbus-fast. "
+                "Gateway %s may fail to authenticate.",
+                self.address,
+            )
+            return
+
+        _LOGGER.info(
+            "PIN gateway detected — attempting D-Bus bonding for %s "
+            "(pin length=%d)",
+            self.address,
+            len(self._bluetooth_pin),
+        )
+
+        success = await pair_with_pin(
+            device_address=self.address,
+            pin=self._bluetooth_pin,
+            timeout=30.0,
+        )
+
+        if success:
+            _LOGGER.info("PIN bonding completed for %s", self.address)
+        else:
+            _LOGGER.warning(
+                "PIN bonding failed for %s — will attempt connection anyway "
+                "(device may already be bonded from a previous session)",
+                self.address,
+            )
+
+        # Short settle delay after bonding (matching Android GATT_SETTLE_DELAY)
+        await asyncio.sleep(1.0)
+
+    async def _remove_stale_bond(self) -> None:
+        """Remove a stale bond and reset for re-pairing.
+
+        Called when authentication fails repeatedly on a PIN gateway,
+        suggesting the bond keys are out of sync.
+        """
+        if not self.is_pin_gateway:
+            return
+
+        _LOGGER.info("Removing stale bond for PIN gateway %s", self.address)
+        removed = await remove_bond(self.address)
+        if removed:
+            self._pin_bond_attempted = False  # Allow re-bonding on next connect
+            _LOGGER.info("Bond removed — will re-pair on next connection")
+        else:
+            _LOGGER.warning("Could not remove bond for %s", self.address)
 
     # ------------------------------------------------------------------
     # Step 2: SEED notification → 16-byte KEY response
@@ -802,6 +900,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._decoder.reset()
         self._metadata_requested = False
         self._has_can_write = False
+        self._pin_bond_attempted = False  # Allow re-bonding on reconnect
 
         # Schedule automatic reconnection with exponential backoff
         self._schedule_reconnect()
@@ -830,6 +929,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await asyncio.sleep(delay)
             if self._connected:
                 return  # Already reconnected by another path
+
+            # For PIN gateways, remove stale bond after 3 consecutive failures
+            # (suggests the bond keys are out of sync with the gateway)
+            if (
+                self.is_pin_gateway
+                and self._consecutive_failures >= 3
+                and self._consecutive_failures % 3 == 0
+            ):
+                _LOGGER.info(
+                    "PIN gateway: %d failures — removing possibly stale bond",
+                    self._consecutive_failures,
+                )
+                await self._remove_stale_bond()
+
             _LOGGER.info("Attempting reconnection to %s...", self.address)
             await self.async_connect()
             # Success — reset backoff counter

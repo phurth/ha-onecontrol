@@ -38,6 +38,9 @@ async def async_get_config_entry_diagnostics(
             if coordinator.last_event_age is not None
             else None
         ),
+        "pairing_method": coordinator._pairing_method,
+        "is_pin_gateway": coordinator.is_pin_gateway,
+        "pin_bond_attempted": coordinator._pin_bond_attempted,
         "has_can_write": coordinator._has_can_write,
         "consecutive_reconnect_failures": coordinator._consecutive_failures,
     }
