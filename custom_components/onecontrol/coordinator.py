@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from bleak import BleakClient, BleakGATTCharacteristic, BleakScanner
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
@@ -457,10 +458,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             _LOGGER.debug("D-Bus not available — skipping PushButton pre-pairing")
 
-        client = BleakClient(
+        client = await establish_connection(
+            BleakClient,
             device,
+            self.address,
             disconnected_callback=self._on_disconnect,
-            timeout=20.0,
         )
         await self._finish_connect(client)
 
@@ -506,10 +508,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.is_pin_gateway:
             await self._pair_pin_gateway()
 
-        client = BleakClient(
+        client = await establish_connection(
+            BleakClient,
             ble_device,
+            self.address,
             disconnected_callback=self._on_disconnect,
-            timeout=20.0,
             adapter=adapter,
         )
 
@@ -517,8 +520,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _finish_connect(self, client: BleakClient) -> None:
         """Complete connection: connect, pair, enumerate, authenticate."""
-
-        await client.connect()
         self._client = client
         self._connected = True
         _LOGGER.info("Connected to %s", self.address)
