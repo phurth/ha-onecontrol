@@ -27,7 +27,7 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .ble_agent import is_pin_pairing_supported, pair_with_pin, remove_bond
+from .ble_agent import is_pin_pairing_supported, pair_push_button, pair_with_pin, remove_bond
 from .const import (
     AUTH_SERVICE_UUID,
     BLE_MTU_SIZE,
@@ -436,16 +436,32 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"OneControl device {self.address} not found by HA Bluetooth"
             )
 
-        # ── PIN gateway: D-Bus bonding BEFORE Bleak connect ───────────
+        # ── D-Bus bonding BEFORE Bleak connect ────────────────────────
         if self.is_pin_gateway:
             await self._pair_pin_gateway()
+        elif is_pin_pairing_supported():
+            _LOGGER.info(
+                "PushButton gateway — attempting D-Bus Just Works pairing "
+                "with %s before connect",
+                self.address,
+            )
+            dbus_ok = await pair_push_button(self.address, timeout=30.0)
+            if dbus_ok:
+                _LOGGER.info("D-Bus PushButton pairing succeeded for %s", self.address)
+            else:
+                _LOGGER.warning(
+                    "D-Bus PushButton pairing failed for %s — "
+                    "will attempt Bleak pair() after connect",
+                    self.address,
+                )
+        else:
+            _LOGGER.debug("D-Bus not available — skipping PushButton pre-pairing")
 
         client = BleakClient(
             device,
             disconnected_callback=self._on_disconnect,
             timeout=20.0,
         )
-
         await self._finish_connect(client)
 
     async def _try_connect_direct(self, adapter: str) -> None:
@@ -455,7 +471,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         slots but a local USB/onboard adapter can reach the gateway.
 
         Performs a BLE scan first so BlueZ discovers the device and
-        populates the correct address type (public vs random).  Then
+        populates the correct address type (public vs random). Then
         connects using the BLEDevice object.
         """
         _LOGGER.info(
@@ -463,8 +479,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.address, adapter, self._pairing_method,
         )
 
-        # Scan on this adapter to discover the device so BlueZ has it
-        # in its device list with the correct address type metadata.
         ble_device = None
         scanner = BleakScanner(adapter=adapter)
         try:
@@ -482,16 +496,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 break
 
         if ble_device is None:
-            raise BleakError(
-                f"Device {self.address} not found in scan on {adapter}"
-            )
+            raise BleakError(f"Device {self.address} not found in scan on {adapter}")
 
         _LOGGER.info(
             "Found %s on %s (rssi=%s), connecting...",
             self.address, adapter, getattr(ble_device, "rssi", "?"),
         )
 
-        # PIN gateway: D-Bus bonding still needed for local adapters
         if self.is_pin_gateway:
             await self._pair_pin_gateway()
 
@@ -507,19 +518,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _finish_connect(self, client: BleakClient) -> None:
         """Complete connection: connect, pair, enumerate, authenticate."""
 
-        # ── Connect ───────────────────────────────────────────────────
-        # For PushButton gateways, hint that pairing should happen
-        # during connect.  For PIN gateways the bond already exists.
-        if not self.is_pin_gateway and hasattr(client, "_pair_before_connect"):
-            client._pair_before_connect = True
-            _LOGGER.debug("BLE pair-before-connect enabled (PushButton)")
-
         await client.connect()
         self._client = client
         self._connected = True
         _LOGGER.info("Connected to %s", self.address)
 
-        # ── Pairing (PushButton gateways only) ────────────────────────
+        # ── Pairing fallback (PushButton — only if D-Bus didn't bond) ─
         if not self.is_pin_gateway:
             try:
                 _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)

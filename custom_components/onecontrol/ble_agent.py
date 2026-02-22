@@ -271,6 +271,138 @@ async def pair_with_pin(
             bus.disconnect()
 
 
+async def pair_push_button(
+    device_address: str,
+    timeout: float = 30.0,
+) -> bool:
+    """Register a temporary D-Bus agent for Just Works pairing, pair, clean up.
+
+    PushButton (newer) gateways use Just Works BLE pairing — no PIN is
+    exchanged at the BLE level.  However BlueZ still requires an agent
+    to accept the RequestConfirmation / RequestAuthorization callbacks.
+    Without an agent, BlueZ rejects the pairing with AuthenticationFailed.
+
+    This mirrors the Android flow where ``createBond()`` succeeds
+    automatically after the user presses the physical Connect button.
+
+    Returns True if pairing succeeded or device was already bonded.
+    """
+    if not _DBUS_AVAILABLE:
+        _LOGGER.error(
+            "PushButton pairing requires Linux/HAOS with BlueZ and dbus-fast — "
+            "not available on %s",
+            platform.system(),
+        )
+        return False
+
+    from dbus_fast import BusType, Message, MessageType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    bus: Any = None
+    agent_registered = False
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception as exc:
+        _LOGGER.error("Cannot connect to system D-Bus: %s", exc)
+        return False
+
+    try:
+        # ── Find device in BlueZ object tree ──────────────────────────
+        device_path = await _find_device_path(bus, device_address)
+        if not device_path:
+            _LOGGER.warning(
+                "Device %s not found in BlueZ — cannot D-Bus pair",
+                device_address,
+            )
+            return False
+
+        # ── Check if already bonded ───────────────────────────────────
+        if await _is_paired(bus, device_path):
+            _LOGGER.info(
+                "Device %s already bonded — skipping PushButton pairing",
+                device_address,
+            )
+            return True
+
+        # ── Register agent (passkey=0, pin="" — Just Works) ──────────
+        agent = _PinAgentInterface(0, "")
+        bus.export(AGENT_PATH, agent)
+
+        # Use NoInputNoOutput capability for Just Works pairing
+        agent_registered = await _register_agent_no_input(bus)
+        if not agent_registered:
+            _LOGGER.error("Failed to register Just Works agent with BlueZ")
+            return False
+
+        _LOGGER.info(
+            "Just Works agent registered — initiating PushButton pairing with %s",
+            device_address,
+        )
+
+        # ── Call Device1.Pair() ───────────────────────────────────────
+        try:
+            pair_reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        path=device_path,
+                        interface=DEVICE_IFACE,
+                        member="Pair",
+                    )
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.error("PushButton pairing timed out after %.0fs", timeout)
+            return False
+        except Exception as exc:
+            _LOGGER.error("D-Bus Pair() call failed: %s", exc)
+            return False
+
+        if pair_reply.message_type == MessageType.ERROR:
+            error_name = pair_reply.error_name or ""
+            if "AlreadyExists" in error_name:
+                _LOGGER.info("Device already paired (AlreadyExists)")
+                return True
+            if "AuthenticationFailed" in error_name:
+                _LOGGER.error(
+                    "PushButton pairing AuthenticationFailed — is the gateway "
+                    "Connect button pressed / pairing mode active?"
+                )
+                return False
+            _LOGGER.error(
+                "PushButton pairing failed: %s — %s", error_name, pair_reply.body
+            )
+            return False
+
+        _LOGGER.info(
+            "PushButton pairing successful for %s (agent responded: %s)",
+            device_address,
+            agent.responded,
+        )
+        return True
+
+    finally:
+        if agent_registered and bus:
+            try:
+                await bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        path="/org/bluez",
+                        interface=AGENT_MANAGER_IFACE,
+                        member="UnregisterAgent",
+                        signature="o",
+                        body=[AGENT_PATH],
+                    )
+                )
+                _LOGGER.debug("Just Works agent unregistered")
+            except Exception as exc:
+                _LOGGER.debug("Agent cleanup error: %s", exc)
+        if bus:
+            bus.disconnect()
+
+
 async def remove_bond(device_address: str) -> bool:
     """Remove an existing BlueZ bond for the given address.
 
@@ -375,6 +507,70 @@ async def _is_paired(bus: Any, device_path: str) -> bool:
     if hasattr(val, "value"):
         return bool(val.value)
     return bool(val)
+
+
+async def _register_agent_no_input(bus: Any) -> bool:
+    """Register agent with NoInputNoOutput capability (Just Works)."""
+    from dbus_fast import Message, MessageType  # noqa: F811
+
+    reply = await bus.call(
+        Message(
+            destination=BLUEZ_SERVICE,
+            path="/org/bluez",
+            interface=AGENT_MANAGER_IFACE,
+            member="RegisterAgent",
+            signature="os",
+            body=[AGENT_PATH, "NoInputNoOutput"],
+        )
+    )
+
+    if reply.message_type == MessageType.ERROR:
+        error_name = reply.error_name or ""
+        if "AlreadyExists" in error_name:
+            _LOGGER.debug("Agent already exists — re-registering (NoInputNoOutput)")
+            await bus.call(
+                Message(
+                    destination=BLUEZ_SERVICE,
+                    path="/org/bluez",
+                    interface=AGENT_MANAGER_IFACE,
+                    member="UnregisterAgent",
+                    signature="o",
+                    body=[AGENT_PATH],
+                )
+            )
+            reply = await bus.call(
+                Message(
+                    destination=BLUEZ_SERVICE,
+                    path="/org/bluez",
+                    interface=AGENT_MANAGER_IFACE,
+                    member="RegisterAgent",
+                    signature="os",
+                    body=[AGENT_PATH, "NoInputNoOutput"],
+                )
+            )
+            if reply.message_type == MessageType.ERROR:
+                _LOGGER.error("Agent re-registration failed: %s", reply.body)
+                return False
+        else:
+            _LOGGER.error("Agent registration failed: %s %s", error_name, reply.body)
+            return False
+
+    default_reply = await bus.call(
+        Message(
+            destination=BLUEZ_SERVICE,
+            path="/org/bluez",
+            interface=AGENT_MANAGER_IFACE,
+            member="RequestDefaultAgent",
+            signature="o",
+            body=[AGENT_PATH],
+        )
+    )
+    if default_reply.message_type == MessageType.ERROR:
+        _LOGGER.debug(
+            "RequestDefaultAgent failed (non-fatal): %s", default_reply.body
+        )
+
+    return True
 
 
 async def _register_agent(bus: Any) -> bool:
