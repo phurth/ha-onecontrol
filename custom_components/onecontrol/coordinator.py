@@ -323,7 +323,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             table_ids.add(self._metadata_raw[key].table_id)
         if not table_ids and self.gateway_info:
             table_ids.add(self.gateway_info.table_id)
-        self._metadata_requested = False
+        # NOTE: Do NOT reset _metadata_requested here — the heartbeat
+        # GatewayInformation handler checks this flag and would schedule
+        # a duplicate request 500ms later.
         for tid in table_ids:
             await self._send_metadata_request(tid)
 
