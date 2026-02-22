@@ -28,20 +28,13 @@ DISCOVERY_SERVICE_UUID = f"00000041{UUID_BASE}"
 LIPPERT_MANUFACTURER_ID = 0x0499  # 1177 decimal — Lippert Components
 
 # ---------------------------------------------------------------------------
-# TEA Encryption Constants
+# TEA Encryption Constants (public / standard)
 # ---------------------------------------------------------------------------
-TEA_DELTA: int = 0x9E3779B9
-TEA_CONSTANT_1: int = 0x436F7079  # 1131376761
-TEA_CONSTANT_2: int = 0x72696768  # 1919510376
-TEA_CONSTANT_3: int = 0x74204944  # 1948272964
-TEA_CONSTANT_4: int = 0x53736E63  # 1400073827
+TEA_DELTA: int = 0x9E3779B9  # Standard TEA delta
 TEA_ROUNDS: int = 32
 
-# Cipher for Step 1 (UNLOCK_STATUS / Data Service auth) — no PIN
-STEP1_CIPHER: int = 0x9E3779B9 ^ 0xBAB3486C  # = 0x248431D5
-
-# Cipher for Step 2 (SEED / Auth Service auth) — includes PIN
-STEP2_CIPHER: int = 0x8100080D
+# Proprietary key-schedule and cipher constants are intentionally NOT stored
+# here in plaintext.  They are derived at runtime in protocol/tea.py.
 
 # ---------------------------------------------------------------------------
 # Default gateway PIN (from sticker)

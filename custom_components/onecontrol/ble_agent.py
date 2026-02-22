@@ -144,7 +144,7 @@ async def pair_with_pin(
 
     Args:
         device_address: BLE MAC address (e.g. "AA:BB:CC:DD:EE:FF").
-        pin: The 6-digit PIN string (e.g. "090336").
+        pin: The 6-digit PIN string from the gateway sticker.
         timeout: Seconds to wait for pairing to complete.
 
     Returns:
