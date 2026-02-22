@@ -19,7 +19,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from bleak import BleakClient, BleakGATTCharacteristic
+from bleak import BleakClient, BleakGATTCharacteristic, BleakScanner
 from bleak.exc import BleakError
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -453,10 +453,42 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Used as fallback when the ESPHome BT proxy has no free connection
         slots but a local USB/onboard adapter can reach the gateway.
+
+        Performs a BLE scan first so BlueZ discovers the device and
+        populates the correct address type (public vs random).  Then
+        connects using the BLEDevice object.
         """
         _LOGGER.info(
-            "Direct connecting to OneControl %s via %s (method=%s)",
+            "Direct connecting to OneControl %s via %s (method=%s, scanning first)",
             self.address, adapter, self._pairing_method,
+        )
+
+        # Scan on this adapter to discover the device so BlueZ has it
+        # in its device list with the correct address type metadata.
+        ble_device = None
+        scanner = BleakScanner(adapter=adapter)
+        try:
+            await scanner.start()
+            await asyncio.sleep(5.0)
+            await scanner.stop()
+        except (BleakError, OSError) as scan_exc:
+            raise BleakError(
+                f"Scan on {adapter} failed (adapter may not exist): {scan_exc}"
+            ) from scan_exc
+
+        for dev in scanner.discovered_devices:
+            if dev.address.upper() == self.address.upper():
+                ble_device = dev
+                break
+
+        if ble_device is None:
+            raise BleakError(
+                f"Device {self.address} not found in scan on {adapter}"
+            )
+
+        _LOGGER.info(
+            "Found %s on %s (rssi=%s), connecting...",
+            self.address, adapter, getattr(ble_device, "rssi", "?"),
         )
 
         # PIN gateway: D-Bus bonding still needed for local adapters
@@ -464,7 +496,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._pair_pin_gateway()
 
         client = BleakClient(
-            self.address,
+            ble_device,
             disconnected_callback=self._on_disconnect,
             timeout=20.0,
             adapter=adapter,
