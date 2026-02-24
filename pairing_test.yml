@@ -1,0 +1,264 @@
+# bt-proxy-pairing-helper.yml
+#
+# Purpose: Establish a BLE bond between this ESP32 and a legacy (PIN-based) OneControl gateway.
+#
+# BT Stack: Bluedroid (ESP-IDF native stack).
+#   - Required because the lambdas below call Bluedroid-specific APIs:
+#       esp_ble_gap_set_security_param(), esp_ble_get_bond_device_num(), etc.
+#   - NimBLE does not expose these symbols; the build would fail without the
+#     sdkconfig_options block below.
+#   - IMPORTANT: the production proxy firmware flashed after pairing MUST also
+#     use Bluedroid. Bond LTKs are stored in NVS under Bluedroid's namespace and
+#     are NOT readable by a NimBLE firmware. If the production proxy uses NimBLE
+#     (ESPHome default), the bond will be invisible after OTA and the gateway will
+#     re-challenge for a passkey on every connection.
+#
+# The bond LTK is stored in ESP-IDF NVS on this device. Once the bond is confirmed,
+# re-flash this device with the production BT proxy firmware via OTA
+# (do NOT erase flash — NVS must survive). HA will then connect to the gateway
+# through this proxy using the stored bond, and the ha-onecontrol integration
+# handles application-layer TEA auth as normal.
+#
+# CRITICAL: Flash this to the SAME physical device that will serve as the HA BT proxy.
+# A bond stored on a dev board is not usable by a different proxy device.
+#
+# Recommended procedure:
+#   1. Flash this YAML to the target proxy device.
+#   2. Set gateway MAC and PIN below.
+#   3. Press "Pair: Connect and Pair" in HA.
+#   4. Confirm on_passkey_request fires and PIN is sent (watch logs).
+#   5. Press "Pair: Check Bond List" and confirm gateway MAC appears.
+#   6. Press "Pair: Disconnect Gateway" to release the ble_client connection.
+#   7. OTA-flash production proxy firmware WITHOUT erasing flash.
+#      Production firmware MUST include the same Bluedroid sdkconfig_options.
+#   8. Configure ha-onecontrol integration in HA using this proxy.
+#
+# Memory note: Bluedroid has a larger footprint than NimBLE. On ESP32 (240KB IRAM)
+# with WiFi active this is tight. If you see heap panics during scanning/connecting,
+# disable Classic BT via CONFIG_BT_CLASSIC_ENABLED: "n" (already set below) and/or
+# reduce the BT controller memory allocation. The ESP32-S3 production hardware
+# (Ethernet, no WiFi) has more headroom and is less likely to hit this limit.
+
+esphome:
+  name: bt-proxy-pairing-helper
+  friendly_name: BT Proxy Pairing Helper
+  on_boot:
+    # Run at default priority (-100) so BLE stack is fully initialized before we configure it.
+    priority: -100.0
+    then:
+      # Configure global BLE security parameters to force MITM-protected Passkey Entry.
+      # Without this, Bluedroid defaults to NoInputNoOutput (Just Works), which silently
+      # bypasses passkey callbacks and produces a bond the gateway may reject.
+      #
+      # IO capability selection:
+      #   ESP_IO_CAP_KBDISP (4) = KeyboardDisplay
+      #     vs gateway DisplayOnly    → Passkey Entry  → on_passkey_request fires (ESP enters PIN)
+      #     vs gateway DisplayYesNo   → Numeric Compare → on_numeric_comparison_request fires
+      #     vs gateway KeyboardOnly   → Passkey Entry  → on_passkey_notification fires (ESP displays)
+      #
+      # auth_req: ESP_LE_AUTH_BOND (0x01) | ESP_LE_AUTH_REQ_MITM (0x04) = 0x05
+      #   Legacy LE pairing with MITM protection + bonding.
+      #   If the gateway supports LE Secure Connections, use ESP_LE_AUTH_REQ_SC_MITM_BOND (0x1D).
+      - lambda: |-
+          uint8_t auth_req = ESP_LE_AUTH_BOND | ESP_LE_AUTH_REQ_MITM;
+          uint8_t iocap    = ESP_IO_CAP_KBDISP;
+          uint8_t key_size = 16;
+          uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+          uint8_t rsp_key  = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+          uint8_t oob      = ESP_BLE_OOB_DISABLE;
+          esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE,      &iocap,    sizeof(iocap));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE,    &key_size, sizeof(key_size));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY,    &init_key, sizeof(init_key));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY,     &rsp_key,  sizeof(rsp_key));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_OOB_SUPPORT,     &oob,      sizeof(oob));
+          ESP_LOGI("pairing", "BLE security params set: MITM + KeyboardDisplay + Bond (Bluedroid)");
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Use Bluedroid instead of NimBLE.
+      # Required for esp_ble_gap_set_security_param() and bond management APIs.
+      CONFIG_BT_ENABLED: "y"
+      CONFIG_BLUEDROID_ENABLED: "y"
+      CONFIG_BT_BLE_ENABLED: "y"
+      CONFIG_BT_NIMBLE_ENABLED: "n"
+      # Disable Classic BT to recover RAM — this device only needs BLE.
+      CONFIG_BT_CLASSIC_ENABLED: "n"
+
+logger:
+  level: DEBUG
+
+api:
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+
+# Keep proxy active so this device remains usable as a BT proxy for HA while the
+# ble_client component handles the one-time pairing flow.
+esp32_ble:
+  max_connections: 4
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+bluetooth_proxy:
+  active: true
+
+ble_client:
+  - mac_address: AA:BB:CC:DD:EE:FF   # <-- replace with gateway MAC
+    id: target_gateway
+    auto_connect: false
+
+    on_connect:
+      then:
+        - logger.log: "BLE connected to target gateway"
+        - delay: 300ms
+        - logger.log: "Requesting MITM-protected pairing now"
+        - lambda: |-
+            id(target_gateway).pair();
+        - delay: 5s
+        - lambda: |-
+            if (id(target_gateway).connected()) {
+              ESP_LOGI("pairing", "Still connected 5s after pair() — waiting for passkey callback or bond completion");
+            } else {
+              ESP_LOGW("pairing", "Disconnected within 5s of pair() — pairing failed or gateway timed out");
+            }
+
+    on_disconnect:
+      then:
+        - logger.log: "BLE disconnected from target gateway"
+        - lambda: |-
+            int count = esp_ble_get_bond_device_num();
+            ESP_LOGI("pairing", "Bond device count after disconnect: %d", count);
+
+    # Fires when the gateway (peripheral) asks the ESP (central) to provide a passkey.
+    # This is the expected path for PIN-based gateways with DisplayOnly IO capability.
+    #
+    # IMPORTANT — leading zeros and YAML parsing:
+    #   BLE Passkey Entry compares values numerically (uint32_t), so the passkey for a
+    #   gateway sticker reading "090336" is the integer 90336.
+    #   Do NOT write `passkey: 090336` — YAML treats a leading zero as an octal prefix,
+    #   and since 9 is not a valid octal digit this will error or produce a wrong value.
+    #   Write `passkey: 90336` (the integer). The BLE exchange is identical either way.
+    #
+    #   Note: the leading zero DOES matter for the ha-onecontrol application-layer TEA
+    #   auth (where the PIN is an ASCII string embedded in the 16-byte key). That is
+    #   configured in the HA integration, not here.
+    on_passkey_request:
+      then:
+        - logger.log: "Passkey requested by gateway — sending configured PIN"
+        - ble_client.passkey_reply:
+            id: target_gateway
+            passkey: 123456   # <-- replace with integer value of gateway PIN (strip any leading zero)
+
+    # Fires when the gateway sends a passkey for the ESP to "display" (less likely for
+    # static-PIN sticker devices, but included for diagnostic completeness).
+    on_passkey_notification:
+      then:
+        - logger.log:
+            format: "Gateway sent passkey for display: %u"
+            args: [passkey]
+
+    # Fires for LESC Numeric Comparison. Auto-accepting here; for production use the
+    # passkey value should be confirmed against what the gateway displays.
+    on_numeric_comparison_request:
+      then:
+        - logger.log:
+            format: "Numeric comparison requested: %u — auto-accepting"
+            args: [passkey]
+        - ble_client.numeric_comparison_reply:
+            id: target_gateway
+            accept: true
+
+button:
+  # Primary pairing trigger. Connects the ble_client; on_connect handles pair().
+  # Do NOT add a redundant pair() call here — on_connect owns that step.
+  - platform: template
+    name: "Pair: Connect and Pair"
+    on_press:
+      then:
+        - logger.log: "Connecting to gateway — pairing will trigger via on_connect"
+        - ble_client.connect: target_gateway
+
+  # Use this if the device is already connected but pair() needs to be re-triggered
+  # (e.g. after a passkey failure, without full disconnect/reconnect cycle).
+  - platform: template
+    name: "Pair: Re-trigger Pair (While Connected)"
+    on_press:
+      then:
+        - logger.log: "Re-triggering pair() on existing connection"
+        - lambda: |-
+            id(target_gateway).pair();
+
+  # Release the ble_client connection after bonding so the bluetooth_proxy can take over.
+  # Always press this before OTA-flashing production firmware.
+  - platform: template
+    name: "Pair: Disconnect Gateway"
+    on_press:
+      then:
+        - ble_client.disconnect: target_gateway
+
+  # Diagnostic: prints all stored bond MACs to the log. Use after a pairing attempt
+  # to confirm whether a bond was actually stored in NVS.
+  - platform: template
+    name: "Pair: Check Bond List"
+    on_press:
+      then:
+        - lambda: |-
+            int count = esp_ble_get_bond_device_num();
+            ESP_LOGI("bond", "Stored bond count: %d", count);
+            if (count > 0) {
+              esp_ble_bond_dev_t *devs = (esp_ble_bond_dev_t *)malloc(sizeof(esp_ble_bond_dev_t) * count);
+              if (devs) {
+                esp_ble_get_bond_device_list(&count, devs);
+                for (int i = 0; i < count; i++) {
+                  ESP_LOGI("bond", "Bond[%d]: %02X:%02X:%02X:%02X:%02X:%02X", i,
+                    devs[i].bd_addr[0], devs[i].bd_addr[1], devs[i].bd_addr[2],
+                    devs[i].bd_addr[3], devs[i].bd_addr[4], devs[i].bd_addr[5]);
+                }
+                free(devs);
+              }
+            }
+
+  # Remove only the target gateway's bond (leaves other bonds intact).
+  # Uses the Bluedroid API directly — more reliable than ble_client.remove_bond
+  # which targets NimBLE's bond store.
+  - platform: template
+    name: "Pair: Remove Gateway Bond"
+    on_press:
+      then:
+        - lambda: |-
+            esp_bd_addr_t addr;
+            // Parse MAC from the configured ble_client address.
+            // Update this if you change the mac_address above.
+            sscanf("AA:BB:CC:DD:EE:FF", "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                   &addr[0], &addr[1], &addr[2], &addr[3], &addr[4], &addr[5]);
+            esp_ble_remove_bond_device(addr);
+            ESP_LOGI("bond", "Removed bond for gateway");
+
+  # Nuclear option: wipe all bonds from NVS for a fully clean retry.
+  - platform: template
+    name: "Pair: Remove All Bonds (Clean Slate)"
+    on_press:
+      then:
+        - lambda: |-
+            int count = esp_ble_get_bond_device_num();
+            ESP_LOGW("bond", "Removing all %d stored bonds", count);
+            if (count > 0) {
+              esp_ble_bond_dev_t *devs = (esp_ble_bond_dev_t *)malloc(sizeof(esp_ble_bond_dev_t) * count);
+              if (devs) {
+                esp_ble_get_bond_device_list(&count, devs);
+                for (int i = 0; i < count; i++) {
+                  esp_ble_remove_bond_device(devs[i].bd_addr);
+                }
+                free(devs);
+              }
+            }
+            ESP_LOGW("bond", "All bonds removed");
