@@ -158,6 +158,128 @@ def is_pin_pairing_supported() -> bool:
     return _DBUS_AVAILABLE
 
 
+class PinAgentContext:
+    """Holds a registered D-Bus PIN agent that is waiting for a pair() call.
+
+    Created by prepare_pin_agent().  The caller must connect GATT and then
+    call client.pair() while this context is active — BlueZ will invoke our
+    agent's RequestPinCode/RequestPasskey method during that pair() call.
+
+    Must always be cleaned up via cleanup(), even on failure.
+    """
+
+    def __init__(
+        self,
+        bus: Any,
+        agent_registered: bool,
+        already_bonded: bool = False,
+        agent: Any = None,
+    ) -> None:
+        self.bus = bus
+        self.agent_registered = agent_registered
+        self.already_bonded = already_bonded
+        self._agent = agent
+
+    @property
+    def agent_responded(self) -> bool:
+        """True if BlueZ actually called our agent for the PIN."""
+        return bool(self._agent and self._agent.responded)
+
+    async def cleanup(self) -> None:
+        """Unregister agent and disconnect D-Bus."""
+        if self.agent_registered and self.bus:
+            try:
+                from dbus_fast import Message  # noqa: F811
+
+                await self.bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        path="/org/bluez",
+                        interface=AGENT_MANAGER_IFACE,
+                        member="UnregisterAgent",
+                        signature="o",
+                        body=[AGENT_PATH],
+                    )
+                )
+                _LOGGER.debug("PIN agent unregistered")
+            except Exception as exc:
+                _LOGGER.debug("Agent cleanup error: %s", exc)
+        if self.bus:
+            self.bus.disconnect()
+            self.bus = None
+
+
+async def prepare_pin_agent(
+    device_address: str,
+    pin: str,
+) -> PinAgentContext | None:
+    """Register a D-Bus PIN agent WITHOUT calling Device1.Pair().
+
+    This follows the Android pattern: register the agent so it is ready,
+    then connect GATT, then call client.pair() — BlueZ will invoke our agent
+    during that pair() call to provide the PIN.
+
+    Returns a PinAgentContext that MUST be cleaned up via ctx.cleanup().
+    Returns None if D-Bus is not available on this platform.
+    If the device is already bonded, ctx.already_bonded is True and no
+    agent is registered (cleanup() is still safe to call).
+    """
+    if not _DBUS_AVAILABLE:
+        return None
+
+    from dbus_fast import BusType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    passkey = int(pin) if pin.isdigit() else 0
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception as exc:
+        _LOGGER.error("Cannot connect to system D-Bus: %s", exc)
+        return None
+
+    try:
+        # If already bonded, no agent registration needed.
+        device_path = await _find_device_path(bus, device_address)
+        if device_path and await _is_paired(bus, device_path):
+            _LOGGER.info(
+                "Device %s already bonded in BlueZ — PIN agent not needed",
+                device_address,
+            )
+            return PinAgentContext(bus=bus, agent_registered=False, already_bonded=True)
+
+        # Register PIN agent and leave it active for the upcoming pair() call.
+        agent = _PinAgentInterface(passkey, pin)
+        bus.export(AGENT_PATH, agent)
+
+        agent_registered = await _register_agent(bus)
+        if not agent_registered:
+            _LOGGER.error("Failed to register PIN agent with BlueZ")
+            bus.disconnect()
+            return None
+
+        _LOGGER.info(
+            "PIN agent registered for %s (passkey=%d) — "
+            "connect GATT then call pair() to complete bonding",
+            device_address,
+            passkey,
+        )
+        return PinAgentContext(
+            bus=bus,
+            agent_registered=True,
+            already_bonded=False,
+            agent=agent,
+        )
+
+    except Exception as exc:
+        _LOGGER.error("prepare_pin_agent failed for %s: %s", device_address, exc)
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+        return None
+
+
 async def pair_with_pin(
     device_address: str,
     pin: str,

@@ -28,7 +28,13 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .ble_agent import is_pin_pairing_supported, pair_push_button, pair_with_pin, remove_bond
+from .ble_agent import (
+    PinAgentContext,
+    is_pin_pairing_supported,
+    pair_push_button,
+    prepare_pin_agent,
+    remove_bond,
+)
 from .const import (
     AUTH_SERVICE_UUID,
     BLE_MTU_SIZE,
@@ -105,8 +111,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._bluetooth_pin: str = entry.data.get(
             CONF_BLUETOOTH_PIN, ""
         ) or self.gateway_pin
-        self._pin_bond_attempted: bool = False  # track per-connection
-        self._pin_dbus_succeeded: bool = False  # D-Bus path succeeded?
+        self._pin_agent_ctx: PinAgentContext | None = None  # active D-Bus agent context
+        self._pin_dbus_succeeded: bool = False  # bonding completed this session
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -360,12 +366,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         max_attempts = 3
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
-            # Allow each attempt a fresh shot at PIN bonding.  On attempt 1 the
-            # device may not yet be in the BlueZ object tree (HA hasn't scanned
-            # it), so pair_with_pin() returns immediately; by attempt 2 HA has
-            # scanned it and bonding can succeed.
-            if self.is_pin_gateway and not self._pin_dbus_succeeded:
-                self._pin_bond_attempted = False
             try:
                 await self._try_connect(attempt)
                 return
@@ -457,9 +457,21 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"OneControl device {self.address} not found by HA Bluetooth"
             )
 
-        # ── D-Bus bonding BEFORE Bleak connect ────────────────────────
+        # ── D-Bus setup BEFORE Bleak connect ──────────────────────────
         if self.is_pin_gateway:
-            await self._pair_pin_gateway()
+            # Register the PIN agent NOW so it is waiting when BlueZ asks
+            # for the PIN during client.pair() after GATT connect.
+            # We do NOT call Device1.Pair() here — that is done post-connect,
+            # matching the Android flow: connectGatt() → createBond() in
+            # onConnectionStateChange.
+            ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+            self._pin_agent_ctx = ctx
+            if ctx and ctx.already_bonded:
+                self._pin_dbus_succeeded = True
+                _LOGGER.info(
+                    "PIN gateway %s — already bonded, connecting directly",
+                    self.address,
+                )
         elif is_pin_pairing_supported():
             _LOGGER.info(
                 "PushButton gateway — attempting D-Bus Just Works pairing "
@@ -479,15 +491,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address,
                 )
         else:
-            _LOGGER.debug("D-Bus not available — skipping PushButton pre-pairing")
+            _LOGGER.debug("D-Bus not available — skipping pre-pairing")
 
-        client = await establish_connection(
-            BleakClient,
-            device,
-            self.address,
-            disconnected_callback=self._on_disconnect,
-        )
-        await self._finish_connect(client)
+        try:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.address,
+                disconnected_callback=self._on_disconnect,
+            )
+            await self._finish_connect(client)
+        except Exception:
+            # Ensure PIN agent is cleaned up if we never reach _finish_connect
+            if self._pin_agent_ctx:
+                await self._pin_agent_ctx.cleanup()
+                self._pin_agent_ctx = None
+            raise
 
     async def _try_connect_direct(self, adapter: str) -> None:
         """Connect directly via a local HCI adapter, bypassing HA routing.
@@ -528,9 +547,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.address, adapter, getattr(ble_device, "rssi", "?"),
         )
 
-        if self.is_pin_gateway:
-            await self._pair_pin_gateway()
-
         client = await establish_connection(
             BleakClient,
             ble_device,
@@ -547,8 +563,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connected = True
         _LOGGER.info("Connected to %s", self.address)
 
-        # ── Pairing fallback (PushButton — only if D-Bus didn't bond) ─
+        # ── Pairing ────────────────────────────────────────────────────
         if not self.is_pin_gateway:
+            # PushButton: D-Bus Just Works pairing ran pre-connect; call pair()
+            # here as a belt-and-suspenders fallback in case it didn't bond.
             try:
                 _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
                 if hasattr(client, "pair"):
@@ -560,39 +578,53 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.info("pair() not implemented — may already be bonded")
             except Exception as exc:
                 _LOGGER.warning("pair() failed: %s — continuing", exc)
-        elif getattr(self, "_pin_dbus_succeeded", False):
-            _LOGGER.info("PIN gateway — skipping Bleak pair() (already bonded via D-Bus)")
-        else:
-            # D-Bus path failed or unavailable — try Bleak pair() as fallback.
-            # This may work via ESPHome BT proxy if it supports passkey forwarding.
+        elif self._pin_agent_ctx and self._pin_agent_ctx.already_bonded:
+            # Already bonded in BlueZ — no re-pairing needed.
+            _LOGGER.info("PIN gateway %s — already bonded, skipping pair()", self.address)
+            await self._pin_agent_ctx.cleanup()
+            self._pin_agent_ctx = None
+        elif self._pin_agent_ctx:
+            # Agent is registered and waiting.  Call pair() now — BlueZ will
+            # invoke our agent's RequestPinCode/RequestPasskey.
+            # This matches Android: createBond() in onConnectionStateChange.
             _LOGGER.info(
-                "PIN gateway — D-Bus bonding unavailable, attempting Bleak pair() "
-                "fallback for %s (may work via BT proxy)",
+                "PIN gateway %s — calling pair() with D-Bus agent active",
+                self.address,
+            )
+            try:
+                if hasattr(client, "pair"):
+                    await client.pair()
+                    _LOGGER.info(
+                        "PIN bonding completed for %s (agent responded: %s)",
+                        self.address,
+                        self._pin_agent_ctx.agent_responded,
+                    )
+                    self._pin_dbus_succeeded = True
+                else:
+                    _LOGGER.warning("pair() not available — PIN bonding may fail")
+            except NotImplementedError:
+                _LOGGER.warning("pair() not implemented — PIN gateway may fail to authenticate")
+            except Exception as exc:
+                _LOGGER.warning("PIN pair() failed: %s", exc)
+            finally:
+                await self._pin_agent_ctx.cleanup()
+                self._pin_agent_ctx = None
+        else:
+            # D-Bus not available (non-Linux / dev machine).
+            _LOGGER.info(
+                "PIN gateway %s — D-Bus not available, attempting Bleak pair() without agent",
                 self.address,
             )
             try:
                 if hasattr(client, "pair"):
                     paired = await client.pair()
-                    _LOGGER.info(
-                        "Bleak pair() fallback result: %s — "
-                        "if authentication fails, a direct USB Bluetooth "
-                        "adapter may be required for PIN gateways",
-                        paired,
-                    )
+                    _LOGGER.info("Bleak pair() result: %s", paired)
                 else:
                     _LOGGER.warning("pair() not available on client wrapper")
             except NotImplementedError:
-                _LOGGER.warning(
-                    "pair() not implemented on this backend — "
-                    "PIN gateway may fail to authenticate"
-                )
+                _LOGGER.warning("pair() not implemented on this backend")
             except Exception as exc:
-                _LOGGER.warning(
-                    "Bleak pair() fallback failed: %s — "
-                    "a direct USB Bluetooth adapter may be required "
-                    "for PIN gateways",
-                    exc,
-                )
+                _LOGGER.warning("Bleak pair() failed: %s", exc)
 
         await asyncio.sleep(0.5)
 
@@ -683,67 +715,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Subscribed to SEED (0x0011)")
         except BleakError as exc:
             _LOGGER.warning("Failed to subscribe SEED: %s", exc)
-
-    # ------------------------------------------------------------------
-    # PIN-based pairing (D-Bus agent)
-    # ------------------------------------------------------------------
-
-    async def _pair_pin_gateway(self) -> None:
-        """Handle PIN-based bonding via BlueZ D-Bus agent.
-
-        Called before Bleak client.connect() for legacy PIN gateways.
-        The D-Bus agent provides the passkey when BlueZ requests it
-        during Device1.Pair().  After bonding, the subsequent Bleak
-        connect() will use the established bond.
-
-        If D-Bus pairing is unavailable (e.g. ESPHome proxy), sets
-        _pin_dbus_succeeded = False so the post-connect path can
-        attempt a Bleak-level pair() fallback.
-
-        Reference: Android BaseBleService.kt § createBond + pairingRequestReceiver
-        """
-        if self._pin_bond_attempted:
-            _LOGGER.debug("PIN bonding already attempted this connection cycle")
-            return
-
-        self._pin_bond_attempted = True
-        self._pin_dbus_succeeded = False
-
-        if not is_pin_pairing_supported():
-            _LOGGER.warning(
-                "D-Bus PIN pairing not available on this platform — "
-                "will try Bleak pair() fallback after connect. "
-                "Gateway: %s",
-                self.address,
-            )
-            return
-
-        _LOGGER.info(
-            "PIN gateway detected — attempting D-Bus bonding for %s "
-            "(pin length=%d)",
-            self.address,
-            len(self._bluetooth_pin),
-        )
-
-        success = await pair_with_pin(
-            device_address=self.address,
-            pin=self._bluetooth_pin,
-            timeout=30.0,
-        )
-
-        if success:
-            _LOGGER.info("PIN bonding completed for %s via D-Bus", self.address)
-            self._pin_dbus_succeeded = True
-        else:
-            _LOGGER.warning(
-                "D-Bus PIN bonding failed for %s — will try Bleak pair() "
-                "fallback after connect",
-                self.address,
-            )
-
-        # Short settle delay after bonding (matching Android GATT_SETTLE_DELAY)
-        if self._pin_dbus_succeeded:
-            await asyncio.sleep(1.0)
 
     async def _remove_stale_bond(self) -> None:
         """Remove a stale bond and reset for re-pairing.
@@ -1064,8 +1035,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._decoder.reset()
         self._metadata_requested = False
         self._has_can_write = False
-        self._pin_bond_attempted = False  # Allow re-bonding on reconnect
         self._pin_dbus_succeeded = False
+        # PIN agent context is cleaned up inside _finish_connect; if somehow
+        # still set here, schedule async cleanup (callback is synchronous).
+        if self._pin_agent_ctx:
+            ctx = self._pin_agent_ctx
+            self._pin_agent_ctx = None
+            self.hass.async_create_task(ctx.cleanup())
 
         # Schedule automatic reconnection with exponential backoff
         self._schedule_reconnect()
