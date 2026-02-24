@@ -21,7 +21,7 @@ from .const import (
     DOMAIN,
     LIPPERT_MANUFACTURER_ID,
 )
-from .protocol.advertisement import PairingMethod, parse_manufacturer_data
+from .protocol.advertisement import PairingMethod
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,12 +59,8 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self._address = discovery_info.address
         self._name = discovery_info.name or f"OneControl {discovery_info.address}"
 
-        # Parse pairing capabilities from advertisement
-        caps = parse_manufacturer_data(discovery_info.manufacturer_data)
-        self._pairing_method = caps.pairing_method
-
         self.context["title_placeholders"] = {"name": self._name}
-        return await self.async_step_confirm()
+        return await self.async_step_pairing_method()
 
     # ------------------------------------------------------------------
     # User-initiated flow (manual add)
@@ -87,13 +83,11 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 if info.address == address:
                     self._discovery_info = info
                     self._name = info.name or f"OneControl {address}"
-                    caps = parse_manufacturer_data(info.manufacturer_data)
-                    self._pairing_method = caps.pairing_method
                     break
             else:
                 self._name = f"OneControl {address}"
 
-            return await self.async_step_confirm()
+            return await self.async_step_pairing_method()
 
         # Build a list of discovered OneControl gateways
         devices: dict[str, str] = {}
@@ -109,6 +103,33 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {vol.Required(CONF_ADDRESS): vol.In(devices)}
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # Pairing method selection
+    # ------------------------------------------------------------------
+
+    async def async_step_pairing_method(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask the user whether their gateway uses Push-to-Pair or PIN."""
+        if user_input is not None:
+            self._pairing_method = PairingMethod(user_input[CONF_PAIRING_METHOD])
+            return await self.async_step_confirm()
+
+        return self.async_show_form(
+            step_id="pairing_method",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PAIRING_METHOD): vol.In(
+                        {
+                            PairingMethod.PUSH_BUTTON.value: "Push-to-Pair (has a physical Connect button)",
+                            PairingMethod.PIN.value: "PIN (legacy gateway, no Connect button)",
+                        }
+                    )
+                }
+            ),
+            description_placeholders={"name": self._name or "OneControl"},
         )
 
     # ------------------------------------------------------------------

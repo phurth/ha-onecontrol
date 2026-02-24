@@ -8,6 +8,13 @@
           "address": "Gateway"
         }
       },
+      "pairing_method": {
+        "title": "Gateway Type — {name}",
+        "description": "Does your OneControl gateway have a physical **Connect** button you press to start pairing, or does it use a fixed PIN printed on a sticker?\n\nCheck the label on your gateway if you're unsure.",
+        "data": {
+          "pairing_method": "Gateway type"
+        }
+      },
       "confirm": {
         "title": "Configure {name}",
         "description": "Enter the 6-digit PIN from the sticker on your OneControl gateway.",
