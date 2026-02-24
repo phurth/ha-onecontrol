@@ -360,6 +360,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         max_attempts = 3
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
+            # Allow each attempt a fresh shot at PIN bonding.  On attempt 1 the
+            # device may not yet be in the BlueZ object tree (HA hasn't scanned
+            # it), so pair_with_pin() returns immediately; by attempt 2 HA has
+            # scanned it and bonding can succeed.
+            if self.is_pin_gateway and not self._pin_dbus_succeeded:
+                self._pin_bond_attempted = False
             try:
                 await self._try_connect(attempt)
                 return
@@ -383,10 +389,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.info("Retrying in %ds...", delay)
                     await asyncio.sleep(delay)
 
+        assert last_exc is not None
+
+        # PIN gateways require bonding before any connection can succeed.
+        # If bonding hasn't succeeded yet, skip direct adapter fallback —
+        # unbonded connects will fail and each attempt leaves BlueZ with
+        # a pending InProgress state that blocks all subsequent attempts.
+        if self.is_pin_gateway and not self._pin_dbus_succeeded:
+            _LOGGER.warning(
+                "PIN gateway %s: D-Bus bonding did not succeed — skipping "
+                "direct adapter fallback.  Ensure the gateway PIN is correct "
+                "and the device is powered on and in pairing mode.",
+                self.address,
+            )
+            raise last_exc
+
         # All HA-routed attempts failed — try direct HCI adapters as fallback.
         # This handles the case where the ESPHome BT proxy has no free slots
         # but a local USB/onboard adapter can reach the gateway.
-        assert last_exc is not None
         _LOGGER.warning(
             "All %d HA-routed connection attempts failed for %s; "
             "trying direct HCI adapter fallback",
