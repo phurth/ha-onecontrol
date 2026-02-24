@@ -468,7 +468,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             dbus_ok = await pair_push_button(self.address, timeout=30.0)
             if dbus_ok:
-                _LOGGER.info("D-Bus PushButton pairing succeeded for %s", self.address)
+                _LOGGER.info(
+                    "D-Bus PushButton pairing OK for %s (bonded or already bonded)",
+                    self.address,
+                )
             else:
                 _LOGGER.warning(
                     "D-Bus PushButton pairing failed for %s — "
