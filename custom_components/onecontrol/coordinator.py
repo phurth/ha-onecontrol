@@ -391,6 +391,38 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         assert last_exc is not None
 
+        # Stale bond detection: if all retries failed with br-connection-canceled
+        # AND we skipped PIN pairing because the device appeared already bonded
+        # (_pin_dbus_succeeded=True via already_bonded), the bond is stale (e.g.
+        # created by a prior push_button attempt or after a gateway factory reset).
+        # Remove the stale bond from BlueZ and do one fresh PIN pairing attempt.
+        if (
+            self.is_pin_gateway
+            and self._pin_dbus_succeeded
+            and "br-connection-canceled" in str(last_exc)
+        ):
+            _LOGGER.warning(
+                "PIN gateway %s: existing BlueZ bond failed with br-connection-canceled "
+                "— removing stale bond and retrying with fresh PIN pairing",
+                self.address,
+            )
+            removed = await remove_bond(self.address)
+            if removed:
+                _LOGGER.info(
+                    "Stale bond removed for %s — attempting fresh PIN pairing",
+                    self.address,
+                )
+                self._pin_dbus_succeeded = False
+                try:
+                    await self._try_connect(max_attempts + 1)
+                    return
+                except Exception as stale_exc:
+                    last_exc = stale_exc
+                    _LOGGER.warning(
+                        "Re-pair attempt after stale bond removal failed for %s: %s",
+                        self.address, stale_exc,
+                    )
+
         # PIN gateways require bonding before any connection can succeed.
         # If bonding hasn't succeeded yet, skip direct adapter fallback —
         # unbonded connects will fail and each attempt leaves BlueZ with
