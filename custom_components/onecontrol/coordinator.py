@@ -113,6 +113,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ) or self.gateway_pin
         self._pin_agent_ctx: PinAgentContext | None = None  # active D-Bus agent context
         self._pin_dbus_succeeded: bool = False  # bonding completed this session
+        self._pin_already_bonded: bool = False  # BlueZ "already bonded" seen (sticky — not reset on disconnect)
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -391,18 +392,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         assert last_exc is not None
 
-        # Stale bond detection: if all retries failed with br-connection-canceled
-        # AND we skipped PIN pairing because the device appeared already bonded
-        # (_pin_dbus_succeeded=True via already_bonded), the bond is stale (e.g.
-        # created by a prior push_button attempt or after a gateway factory reset).
-        # Remove the stale bond from BlueZ and do one fresh PIN pairing attempt.
-        if (
-            self.is_pin_gateway
-            and self._pin_dbus_succeeded
-            and "br-connection-canceled" in str(last_exc)
-        ):
+        # Stale bond detection: if BlueZ reported "already bonded" at any point
+        # this session but all connection attempts still failed, the bond is stale
+        # (e.g. created by a prior push_button session or after a gateway reset).
+        # _pin_already_bonded is a sticky flag — unlike _pin_dbus_succeeded it is
+        # NOT cleared by _on_disconnect, so it survives across the retry loop.
+        # We remove the stale bond and attempt one fresh PIN pairing.
+        if self.is_pin_gateway and self._pin_already_bonded:
             _LOGGER.warning(
-                "PIN gateway %s: existing BlueZ bond failed with br-connection-canceled "
+                "PIN gateway %s: BlueZ bond present but all connection attempts failed "
                 "— removing stale bond and retrying with fresh PIN pairing",
                 self.address,
             )
@@ -413,6 +411,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address,
                 )
                 self._pin_dbus_succeeded = False
+                self._pin_already_bonded = False
                 try:
                     await self._try_connect(max_attempts + 1)
                     return
@@ -500,6 +499,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._pin_dbus_succeeded = True
+                self._pin_already_bonded = True
                 _LOGGER.info(
                     "PIN gateway %s — already bonded, connecting directly",
                     self.address,
@@ -760,7 +760,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.info("Removing stale bond for PIN gateway %s", self.address)
         removed = await remove_bond(self.address)
         if removed:
-            self._pin_bond_attempted = False  # Allow re-bonding on next connect
+            self._pin_already_bonded = False
             _LOGGER.info("Bond removed — will re-pair on next connection")
         else:
             _LOGGER.warning("Could not remove bond for %s", self.address)
@@ -1079,9 +1079,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
-        """Schedule a reconnect attempt with exponential backoff."""
+        """Schedule a reconnect attempt with exponential backoff.
+
+        Cancels any in-progress reconnect timer and restarts it.  This debounces
+        rapid _on_disconnect calls that fire during BRC internal retries and
+        prevents multiple concurrent reconnect coroutines from racing each other
+        into BlueZ's "InProgress" error state.
+        """
         if self._reconnect_task and not self._reconnect_task.done():
-            return  # Already scheduled
+            self._reconnect_task.cancel()
 
         delay = min(
             RECONNECT_BACKOFF_BASE * (2 ** self._consecutive_failures),
