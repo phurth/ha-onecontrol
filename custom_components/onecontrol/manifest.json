@@ -9,6 +9,7 @@
     "bluetooth_adapters"
   ],
   "documentation": "https://github.com/phurth/ha-onecontrol",
+  "issue_tracker": "https://github.com/phurth/ha-onecontrol/issues",
   "bluetooth": [
     {
       "manufacturer_id": 1177
