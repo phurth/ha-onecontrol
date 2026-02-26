@@ -211,6 +211,9 @@ class HourMeter:
     table_id: int = 0
     device_id: int = 0
     hours: float = 0.0
+    maintenance_due: bool = False
+    maintenance_past_due: bool = False
+    error: bool = False
 
 
 @dataclass
@@ -558,15 +561,23 @@ def parse_real_time_clock(data: bytes) -> RealTimeClock | None:
 
 
 def parse_hour_meter(data: bytes) -> HourMeter | None:
-    """Parse HourMeter (0x0F)."""
-    if len(data) < 4:
+    """Parse HourMeter (0x0F).
+
+    Frame: [0x0F][tableId][deviceId][opSec3][opSec2][opSec1][opSec0][statusBits]
+    Android ref: handleHourMeterStatus() — BytesPerDevice=6 starting at offset 2.
+    OperatingSeconds is a big-endian uint32; statusBits carries maintenance flags.
+    """
+    if len(data) < 8:
         return None
-    # hours are typically a 16-bit value at data[3..4]
-    hours_raw = (data[3] << 8 | data[4]) if len(data) >= 5 else data[3]
+    operating_seconds = int.from_bytes(data[3:7], "big")
+    status_bits = data[7]
     return HourMeter(
         table_id=data[1],
         device_id=data[2],
-        hours=hours_raw / 10.0,  # 0.1h resolution
+        hours=operating_seconds / 3600.0,
+        maintenance_due=bool(status_bits & 0x02),
+        maintenance_past_due=bool(status_bits & 0x04),
+        error=bool(status_bits & 0x20),
     )
 
 

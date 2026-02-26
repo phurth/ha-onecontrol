@@ -491,6 +491,17 @@ class OneControlHourMeterSensor(_OneControlSensorBase):
         hm = self.coordinator.hour_meters.get(self._key)
         return hm.hours if hm else None
 
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        hm = self.coordinator.hour_meters.get(self._key)
+        if hm is None:
+            return None
+        return {
+            "maintenance_due": hm.maintenance_due,
+            "maintenance_past_due": hm.maintenance_past_due,
+            "error": hm.error,
+        }
+
     async def async_will_remove_from_hass(self) -> None:
         self._unsub()
 

@@ -153,6 +153,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_loaded_tables: set[int] = set()
         self._metadata_rejected_tables: set[int] = set()
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
+        # Set once the initial GetDevices command has been sent after connection.
+        # Metadata requests are delayed until this is True to mirror the v2.7.2
+        # Android plugin sequencing (GetDevices T+500ms, metadata T+1500ms).
+        self._initial_get_devices_sent: bool = False
         # CRC of the metadata last successfully loaded from the gateway.
         # Persists across disconnect/reconnect so we can skip re-requests when
         # the gateway reports the same DeviceMetadataTableCrc (official app behaviour).
@@ -908,6 +912,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         _LOGGER.info("OneControl %s — notifications enabled, waiting for SEED", self.address)
 
+        # For non-PIN gateways authenticated in step 1, start the heartbeat now.
+        # PIN gateways start it in _authenticate_step2 after the SEED handshake.
+        if self._authenticated:
+            self._start_heartbeat()
+
+        # Send an initial GetDevices command to wake the gateway before metadata
+        # is requested.  Mirrors v2.7.2 Android plugin: GetDevices at T+500ms,
+        # metadata at T+1500ms.  Older gateway firmware requires the device-list
+        # request to be processed before it will serve GetDevicesMetadata.
+        self.hass.async_create_task(self._send_initial_get_devices())
+
     # ------------------------------------------------------------------
     # Step 1: UNLOCK_STATUS challenge → KEY response
     # ------------------------------------------------------------------
@@ -1033,9 +1048,37 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:
             _LOGGER.warning("Failed to send metadata request: %s", exc)
 
-    async def _request_metadata_after_delay(self, table_id: int) -> None:
-        """Wait 500ms then request metadata (INTERNALS.md timing)."""
+    async def _send_initial_get_devices(self) -> None:
+        """Send GetDevices at T+500ms to wake the gateway before metadata is requested.
+
+        Mirrors v2.7.2 Android plugin sequencing: GetDevices fires 500ms after
+        notifications are enabled, metadata fires 1500ms after.  Some gateway
+        firmware requires the device-list request to be processed before it will
+        serve GetDevicesMetadata.
+        """
         await asyncio.sleep(0.5)
+        if not self._connected or not self._authenticated:
+            return
+        if self.gateway_info is None:
+            return
+        try:
+            cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
+            await self.async_send_command(cmd)
+            self._initial_get_devices_sent = True
+            _LOGGER.debug(
+                "Initial GetDevices sent for table %d", self.gateway_info.table_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Initial GetDevices failed: %s", exc)
+
+    async def _request_metadata_after_delay(self, table_id: int) -> None:
+        """Wait 1500ms then request metadata.
+
+        The 1.5 s delay matches the v2.7.2 Android plugin (GetDevices at T+500ms,
+        metadata at T+1500ms), giving the gateway time to process the device-list
+        request before we ask for metadata.
+        """
+        await asyncio.sleep(1.5)
         if (
             table_id not in self._metadata_requested_tables
             and table_id not in self._metadata_rejected_tables
@@ -1067,7 +1110,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _start_heartbeat(self) -> None:
         """Start the heartbeat loop after authentication."""
         self._stop_heartbeat()
-        self._heartbeat_task = self.hass.async_create_task(self._heartbeat_loop())
+        self._heartbeat_task = self.hass.async_create_background_task(
+            self._heartbeat_loop(), name="ha_onecontrol_heartbeat"
+        )
         _LOGGER.info("Heartbeat started (every %.0fs)", HEARTBEAT_INTERVAL)
 
     def _stop_heartbeat(self) -> None:
@@ -1436,6 +1481,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()
         self._pending_metadata_cmdids.clear()
+        self._initial_get_devices_sent = False
         self._has_can_write = False
         self._pin_dbus_succeeded = False
         # PIN agent context is cleaned up inside _finish_connect; if somehow
