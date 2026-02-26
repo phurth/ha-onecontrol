@@ -1,5 +1,5 @@
 {
-  "domain": "onecontrol",
+  "domain": "ha_onecontrol",
   "name": "OneControl",
   "codeowners": [
     "@phurth"
