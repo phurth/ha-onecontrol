@@ -159,8 +159,12 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
     async def async_turn_on(self, **kwargs: Any) -> None:
         brightness = kwargs.get(ATTR_BRIGHTNESS)
         if brightness is None:
-            light = self.coordinator.dimmable_lights.get(self._key)
-            brightness = light.brightness if light and light.brightness > 0 else 255
+            # Restore last active brightness — mirrors Android lastKnownDimmableBrightness.
+            # Cannot use current state because it holds 0 while the light is off.
+            brightness = self.coordinator._last_known_dimmable_brightness.get(self._key, 255)
+        else:
+            # Record explicit brightness for future restore.
+            self.coordinator._last_known_dimmable_brightness[self._key] = brightness
 
         effect = kwargs.get(ATTR_EFFECT)
         if effect and effect in _DIMMABLE_EFFECTS:

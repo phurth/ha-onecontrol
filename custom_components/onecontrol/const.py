@@ -105,6 +105,27 @@ HVAC_FAN_AUTO = 0
 HVAC_FAN_HIGH = 1
 HVAC_FAN_LOW = 2
 
+# Pending command guard windows (seconds) — match Android plugin constants
+HVAC_PENDING_WINDOW_S = 8.0           # suppress stale echoes after mode/fan command
+HVAC_SETPOINT_PENDING_WINDOW_S = 20.0  # wider window for setpoint changes (+ retries)
+HVAC_PRESET_PENDING_WINDOW_S = 70.0   # extended guard for preset (delayed echoes arrive 30-60s later)
+
+# Setpoint debounce and retry
+HVAC_SETPOINT_DEBOUNCE_S = 0.25
+HVAC_SETPOINT_RETRY_DELAY_S = 5.0
+HVAC_SETPOINT_MAX_RETRIES = 3
+
+# Observed capability bitmask bits (accumulated from status events)
+HVAC_CAP_GAS = 0x01
+HVAC_CAP_AC = 0x02
+HVAC_CAP_HEAT_PUMP = 0x04
+HVAC_CAP_MULTISPEED_FAN = 0x08
+
+# Heat source preset names (match Android / HA climate preset_mode)
+HVAC_PRESET_GAS = "Prefer Gas"
+HVAC_PRESET_HEAT_PUMP = "Prefer Heat Pump"
+HVAC_PRESET_NONE = "none"
+
 # ---------------------------------------------------------------------------
 # Cover status byte values (state-only, no commands — INTERNALS.md § Cover)
 # ---------------------------------------------------------------------------

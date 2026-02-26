@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from bleak import BleakClient, BleakGATTCharacteristic, BleakScanner
@@ -48,6 +49,15 @@ from .const import (
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
     HEARTBEAT_INTERVAL,
+    HVAC_CAP_AC,
+    HVAC_CAP_GAS,
+    HVAC_CAP_HEAT_PUMP,
+    HVAC_CAP_MULTISPEED_FAN,
+    HVAC_PENDING_WINDOW_S,
+    HVAC_PRESET_PENDING_WINDOW_S,
+    HVAC_SETPOINT_MAX_RETRIES,
+    HVAC_SETPOINT_PENDING_WINDOW_S,
+    HVAC_SETPOINT_RETRY_DELAY_S,
     KEY_CHAR_UUID,
     LOCKOUT_CLEAR_THROTTLE,
     NOTIFICATION_ENABLE_DELAY,
@@ -88,6 +98,23 @@ _LOGGER = logging.getLogger(__name__)
 def _device_key(table_id: int, device_id: int) -> str:
     """Canonical string key for a (table, device) pair."""
     return f"{table_id:02x}:{device_id:02x}"
+
+
+@dataclass
+class PendingHvacCommand:
+    """State of an in-flight HVAC BLE command used by the pending guard and retry logic."""
+
+    table_id: int
+    device_id: int
+    heat_mode: int
+    heat_source: int
+    fan_mode: int
+    low_trip_f: int
+    high_trip_f: int
+    is_setpoint_change: bool
+    is_preset_change: bool
+    sent_at: float        # time.monotonic() timestamp of last send
+    retry_count: int = 0
 
 
 class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -159,6 +186,23 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Metadata: friendly names per device key
         self.device_names: dict[str, str] = {}
         self._metadata_raw: dict[str, DeviceMetadata] = {}
+
+        # Last non-zero brightness per dimmable device (persists across off/on cycles).
+        # Mirrors Android lastKnownDimmableBrightness — only updated when brightness > 0.
+        self._last_known_dimmable_brightness: dict[str, int] = {}
+
+        # ── HVAC debounce / pending guard / retry ─────────────────────
+        # Pending command guard: suppresses stale gateway echoes during command window.
+        # Mirrors Android pendingHvacCommands.
+        self._pending_hvac: dict[str, PendingHvacCommand] = {}
+        # Command merge baseline: kept in sync with hvac_zones but only updated
+        # after the pending guard passes (so suppressed echoes don't corrupt merges).
+        self._hvac_zone_states: dict[str, HvacZone] = {}
+        # Observed capability bitmask learned from status events.
+        # Mirrors Android observedHvacCapability (bit0=Gas, bit1=AC, bit2=HeatPump, bit3=Fan).
+        self.observed_hvac_capability: dict[str, int] = {}
+        # Asyncio timer handles for setpoint retry (one per zone).
+        self._hvac_retry_handles: dict[str, asyncio.TimerHandle] = {}
 
         # Entity platform callbacks (typed)
         self._event_callbacks: list[Callable[[Any], None]] = []
@@ -255,12 +299,167 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         fan_mode: int = 0,
         low_trip_f: int = 65,
         high_trip_f: int = 78,
+        is_setpoint_change: bool = False,
+        is_preset_change: bool = False,
     ) -> None:
-        """Send an HVAC command."""
+        """Send an HVAC command and register a pending command guard."""
         cmd = self._cmd.build_action_hvac(
             table_id, device_id, heat_mode, heat_source, fan_mode, low_trip_f, high_trip_f
         )
         await self.async_send_command(cmd)
+
+        key = _device_key(table_id, device_id)
+        self._pending_hvac[key] = PendingHvacCommand(
+            table_id=table_id,
+            device_id=device_id,
+            heat_mode=heat_mode,
+            heat_source=heat_source,
+            fan_mode=fan_mode,
+            low_trip_f=low_trip_f,
+            high_trip_f=high_trip_f,
+            is_setpoint_change=is_setpoint_change,
+            is_preset_change=is_preset_change,
+            sent_at=time.monotonic(),
+        )
+        if is_setpoint_change:
+            self._schedule_setpoint_retry(key)
+
+    # ------------------------------------------------------------------
+    # HVAC capability tracking, pending guard, and setpoint retry
+    # ------------------------------------------------------------------
+
+    def _update_observed_hvac_capability(self, zone_key: str, zone: HvacZone) -> None:
+        """Accumulate observed HVAC capability from status events.
+
+        Mirrors Android observedHvacCapability logic — each status event can
+        reveal new capabilities even if GetDevicesMetadata returns 0x00.
+        """
+        prev = self.observed_hvac_capability.get(zone_key, 0)
+        cap = prev
+
+        active_status = zone.zone_status & 0x0F
+        if active_status == 2:
+            cap |= HVAC_CAP_AC
+        elif active_status == 3:
+            cap |= HVAC_CAP_HEAT_PUMP | HVAC_CAP_AC
+        elif active_status in (5, 6):
+            cap |= HVAC_CAP_GAS
+
+        if zone.heat_mode in (1, 3):
+            if zone.heat_source == 0:
+                cap |= HVAC_CAP_GAS
+            elif zone.heat_source == 1:
+                cap |= HVAC_CAP_HEAT_PUMP
+        if zone.heat_mode in (2, 3):
+            cap |= HVAC_CAP_AC
+        if zone.fan_mode == 2:
+            cap |= HVAC_CAP_MULTISPEED_FAN
+
+        if cap != prev:
+            self.observed_hvac_capability[zone_key] = cap
+            _LOGGER.debug(
+                "HVAC %s: observed capability 0x%02X→0x%02X (status=%d mode=%d src=%d fan=%d)",
+                zone_key, prev, cap,
+                active_status, zone.heat_mode, zone.heat_source, zone.fan_mode,
+            )
+
+    def _handle_hvac_zone(self, zone: HvacZone) -> None:
+        """Apply the pending command guard and update hvac_zones / _hvac_zone_states.
+
+        Always updates observed capability and triggers metadata request.
+        Only updates state dicts if the event is not suppressed by the guard.
+        Mirrors Android handleHvacStatus() pending-guard logic.
+        """
+        key = _device_key(zone.table_id, zone.device_id)
+        self._ensure_metadata_for_table(zone.table_id)
+        self._update_observed_hvac_capability(key, zone)
+
+        pending = self._pending_hvac.get(key)
+        if pending is not None:
+            age = time.monotonic() - pending.sent_at
+            window = (
+                HVAC_PRESET_PENDING_WINDOW_S if pending.is_preset_change
+                else HVAC_SETPOINT_PENDING_WINDOW_S if pending.is_setpoint_change
+                else HVAC_PENDING_WINDOW_S
+            )
+            if age <= window:
+                low_ok = abs(zone.low_trip_f - pending.low_trip_f) <= 1
+                high_ok = abs(zone.high_trip_f - pending.high_trip_f) <= 1
+                matches = (
+                    zone.heat_mode == pending.heat_mode
+                    and zone.heat_source == pending.heat_source
+                    and zone.fan_mode == pending.fan_mode
+                    and low_ok and high_ok
+                )
+                if not matches:
+                    _LOGGER.debug(
+                        "HVAC guard: suppressing stale echo for %s (age=%.1fs window=%.0fs)",
+                        key, age, window,
+                    )
+                    return  # suppress — do not update hvac_zones
+                # Matched — gateway confirmed our command
+                if not pending.is_preset_change:
+                    # Clear pending immediately (preset guard holds full window)
+                    self._pending_hvac.pop(key, None)
+                    if key in self._hvac_retry_handles:
+                        self._hvac_retry_handles.pop(key).cancel()
+                    _LOGGER.debug("HVAC guard: command confirmed for %s (age=%.1fs)", key, age)
+            else:
+                # Window expired — clear stale pending
+                self._pending_hvac.pop(key, None)
+
+        self.hvac_zones[key] = zone
+        self._hvac_zone_states[key] = zone
+
+    def _schedule_setpoint_retry(self, zone_key: str) -> None:
+        """Schedule a setpoint verification/retry check after HVAC_SETPOINT_RETRY_DELAY_S.
+
+        Mirrors Android scheduleSetpointVerification() — WRITE_TYPE_NO_RESPONSE
+        can be silently dropped by the BLE stack; this ensures eventual delivery.
+        """
+        if zone_key in self._hvac_retry_handles:
+            self._hvac_retry_handles.pop(zone_key).cancel()
+
+        def _callback() -> None:
+            self.hass.async_create_task(self._do_retry_setpoint(zone_key))
+
+        self._hvac_retry_handles[zone_key] = self.hass.loop.call_later(
+            HVAC_SETPOINT_RETRY_DELAY_S, _callback
+        )
+
+    async def _do_retry_setpoint(self, zone_key: str) -> None:
+        """Re-send an unconfirmed HVAC setpoint command.
+
+        Uses exact values from PendingHvacCommand — no re-merging.
+        Mirrors Android retryHvacSetpoint().
+        """
+        pending = self._pending_hvac.get(zone_key)
+        if pending is None or not pending.is_setpoint_change:
+            return  # already confirmed — nothing to do
+        if pending.retry_count >= HVAC_SETPOINT_MAX_RETRIES:
+            _LOGGER.warning(
+                "HVAC setpoint retries exhausted (%d) for %s — giving up",
+                HVAC_SETPOINT_MAX_RETRIES, zone_key,
+            )
+            self._pending_hvac.pop(zone_key, None)
+            return
+        _LOGGER.debug(
+            "HVAC setpoint retry %d/%d for %s (low=%d high=%d)",
+            pending.retry_count + 1, HVAC_SETPOINT_MAX_RETRIES, zone_key,
+            pending.low_trip_f, pending.high_trip_f,
+        )
+        cmd = self._cmd.build_action_hvac(
+            pending.table_id, pending.device_id,
+            pending.heat_mode, pending.heat_source, pending.fan_mode,
+            pending.low_trip_f, pending.high_trip_f,
+        )
+        await self.async_send_command(cmd)
+        self._pending_hvac[zone_key] = replace(
+            pending,
+            retry_count=pending.retry_count + 1,
+            sent_at=time.monotonic(),
+        )
+        self._schedule_setpoint_retry(zone_key)
 
     async def async_set_generator(
         self, table_id: int, device_id: int, run: bool
@@ -1040,6 +1239,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, DimmableLight):
             key = _device_key(event.table_id, event.device_id)
             self.dimmable_lights[key] = event
+            if event.brightness > 0:
+                self._last_known_dimmable_brightness[key] = event.brightness
             self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, RgbLight):
@@ -1056,9 +1257,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Multi-item events: HvacZone list, TankLevel list, DeviceMetadata list
             for item in event:
                 if isinstance(item, HvacZone):
-                    key = _device_key(item.table_id, item.device_id)
-                    self.hvac_zones[key] = item
-                    self._ensure_metadata_for_table(item.table_id)
+                    self._handle_hvac_zone(item)
                 elif isinstance(item, TankLevel):
                     key = _device_key(item.table_id, item.device_id)
                     self.tanks[key] = item
@@ -1072,9 +1271,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HvacZone):
-            key = _device_key(event.table_id, event.device_id)
-            self.hvac_zones[key] = event
-            self._ensure_metadata_for_table(event.table_id)
+            self._handle_hvac_zone(event)
 
         elif isinstance(event, DeviceOnline):
             key = _device_key(event.table_id, event.device_id)
