@@ -213,11 +213,34 @@ class HourMeter:
 
 @dataclass
 class GeneratorStatus:
-    """Generator Genie status (event 0x0A)."""
+    """Generator Genie status (event 0x0A).
+
+    Android reference: handleGeneratorGenieStatus()
+    Frame: [0x0A][tableId][deviceId][status0][battH][battL][tempH][tempL]
+      state (bits 0-2 of status0): 0=Off,1=Priming,2=Starting,3=Running,4=Stopping
+      quiet_hours (bit 7 of status0): True when quiet hours mode active
+      battery_voltage: unsigned 8.8 fixed-point big-endian, volts
+      temperature_c: signed 8.8 fixed-point big-endian, °C; None if unsupported/invalid
+    """
 
     table_id: int = 0
     device_id: int = 0
-    is_running: bool = False
+    state: int = 0  # 0=Off,1=Priming,2=Starting,3=Running,4=Stopping
+    battery_voltage: float = 0.0
+    temperature_c: float | None = None
+    quiet_hours: bool = False
+
+    @property
+    def is_running(self) -> bool:
+        """True only when fully running (state == 3)."""
+        return self.state == 3
+
+    @property
+    def state_name(self) -> str:
+        """Human-readable state string."""
+        return {0: "off", 1: "priming", 2: "starting", 3: "running", 4: "stopping"}.get(
+            self.state, "unknown"
+        )
 
 
 @dataclass
@@ -410,13 +433,33 @@ def parse_rgb_light(data: bytes) -> RgbLight | None:
 
 
 def parse_generator_status(data: bytes) -> GeneratorStatus | None:
-    """Parse GeneratorGenie status (0x0A)."""
-    if len(data) < 4:
+    """Parse GeneratorGenie status (0x0A).
+
+    Android reference: handleGeneratorGenieStatus()
+    Frame (8+ bytes): [0x0A][tableId][deviceId][status0][battH][battL][tempH][tempL]
+      status0 bits 0-2: state enum (0=Off,1=Priming,2=Starting,3=Running,4=Stopping)
+      status0 bit 7:    QuietHoursActive
+      bytes 4-5: battery voltage, unsigned 8.8 big-endian fixed-point (volts)
+      bytes 6-7: temperature, signed 8.8 big-endian fixed-point (°C);
+                 0x8000 = not supported, 0x7FFF = sensor invalid
+    """
+    if len(data) < 8:
         return None
+    status0 = data[3] & 0xFF
+    batt_raw = (data[4] << 8) | data[5]
+    temp_raw = (data[6] << 8) | data[7]
+    if temp_raw in (0x8000, 0x7FFF):
+        temperature_c = None
+    else:
+        signed = temp_raw - 0x10000 if temp_raw >= 0x8000 else temp_raw
+        temperature_c = signed / 256.0
     return GeneratorStatus(
         table_id=data[1],
         device_id=data[2],
-        is_running=data[3] != 0,
+        state=status0 & 0x07,
+        battery_voltage=batt_raw / 256.0,
+        temperature_c=temperature_c,
+        quiet_hours=bool(status0 & 0x80),
     )
 
 

@@ -15,6 +15,7 @@ Reference: INTERNALS.md § Event Types
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -22,13 +23,14 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .protocol.events import GeneratorStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +50,27 @@ async def async_setup_entry(
         OneControlInMotionLockout(coordinator, address),
         OneControlDataHealthy(coordinator, address),
     ])
+
+    discovered_gen_quiet: set[str] = set()
+
+    @callback
+    def _on_event(event: Any) -> None:
+        if isinstance(event, GeneratorStatus):
+            key = f"{event.table_id:02x}:{event.device_id:02x}"
+            if key not in discovered_gen_quiet:
+                discovered_gen_quiet.add(key)
+                async_add_entities(
+                    [OneControlGeneratorQuietHours(coordinator, address, event.table_id, event.device_id)]
+                )
+
+    coordinator.register_event_callback(_on_event)
+
+    for key, gen in coordinator.generators.items():
+        if key not in discovered_gen_quiet:
+            discovered_gen_quiet.add(key)
+            async_add_entities(
+                [OneControlGeneratorQuietHours(coordinator, address, gen.table_id, gen.device_id)]
+            )
 
 
 class OneControlGatewayConnectivity(
@@ -187,3 +210,61 @@ class OneControlDataHealthy(
         if age is None:
             return {}
         return {"last_event_age_seconds": round(age, 1)}
+
+
+class OneControlGeneratorQuietHours(
+    CoordinatorEntity[OneControlCoordinator], BinarySensorEntity
+):
+    """Binary sensor for generator quiet hours mode — event 0x0A.
+
+    On when the generator is operating in quiet/reduced-noise mode.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:volume-off"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        mac = address.replace(":", "").lower()
+        self._attr_unique_id = f"{mac}_gen_quiet_{table_id:02x}{device_id:02x}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            name=f"OneControl {address}",
+            manufacturer="Lippert / LCI",
+            model="BLE Gateway",
+            connections={("bluetooth", address)},
+        )
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base} Quiet Hours"
+
+    @property
+    def is_on(self) -> bool | None:
+        gen = self.coordinator.generators.get(self._key)
+        if gen is None:
+            return None
+        return gen.quiet_hours
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, GeneratorStatus)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()

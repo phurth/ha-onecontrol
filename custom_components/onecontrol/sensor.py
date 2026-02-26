@@ -83,7 +83,11 @@ async def async_setup_entry(
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_generators:
                     discovered_generators.add(key)
-                    new.append(OneControlGeneratorSensor(coordinator, address, item.table_id, item.device_id))
+                    new.extend([
+                        OneControlGeneratorSensor(coordinator, address, item.table_id, item.device_id),
+                        OneControlGeneratorBatterySensor(coordinator, address, item.table_id, item.device_id),
+                        OneControlGeneratorTemperatureSensor(coordinator, address, item.table_id, item.device_id),
+                    ])
 
             elif isinstance(item, HourMeter):
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
@@ -110,7 +114,11 @@ async def async_setup_entry(
     for key, gen in coordinator.generators.items():
         if key not in discovered_generators:
             discovered_generators.add(key)
-            entities.append(OneControlGeneratorSensor(coordinator, address, gen.table_id, gen.device_id))
+            entities.extend([
+                OneControlGeneratorSensor(coordinator, address, gen.table_id, gen.device_id),
+                OneControlGeneratorBatterySensor(coordinator, address, gen.table_id, gen.device_id),
+                OneControlGeneratorTemperatureSensor(coordinator, address, gen.table_id, gen.device_id),
+            ])
     for key, hm in coordinator.hour_meters.items():
         if key not in discovered_hour_meters:
             discovered_hour_meters.add(key)
@@ -338,7 +346,105 @@ class OneControlGeneratorSensor(_OneControlSensorBase):
         gen = self.coordinator.generators.get(self._key)
         if gen is None:
             return None
-        return "Running" if gen.is_running else "Stopped"
+        return gen.state_name.capitalize()  # Off/Priming/Starting/Running/Stopping
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, GeneratorStatus)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()
+
+
+class OneControlGeneratorBatterySensor(_OneControlSensorBase):
+    """Generator battery voltage sensor — event 0x0A."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:car-battery"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator, address)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_gen_battery_{table_id:02x}{device_id:02x}"
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base} Battery"
+
+    @property
+    def native_value(self) -> float | None:
+        gen = self.coordinator.generators.get(self._key)
+        if gen is None:
+            return None
+        return round(gen.battery_voltage, 2)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, GeneratorStatus)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()
+
+
+class OneControlGeneratorTemperatureSensor(_OneControlSensorBase):
+    """Generator temperature sensor — event 0x0A.
+
+    Returns None (unavailable) when the generator reports 0x8000 (not supported)
+    or 0x7FFF (sensor invalid).
+    """
+
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator, address)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_gen_temp_{table_id:02x}{device_id:02x}"
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base} Temperature"
+
+    @property
+    def native_value(self) -> float | None:
+        gen = self.coordinator.generators.get(self._key)
+        if gen is None or gen.temperature_c is None:
+            return None
+        return round(gen.temperature_c, 1)
 
     async def async_will_remove_from_hass(self) -> None:
         self._unsub()

@@ -22,7 +22,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
-from .protocol.events import RelayStatus
+from .protocol.events import GeneratorStatus, RelayStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ async def async_setup_entry(
     address = entry.data[CONF_ADDRESS]
 
     discovered: set[str] = set()
+    discovered_generators: set[str] = set()
 
     @callback
     def _on_event(event: Any) -> None:
@@ -47,6 +48,13 @@ async def async_setup_entry(
                 async_add_entities(
                     [OneControlSwitch(coordinator, address, event.table_id, event.device_id)]
                 )
+        elif isinstance(event, GeneratorStatus):
+            key = f"{event.table_id:02x}:{event.device_id:02x}"
+            if key not in discovered_generators:
+                discovered_generators.add(key)
+                async_add_entities(
+                    [OneControlGeneratorSwitch(coordinator, address, event.table_id, event.device_id)]
+                )
 
     coordinator.register_event_callback(_on_event)
 
@@ -56,6 +64,13 @@ async def async_setup_entry(
             discovered.add(key)
             async_add_entities(
                 [OneControlSwitch(coordinator, address, relay.table_id, relay.device_id)]
+            )
+
+    for key, gen in coordinator.generators.items():
+        if key not in discovered_generators:
+            discovered_generators.add(key)
+            async_add_entities(
+                [OneControlGeneratorSwitch(coordinator, address, gen.table_id, gen.device_id)]
             )
 
 
@@ -140,6 +155,72 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
     def _on_event(self, event: Any) -> None:
         if (
             isinstance(event, RelayStatus)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()
+
+
+class OneControlGeneratorSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
+    """Generator start/stop switch — event 0x0A, command 0x42.
+
+    is_on is True when state is Priming, Starting, or Running (state in 1..3),
+    matching Android's isActive logic. This prevents re-sending ON during the
+    startup sequence and gives accurate state during shutdown (Stopping = off).
+
+    No optimistic state update — waits for real GeneratorGenieStatus event to
+    confirm state change (same as Android plugin).
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:engine"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        mac = address.replace(":", "").lower()
+        self._attr_unique_id = f"{mac}_gen_switch_{table_id:02x}{device_id:02x}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            name=f"OneControl {address}",
+            manufacturer="Lippert / LCI",
+            model="BLE Gateway",
+            connections={("bluetooth", address)},
+        )
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        return self.coordinator.device_name(self._table_id, self._device_id)
+
+    @property
+    def is_on(self) -> bool | None:
+        gen = self.coordinator.generators.get(self._key)
+        if gen is None:
+            return None
+        return gen.state in (1, 2, 3)  # Priming, Starting, or Running
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self.coordinator.async_set_generator(self._table_id, self._device_id, True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self.coordinator.async_set_generator(self._table_id, self._device_id, False)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, GeneratorStatus)
             and event.table_id == self._table_id
             and event.device_id == self._device_id
         ):
