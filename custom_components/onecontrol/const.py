@@ -1,6 +1,6 @@
 """Constants for the OneControl BLE integration."""
 
-DOMAIN = "ha_onecontrol"
+DOMAIN = "onecontrol"
 
 # ---------------------------------------------------------------------------
 # BLE Service & Characteristic UUIDs
