@@ -2,13 +2,13 @@
   "domain": "onecontrol",
   "name": "OneControl",
   "codeowners": [
-    "@petehurth"
+    "@phurth"
   ],
   "config_flow": true,
   "dependencies": [
     "bluetooth_adapters"
   ],
-  "documentation": "https://github.com/petehurth/ha-onecontrol",
+  "documentation": "https://github.com/phurth/ha-onecontrol",
   "bluetooth": [
     {
       "manufacturer_id": 1177
