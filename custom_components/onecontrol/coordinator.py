@@ -121,7 +121,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._authenticated = False
         self._connected = False
         self._connect_lock = asyncio.Lock()
-        self._metadata_requested = False
+        # Per-table metadata tracking (replaces single _metadata_requested bool)
+        self._metadata_requested_tables: set[int] = set()
+        self._metadata_loaded_tables: set[int] = set()
+        self._metadata_rejected_tables: set[int] = set()
+        self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._heartbeat_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._consecutive_failures: int = 0
@@ -324,17 +328,30 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_refresh_metadata(self) -> None:
         """Re-request device metadata for all known table IDs."""
-        table_ids = set()
+        # Reset per-table state so all tables can be re-requested
+        self._metadata_requested_tables.clear()
+        self._metadata_loaded_tables.clear()
+        self._metadata_rejected_tables.clear()
+        self._pending_metadata_cmdids.clear()
+
+        # Collect all known table IDs: gateway, previously loaded metadata,
+        # and all observed device status tables (covers tables we saw via status
+        # events but may not have successfully loaded metadata for)
+        table_ids: set[int] = set()
         if self.gateway_info:
             table_ids.add(self.gateway_info.table_id)
-        for key in list(self._metadata_raw.keys()):
-            table_ids.add(self._metadata_raw[key].table_id)
-        if not table_ids and self.gateway_info:
-            table_ids.add(self.gateway_info.table_id)
-        # NOTE: Do NOT reset _metadata_requested here — the heartbeat
-        # GatewayInformation handler checks this flag and would schedule
-        # a duplicate request 500ms later.
-        for tid in table_ids:
+        for meta in self._metadata_raw.values():
+            table_ids.add(meta.table_id)
+        for status_dict in (
+            self.relays, self.dimmable_lights, self.rgb_lights, self.covers,
+            self.hvac_zones, self.tanks, self.device_online, self.device_locks,
+            self.generators, self.hour_meters,
+        ):
+            for key in status_dict:
+                t = int(key.split(":")[0], 16)
+                if t != 0:
+                    table_ids.add(t)
+        for tid in sorted(table_ids):
             await self._send_metadata_request(tid)
 
     # ------------------------------------------------------------------
@@ -804,18 +821,41 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _send_metadata_request(self, table_id: int) -> None:
         """Send GetDevicesMetadata for a single table ID."""
         cmd = self._cmd.build_get_devices_metadata(table_id)
+        cmd_id = int.from_bytes(cmd[0:2], "little")
+        self._pending_metadata_cmdids[cmd_id] = table_id
+        self._metadata_requested_tables.add(table_id)
         try:
             await self.async_send_command(cmd)
-            _LOGGER.info("Sent GetDevicesMetadata for table %d", table_id)
+            _LOGGER.info("Sent GetDevicesMetadata for table %d (cmdId=%d)", table_id, cmd_id)
         except Exception as exc:
             _LOGGER.warning("Failed to send metadata request: %s", exc)
 
-    async def _request_metadata_after_delay(self) -> None:
+    async def _request_metadata_after_delay(self, table_id: int) -> None:
         """Wait 500ms then request metadata (INTERNALS.md timing)."""
         await asyncio.sleep(0.5)
-        if self.gateway_info and not self._metadata_requested:
-            self._metadata_requested = True
-            await self._send_metadata_request(self.gateway_info.table_id)
+        if (
+            table_id not in self._metadata_requested_tables
+            and table_id not in self._metadata_rejected_tables
+        ):
+            await self._send_metadata_request(table_id)
+
+    def _ensure_metadata_for_table(self, table_id: int) -> None:
+        """Request metadata for an observed table_id if not yet requested/loaded/rejected.
+
+        Implements the observed-table path: any status event carrying a table_id
+        triggers a metadata request for that table if we haven't already loaded or
+        requested it.  This mirrors Android's ensureMetadataRequestedForTable().
+        """
+        if table_id == 0:
+            return
+        if (
+            table_id in self._metadata_loaded_tables
+            or table_id in self._metadata_rejected_tables
+            or table_id in self._metadata_requested_tables
+        ):
+            return
+        _LOGGER.info("Requesting metadata for observed table_id=%d", table_id)
+        self.hass.async_create_task(self._send_metadata_request(table_id))
 
     # ------------------------------------------------------------------
     # Heartbeat keepalive (GetDevices every 5 seconds)
@@ -898,8 +938,38 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Track data freshness
         self._last_event_time = time.monotonic()
 
-        event = parse_event(frame)
         event_type = frame[0]
+
+        # Detect metadata error responses before full parse.
+        # An error 0x02 frame has responseType=0x82 at byte 3.
+        # Reference: METADATA_RETRIEVAL.md § Response Format; Android handleCommandResponse()
+        if event_type == 0x02 and len(frame) >= 4:
+            response_type = frame[3] & 0xFF
+            if response_type == 0x82:
+                cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
+                rejected_table = self._pending_metadata_cmdids.pop(cmd_id, None)
+                if rejected_table is not None:
+                    error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
+                    if error_code == 0x0F:
+                        self._metadata_rejected_tables.add(rejected_table)
+                        _LOGGER.warning(
+                            "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
+                            " — suppressing retries",
+                            rejected_table,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "Metadata request failed for table_id=%d (errorCode=0x%02x)",
+                            rejected_table,
+                            error_code if error_code >= 0 else 0,
+                        )
+                else:
+                    _LOGGER.debug(
+                        "Metadata error response for unknown cmdId=%d", cmd_id
+                    )
+                return
+
+        event = parse_event(frame)
         _LOGGER.debug(
             "Event 0x%02X (%d bytes): %s",
             event_type,
@@ -915,9 +985,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 event.table_id,
                 event.device_count,
             )
-            # Trigger metadata request 500ms later (INTERNALS.md § Timing)
-            if not self._metadata_requested:
-                self.hass.async_create_task(self._request_metadata_after_delay())
+            # Trigger metadata request 500ms later, per table_id.
+            # Handles gateways that rotate table_ids in GatewayInfo. (INTERNALS.md § Timing)
+            if (
+                event.table_id not in self._metadata_requested_tables
+                and event.table_id not in self._metadata_rejected_tables
+            ):
+                self.hass.async_create_task(
+                    self._request_metadata_after_delay(event.table_id)
+                )
 
         elif isinstance(event, RvStatus):
             self.rv_status = event
@@ -930,6 +1006,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, RelayStatus):
             key = _device_key(event.table_id, event.device_id)
             self.relays[key] = event
+            self._ensure_metadata_for_table(event.table_id)
             # Fire HA event for DTC faults (only on change, gas appliances only)
             # Android behaviour: only publish DTC for devices with "gas" in name
             prev_dtc = self._last_dtc_codes.get(key, 0)
@@ -963,14 +1040,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, DimmableLight):
             key = _device_key(event.table_id, event.device_id)
             self.dimmable_lights[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, RgbLight):
             key = _device_key(event.table_id, event.device_id)
             self.rgb_lights[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, CoverStatus):
             key = _device_key(event.table_id, event.device_id)
             self.covers[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, list):
             # Multi-item events: HvacZone list, TankLevel list, DeviceMetadata list
@@ -978,23 +1058,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if isinstance(item, HvacZone):
                     key = _device_key(item.table_id, item.device_id)
                     self.hvac_zones[key] = item
+                    self._ensure_metadata_for_table(item.table_id)
                 elif isinstance(item, TankLevel):
                     key = _device_key(item.table_id, item.device_id)
                     self.tanks[key] = item
+                    self._ensure_metadata_for_table(item.table_id)
                 elif isinstance(item, DeviceMetadata):
                     self._process_metadata(item)
 
         elif isinstance(event, TankLevel):
             key = _device_key(event.table_id, event.device_id)
             self.tanks[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HvacZone):
             key = _device_key(event.table_id, event.device_id)
             self.hvac_zones[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, DeviceOnline):
             key = _device_key(event.table_id, event.device_id)
             self.device_online[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, SystemLockout):
             self.system_lockout_level = event.lockout_level
@@ -1006,14 +1091,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, DeviceLock):
             key = _device_key(event.table_id, event.device_id)
             self.device_locks[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, GeneratorStatus):
             key = _device_key(event.table_id, event.device_id)
             self.generators[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HourMeter):
             key = _device_key(event.table_id, event.device_id)
             self.hour_meters[key] = event
+            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, RealTimeClock):
             self.rtc = event
@@ -1034,6 +1122,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_raw[key] = meta
         name = get_friendly_name(meta.function_name, meta.function_instance)
         self.device_names[key] = name
+        self._metadata_loaded_tables.add(meta.table_id)
         _LOGGER.info(
             "Metadata: %s → func=%d inst=%d → %s",
             key.upper(), meta.function_name, meta.function_instance, name,
@@ -1065,7 +1154,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connected = False
         self._authenticated = False
         self._decoder.reset()
-        self._metadata_requested = False
+        self._metadata_requested_tables.clear()
+        self._metadata_loaded_tables.clear()
+        self._metadata_rejected_tables.clear()
+        self._pending_metadata_cmdids.clear()
         self._has_can_write = False
         self._pin_dbus_succeeded = False
         # PIN agent context is cleaned up inside _finish_connect; if somehow

@@ -566,6 +566,19 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
                     function_instance=func_instance,
                 )
             )
+        elif protocol == METADATA_PROTOCOL_HOST and payload_size == 0:
+            # Host device with no IDS CAN metadata — Gateway RVLink default.
+            # Reference: Android OneControlDevicePlugin.kt handleGetDevicesMetadataResponse()
+            # func=323 (0x0143) "Gateway RVLink", instance=15
+            device_id = (start_id + index) & 0xFF
+            results.append(
+                DeviceMetadata(
+                    table_id=table_id,
+                    device_id=device_id,
+                    function_name=323,
+                    function_instance=15,
+                )
+            )
 
         offset += payload_size + 2
         index += 1
