@@ -45,6 +45,8 @@ class GatewayInformation:
     options: int = 0
     device_count: int = 0
     table_id: int = 0
+    device_table_crc: int = 0           # uint32 LE at offset 5–8 (MyRvLinkGatewayInformation.cs)
+    device_metadata_table_crc: int = 0  # uint32 LE at offset 9–12; used for cache validation
 
 
 @dataclass
@@ -262,13 +264,16 @@ class DeviceMetadata:
 
 
 def parse_gateway_information(data: bytes) -> GatewayInformation | None:
-    if len(data) < 5:
+    # Official app MinPayloadLength = 13 (MyRvLinkGatewayInformation.cs)
+    if len(data) < 13:
         return None
     return GatewayInformation(
         protocol_version=data[1],
         options=data[2],
         device_count=data[3],
         table_id=data[4],
+        device_table_crc=int.from_bytes(data[5:9], "little"),
+        device_metadata_table_crc=int.from_bytes(data[9:13], "little"),
     )
 
 

@@ -153,6 +153,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_loaded_tables: set[int] = set()
         self._metadata_rejected_tables: set[int] = set()
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
+        # CRC of the metadata last successfully loaded from the gateway.
+        # Persists across disconnect/reconnect so we can skip re-requests when
+        # the gateway reports the same DeviceMetadataTableCrc (official app behaviour).
+        self._last_metadata_crc: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._consecutive_failures: int = 0
@@ -1139,11 +1143,40 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         event_type = frame[0]
 
-        # Detect metadata error responses before full parse.
-        # An error 0x02 frame has responseType=0x82 at byte 3.
-        # Reference: METADATA_RETRIEVAL.md § Response Format; Android handleCommandResponse()
+        # Detect metadata error/completion responses before full parse.
+        # responseType byte 3: 0x01=SuccessMulti, 0x81=SuccessComplete, 0x02/0x82=Fail
+        # Reference: METADATA_RETRIEVAL.md § Response Format; MyRvLinkCommandGetDevicesMetadata.cs
         if event_type == 0x02 and len(frame) >= 4:
             response_type = frame[3] & 0xFF
+            if response_type == 0x81:
+                # SuccessComplete: final frame carrying DeviceMetadataTableCrc (bytes 4–7 LE)
+                # and total device count (byte 8). Validate CRC against GatewayInformation.
+                cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
+                completed_table = self._pending_metadata_cmdids.pop(cmd_id, None)
+                if completed_table is not None and len(frame) >= 8:
+                    response_crc = int.from_bytes(frame[4:8], "little")
+                    expected_crc = (
+                        self.gateway_info.device_metadata_table_crc
+                        if self.gateway_info is not None
+                        else 0
+                    )
+                    if expected_crc != 0 and response_crc != expected_crc:
+                        _LOGGER.warning(
+                            "Metadata CRC mismatch for table %d: "
+                            "response=0x%08x, expected=0x%08x — discarding",
+                            completed_table,
+                            response_crc,
+                            expected_crc,
+                        )
+                        self._metadata_loaded_tables.discard(completed_table)
+                        self._last_metadata_crc = None
+                    else:
+                        _LOGGER.debug(
+                            "Metadata completion OK for table %d (CRC=0x%08x)",
+                            completed_table,
+                            response_crc,
+                        )
+                return
             if response_type == 0x82:
                 cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
                 rejected_table = self._pending_metadata_cmdids.pop(cmd_id, None)
@@ -1178,16 +1211,56 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── Update accumulated state ──────────────────────────────────
         if isinstance(event, GatewayInformation):
-            self.gateway_info = event
             _LOGGER.debug(
-                "GatewayInfo: table_id=%d, devices=%d",
+                "GatewayInfo: table_id=%d, devices=%d, "
+                "table_crc=0x%08x, metadata_crc=0x%08x",
                 event.table_id,
                 event.device_count,
+                event.device_table_crc,
+                event.device_metadata_table_crc,
             )
-            # Trigger metadata request 500ms later, per table_id.
-            # Handles gateways that rotate table_ids in GatewayInfo. (INTERNALS.md § Timing)
+
+            # CRC-gated metadata logic (mirrors official app DeviceMetadataTracker):
+            # If the gateway reports the same DeviceMetadataTableCrc we last loaded,
+            # the metadata in _metadata_raw is still valid — restore tracking state
+            # and skip the BLE request entirely.
+            # If the CRC has changed, invalidate cached metadata for this table so
+            # a fresh request is triggered (e.g. after a gateway firmware update).
+            crc = event.device_metadata_table_crc
+            if crc != 0 and crc == self._last_metadata_crc:
+                self._metadata_loaded_tables.add(event.table_id)
+                _LOGGER.debug(
+                    "Metadata CRC unchanged (0x%08x), skipping re-request for table %d",
+                    crc,
+                    event.table_id,
+                )
+            elif (
+                self._last_metadata_crc is not None
+                and crc != self._last_metadata_crc
+                and event.table_id in self._metadata_loaded_tables
+            ):
+                _LOGGER.info(
+                    "Metadata CRC changed (0x%08x → 0x%08x), invalidating table %d",
+                    self._last_metadata_crc,
+                    crc,
+                    event.table_id,
+                )
+                self._last_metadata_crc = None
+                prefix = f"{event.table_id:02x}:"
+                for k in list(self._metadata_raw):
+                    if k.startswith(prefix):
+                        del self._metadata_raw[k]
+                        self.device_names.pop(k, None)
+                self._metadata_requested_tables.discard(event.table_id)
+                self._metadata_loaded_tables.discard(event.table_id)
+                self._metadata_rejected_tables.discard(event.table_id)
+
+            self.gateway_info = event
+
+            # Schedule metadata request if not already handled by CRC gate above.
             if (
-                event.table_id not in self._metadata_requested_tables
+                event.table_id not in self._metadata_loaded_tables
+                and event.table_id not in self._metadata_requested_tables
                 and event.table_id not in self._metadata_rejected_tables
             ):
                 self.hass.async_create_task(
@@ -1320,6 +1393,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         name = get_friendly_name(meta.function_name, meta.function_instance)
         self.device_names[key] = name
         self._metadata_loaded_tables.add(meta.table_id)
+        # Record the CRC for the gateway's primary table so reconnects can skip
+        # re-requesting metadata when the CRC hasn't changed.
+        if (
+            self.gateway_info is not None
+            and meta.table_id == self.gateway_info.table_id
+            and self.gateway_info.device_metadata_table_crc != 0
+        ):
+            self._last_metadata_crc = self.gateway_info.device_metadata_table_crc
         _LOGGER.info(
             "Metadata: %s → func=%d inst=%d → %s",
             key.upper(), meta.function_name, meta.function_instance, name,
