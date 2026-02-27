@@ -87,6 +87,7 @@ from .protocol.events import (
     SystemLockout,
     TankLevel,
     parse_event,
+    parse_metadata_response,
 )
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.function_names import get_friendly_name
@@ -156,11 +157,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables: set[int] = set()
         self._metadata_retry_counts: dict[int, int] = {}   # table_id → 0x0f retry count
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
+        self._pending_metadata_entries: dict[int, dict[str, DeviceMetadata]] = {}
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._cmd_correlation_stats: dict[str, int] = {
             "metadata_success_multi_accepted": 0,
             "metadata_success_multi_discarded_get_devices": 0,
             "metadata_success_multi_discarded_unknown": 0,
+            "metadata_entries_staged": 0,
+            "metadata_commit_success": 0,
+            "metadata_commit_crc_mismatch": 0,
+            "metadata_commit_count_mismatch": 0,
             "command_error_unknown": 0,
             "get_devices_rejected": 0,
             "get_devices_completed": 0,
@@ -554,6 +560,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
+        self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
 
         # Collect all known table IDs: gateway, previously loaded metadata,
@@ -1056,11 +1063,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cmd = self._cmd.build_get_devices_metadata(table_id)
         cmd_id = int.from_bytes(cmd[0:2], "little")
         self._pending_metadata_cmdids[cmd_id] = table_id
+        self._pending_metadata_entries.pop(cmd_id, None)
         self._metadata_requested_tables.add(table_id)
         try:
             await self.async_send_command(cmd)
             _LOGGER.info("Sent GetDevicesMetadata for table %d (cmdId=%d)", table_id, cmd_id)
         except Exception as exc:
+            self._pending_metadata_cmdids.pop(cmd_id, None)
+            self._pending_metadata_entries.pop(cmd_id, None)
             _LOGGER.warning("Failed to send metadata request: %s", exc)
 
     async def _retry_metadata_after_rejection(self, table_id: int) -> None:
@@ -1273,12 +1283,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # CRC is big-endian per MyRvLinkCommandGetDevicesMetadataResponseCompleted.cs
                     # (GetValueUInt32 defaults to Endian.Big in ArrayExtension.cs)
                     response_crc = int.from_bytes(frame[4:8], "big")
+                    response_count = frame[8] & 0xFF if len(frame) >= 9 else None
+                    staged_entries = self._pending_metadata_entries.pop(cmd_id, {})
+                    staged_count = len(staged_entries)
                     expected_crc = (
                         self.gateway_info.device_metadata_table_crc
                         if self.gateway_info is not None
                         else 0
                     )
                     if expected_crc != 0 and response_crc != expected_crc:
+                        self._cmd_correlation_stats["metadata_commit_crc_mismatch"] += 1
                         _LOGGER.warning(
                             "Metadata CRC mismatch for table %d: "
                             "response=0x%08x, expected=0x%08x — discarding",
@@ -1287,17 +1301,36 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             expected_crc,
                         )
                         self._metadata_loaded_tables.discard(completed_table)
+                        self._metadata_requested_tables.discard(completed_table)
+                        self._last_metadata_crc = None
+                    elif response_count is not None and response_count != staged_count:
+                        self._cmd_correlation_stats["metadata_commit_count_mismatch"] += 1
+                        _LOGGER.warning(
+                            "Metadata count mismatch for table %d: completed=%d staged=%d — discarding",
+                            completed_table,
+                            response_count,
+                            staged_count,
+                        )
+                        self._metadata_loaded_tables.discard(completed_table)
+                        self._metadata_requested_tables.discard(completed_table)
                         self._last_metadata_crc = None
                     else:
+                        for meta in staged_entries.values():
+                            self._process_metadata(meta)
+                        self._metadata_loaded_tables.add(completed_table)
+                        self._last_metadata_crc = response_crc
+                        self._cmd_correlation_stats["metadata_commit_success"] += 1
                         _LOGGER.debug(
-                            "Metadata completion OK for table %d (CRC=0x%08x)",
+                            "Metadata completion OK for table %d (CRC=0x%08x, entries=%d)",
                             completed_table,
                             response_crc,
+                            staged_count,
                         )
                 return
             if response_type == 0x82:
                 cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
                 rejected_table = self._pending_metadata_cmdids.pop(cmd_id, None)
+                self._pending_metadata_entries.pop(cmd_id, None)
                 if rejected_table is not None:
                     error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
                     if error_code == 0x0F:
@@ -1370,6 +1403,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                     return
                 self._cmd_correlation_stats["metadata_success_multi_accepted"] += 1
+                staged = self._pending_metadata_entries.setdefault(cmd_id, {})
+                added = 0
+                for meta in parse_metadata_response(frame):
+                    key = _device_key(meta.table_id, meta.device_id)
+                    if key not in staged:
+                        added += 1
+                    staged[key] = meta
+                if added:
+                    self._cmd_correlation_stats["metadata_entries_staged"] += added
+                return
 
         event = parse_event(frame)
         _LOGGER.debug(
@@ -1613,6 +1656,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
+        self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
