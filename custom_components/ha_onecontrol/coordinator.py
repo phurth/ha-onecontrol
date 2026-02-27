@@ -154,6 +154,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables: set[int] = set()
         self._metadata_retry_counts: dict[int, int] = {}   # table_id → 0x0f retry count
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
+        self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
         # Set once the initial GetDevices command has been sent after connection.
         # Metadata requests are delayed until this is True to mirror the v2.7.2
         # Android plugin sequencing (GetDevices T+500ms, metadata T+1500ms).
@@ -542,6 +543,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
+        self._pending_get_devices_cmdids.clear()
 
         # Collect all known table IDs: gateway, previously loaded metadata,
         # and all observed device status tables (covers tables we saw via status
@@ -1095,10 +1097,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         try:
             cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
+            cmd_id = int.from_bytes(cmd[0:2], "little")
+            self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
             await self.async_send_command(cmd)
             self._initial_get_devices_sent = True
             _LOGGER.debug(
-                "Initial GetDevices sent for table %d", self.gateway_info.table_id
+                "Initial GetDevices sent for table %d (cmdId=%d)",
+                self.gateway_info.table_id, cmd_id,
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Initial GetDevices failed: %s", exc)
@@ -1231,7 +1236,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
                 completed_table = self._pending_metadata_cmdids.pop(cmd_id, None)
                 if completed_table is not None and len(frame) >= 8:
-                    response_crc = int.from_bytes(frame[4:8], "little")
+                    # CRC is big-endian per MyRvLinkCommandGetDevicesMetadataResponseCompleted.cs
+                    # (GetValueUInt32 defaults to Endian.Big in ArrayExtension.cs)
+                    response_crc = int.from_bytes(frame[4:8], "big")
                     expected_crc = (
                         self.gateway_info.device_metadata_table_crc
                         if self.gateway_info is not None
@@ -1286,9 +1293,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             error_code if error_code >= 0 else 0,
                         )
                 else:
-                    _LOGGER.debug(
-                        "Metadata error response for unknown cmdId=%d", cmd_id
-                    )
+                    # Check if this is a GetDevices rejection instead of metadata.
+                    gd_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
+                    if gd_table is not None:
+                        error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
+                        _LOGGER.warning(
+                            "GetDevices rejected by gateway for table_id=%d "
+                            "(cmdId=%d errorCode=0x%02x) — metadata may fail to load",
+                            gd_table, cmd_id,
+                            error_code if error_code >= 0 else 0,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Command error response for unknown cmdId=%d", cmd_id
+                        )
                 return
 
         event = parse_event(frame)
@@ -1533,6 +1551,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
+        self._pending_get_devices_cmdids.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
         self._pin_dbus_succeeded = False

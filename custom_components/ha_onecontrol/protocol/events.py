@@ -8,8 +8,11 @@ Reference: INTERNALS.md § Event Types, Event Parsing Examples
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 from ..const import (
     EVENT_DEVICE_COMMAND,
@@ -45,8 +48,8 @@ class GatewayInformation:
     options: int = 0
     device_count: int = 0
     table_id: int = 0
-    device_table_crc: int = 0           # uint32 LE at offset 5–8 (MyRvLinkGatewayInformation.cs)
-    device_metadata_table_crc: int = 0  # uint32 LE at offset 9–12; used for cache validation
+    device_table_crc: int = 0           # uint32 BE at offset 5–8 (MyRvLinkGatewayInformation.cs)
+    device_metadata_table_crc: int = 0  # uint32 BE at offset 9–12; used for cache validation
 
 
 @dataclass
@@ -270,13 +273,14 @@ def parse_gateway_information(data: bytes) -> GatewayInformation | None:
     # Official app MinPayloadLength = 13 (MyRvLinkGatewayInformation.cs)
     if len(data) < 13:
         return None
+    # CRC values are big-endian per ArrayExtension.cs GetValueUInt32 (Endian.Big default)
     return GatewayInformation(
         protocol_version=data[1],
         options=data[2],
         device_count=data[3],
         table_id=data[4],
-        device_table_crc=int.from_bytes(data[5:9], "little"),
-        device_metadata_table_crc=int.from_bytes(data[9:13], "little"),
+        device_table_crc=int.from_bytes(data[5:9], "big"),
+        device_metadata_table_crc=int.from_bytes(data[9:13], "big"),
     )
 
 
@@ -597,6 +601,13 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
     start_id = data[5] & 0xFF
     count = data[6] & 0xFF
 
+    # Log raw frame for field diagnostics — helps identify unknown gateway variants.
+    hex_preview = data.hex(" ").upper()
+    _LOGGER.debug(
+        "Metadata frame raw (table=%d start=%d count=%d len=%d): %s",
+        table_id, start_id, count, len(data), hex_preview,
+    )
+
     results: list[DeviceMetadata] = []
     offset = 7
     index = 0
@@ -617,6 +628,12 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
             func_instance = data[offset + 4] & 0xFF
 
             device_id = (start_id + index) & 0xFF
+            _LOGGER.debug(
+                "Metadata entry[%d]: table=%d device=0x%02x protocol=%d "
+                "payload_size=%d func=0x%04x inst=%d",
+                index, table_id, device_id, protocol, payload_size,
+                func_name, func_instance,
+            )
             results.append(
                 DeviceMetadata(
                     table_id=table_id,
@@ -630,6 +647,11 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
             # Reference: Android OneControlDevicePlugin.kt handleGetDevicesMetadataResponse()
             # func=323 (0x0143) "Gateway RVLink", instance=15
             device_id = (start_id + index) & 0xFF
+            _LOGGER.debug(
+                "Metadata entry[%d]: table=%d device=0x%02x protocol=%d "
+                "payload_size=0 (legacy Host, defaulting to Gateway RVLink func=323 inst=15)",
+                index, table_id, device_id, protocol,
+            )
             results.append(
                 DeviceMetadata(
                     table_id=table_id,
@@ -638,9 +660,26 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
                     function_instance=15,
                 )
             )
+        else:
+            # Unknown protocol/payload combination — log clearly so we can identify
+            # new gateway variants or firmware versions in the field.
+            device_id = (start_id + index) & 0xFF
+            entry_hex = data[offset : offset + 2 + min(payload_size, 32)].hex(" ").upper()
+            _LOGGER.warning(
+                "Metadata entry[%d]: UNKNOWN combination — table=%d device=0x%02x "
+                "protocol=0x%02x payload_size=%d — skipping. Raw: %s",
+                index, table_id, device_id, protocol, payload_size, entry_hex,
+            )
 
         offset += payload_size + 2
         index += 1
+
+    if len(results) != count:
+        _LOGGER.warning(
+            "Metadata count mismatch for table=%d: frame declared %d entries, "
+            "decoded %d (skipped %d). This may indicate an unknown protocol variant.",
+            table_id, count, len(results), count - len(results),
+        )
 
     return results
 
