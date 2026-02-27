@@ -152,6 +152,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_requested_tables: set[int] = set()
         self._metadata_loaded_tables: set[int] = set()
         self._metadata_rejected_tables: set[int] = set()
+        self._metadata_retry_counts: dict[int, int] = {}   # table_id → 0x0f retry count
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
         # Set once the initial GetDevices command has been sent after connection.
         # Metadata requests are delayed until this is True to mirror the v2.7.2
@@ -539,6 +540,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_requested_tables.clear()
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()
+        self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
 
         # Collect all known table IDs: gateway, previously loaded metadata,
@@ -1048,6 +1050,23 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:
             _LOGGER.warning("Failed to send metadata request: %s", exc)
 
+    async def _retry_metadata_after_rejection(self, table_id: int) -> None:
+        """Retry GetDevicesMetadata 10s after a 0x0f rejection.
+
+        Clears the rejected/requested state so _send_metadata_request can proceed.
+        If the gateway rejects again the retry counter will increment and eventually
+        the give-up path in the error handler will stop further scheduling.
+        """
+        await asyncio.sleep(10.0)
+        if not self._connected:
+            return
+        if table_id in self._metadata_loaded_tables:
+            return
+        _LOGGER.debug("Retrying metadata for table_id=%d after 0x0f rejection", table_id)
+        self._metadata_rejected_tables.discard(table_id)
+        self._metadata_requested_tables.discard(table_id)
+        await self._send_metadata_request(table_id)
+
     async def _send_initial_get_devices(self) -> None:
         """Send GetDevices at T+500ms to wake the gateway before metadata is requested.
 
@@ -1055,8 +1074,21 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         notifications are enabled, metadata fires 1500ms after.  Some gateway
         firmware requires the device-list request to be processed before it will
         serve GetDevicesMetadata.
+
+        If GatewayInfo hasn't arrived within 500ms this call is a no-op; the
+        GatewayInfo handler will call _do_send_initial_get_devices() directly
+        as a fallback when it stores the first GatewayInfo event.
         """
         await asyncio.sleep(0.5)
+        await self._do_send_initial_get_devices()
+
+    async def _do_send_initial_get_devices(self) -> None:
+        """Send the initial GetDevices command if not already sent.
+
+        Idempotent — skipped if already sent or if connection/auth state is invalid.
+        """
+        if self._initial_get_devices_sent:
+            return
         if not self._connected or not self._authenticated:
             return
         if self.gateway_info is None:
@@ -1228,12 +1260,25 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if rejected_table is not None:
                     error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
                     if error_code == 0x0F:
+                        _MAX_RETRIES = 3
+                        retry_count = self._metadata_retry_counts.get(rejected_table, 0) + 1
+                        self._metadata_retry_counts[rejected_table] = retry_count
                         self._metadata_rejected_tables.add(rejected_table)
-                        _LOGGER.warning(
-                            "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
-                            " — suppressing retries",
-                            rejected_table,
-                        )
+                        if retry_count <= _MAX_RETRIES:
+                            _LOGGER.warning(
+                                "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
+                                " — retry %d/%d in 10s",
+                                rejected_table, retry_count, _MAX_RETRIES,
+                            )
+                            self.hass.async_create_task(
+                                self._retry_metadata_after_rejection(rejected_table)
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
+                                " after %d retries — giving up",
+                                rejected_table, _MAX_RETRIES,
+                            )
                     else:
                         _LOGGER.warning(
                             "Metadata request failed for table_id=%d (errorCode=0x%02x)",
@@ -1301,6 +1346,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._metadata_rejected_tables.discard(event.table_id)
 
             self.gateway_info = event
+
+            # Belt-and-suspenders: if GatewayInfo arrived after the T+0.5s
+            # window (so _send_initial_get_devices bailed), send GetDevices now
+            # so it still precedes the metadata request below.
+            if not self._initial_get_devices_sent:
+                self.hass.async_create_task(self._do_send_initial_get_devices())
 
             # Schedule metadata request if not already handled by CRC gate above.
             if (
@@ -1480,6 +1531,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_requested_tables.clear()
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()
+        self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
