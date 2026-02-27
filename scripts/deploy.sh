@@ -7,10 +7,10 @@
 
 set -euo pipefail
 
-HOST="${1:-root@10.115.19.131}"
+HOST="${1:-root@100.127.141.49}"
 PORT="${2:-22}"
-COMPONENT_DIR="custom_components/onecontrol"
-REMOTE_DIR="/config/custom_components/onecontrol"
+COMPONENT_DIR="custom_components/ha_onecontrol"
+REMOTE_DIR="/homeassistant/custom_components/ha_onecontrol"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
