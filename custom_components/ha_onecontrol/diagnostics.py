@@ -43,6 +43,9 @@ async def async_get_config_entry_diagnostics(
         "pin_bond_attempted": coordinator._pin_bond_attempted,
         "has_can_write": coordinator._has_can_write,
         "consecutive_reconnect_failures": coordinator._consecutive_failures,
+        "pending_metadata_cmdids": len(coordinator._pending_metadata_cmdids),
+        "pending_get_devices_cmdids": len(coordinator._pending_get_devices_cmdids),
+        "cmd_correlation": dict(coordinator._cmd_correlation_stats),
     }
 
     # ── Gateway info ─────────────────────────────────────────────

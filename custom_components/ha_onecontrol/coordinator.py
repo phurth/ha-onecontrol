@@ -94,6 +94,8 @@ from .protocol.tea import calculate_step1_key, calculate_step2_key
 
 _LOGGER = logging.getLogger(__name__)
 
+_MAX_PENDING_GET_DEVICES_CMDIDS = 128
+
 
 def _device_key(table_id: int, device_id: int) -> str:
     """Canonical string key for a (table, device) pair."""
@@ -155,6 +157,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_retry_counts: dict[int, int] = {}   # table_id → 0x0f retry count
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
+        self._cmd_correlation_stats: dict[str, int] = {
+            "metadata_success_multi_accepted": 0,
+            "metadata_success_multi_discarded_get_devices": 0,
+            "metadata_success_multi_discarded_unknown": 0,
+            "command_error_unknown": 0,
+            "get_devices_rejected": 0,
+            "get_devices_completed": 0,
+            "pending_get_devices_peak": 0,
+        }
         # Set once the initial GetDevices command has been sent after connection.
         # Metadata requests are delayed until this is True to mirror the v2.7.2
         # Android plugin sequencing (GetDevices T+500ms, metadata T+1500ms).
@@ -1099,6 +1110,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
             cmd_id = int.from_bytes(cmd[0:2], "little")
             self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
+            if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
+                self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
+            self._cmd_correlation_stats["pending_get_devices_peak"] = max(
+                self._cmd_correlation_stats["pending_get_devices_peak"],
+                len(self._pending_get_devices_cmdids),
+            )
             await self.async_send_command(cmd)
             self._initial_get_devices_sent = True
             _LOGGER.debug(
@@ -1191,6 +1208,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 try:
                     cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
+                    cmd_id = int.from_bytes(cmd[0:2], "little")
+                    self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
+                    if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
+                        self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
+                    self._cmd_correlation_stats["pending_get_devices_peak"] = max(
+                        self._cmd_correlation_stats["pending_get_devices_peak"],
+                        len(self._pending_get_devices_cmdids),
+                    )
                     await self.async_send_command(cmd)
                 except BleakError as exc:
                     _LOGGER.warning("Heartbeat BLE write failed: %s", exc)
@@ -1234,6 +1259,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # SuccessComplete: final frame carrying DeviceMetadataTableCrc (bytes 4–7 LE)
                 # and total device count (byte 8). Validate CRC against GatewayInformation.
                 cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
+                completed_get_devices_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
+                if completed_get_devices_table is not None:
+                    self._cmd_correlation_stats["get_devices_completed"] += 1
+                    _LOGGER.debug(
+                        "GetDevices completion frame (cmdId=%d table=%d)",
+                        cmd_id,
+                        completed_get_devices_table,
+                    )
+                    return
                 completed_table = self._pending_metadata_cmdids.pop(cmd_id, None)
                 if completed_table is not None and len(frame) >= 8:
                     # CRC is big-endian per MyRvLinkCommandGetDevicesMetadataResponseCompleted.cs
@@ -1296,6 +1330,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # Check if this is a GetDevices rejection instead of metadata.
                     gd_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
                     if gd_table is not None:
+                        self._cmd_correlation_stats["get_devices_rejected"] += 1
                         error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
                         _LOGGER.warning(
                             "GetDevices rejected by gateway for table_id=%d "
@@ -1304,6 +1339,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             error_code if error_code >= 0 else 0,
                         )
                     else:
+                        self._cmd_correlation_stats["command_error_unknown"] += 1
                         _LOGGER.debug(
                             "Command error response for unknown cmdId=%d", cmd_id
                         )
@@ -1317,16 +1353,23 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
                 if cmd_id not in self._pending_metadata_cmdids:
                     if cmd_id in self._pending_get_devices_cmdids:
+                        self._cmd_correlation_stats[
+                            "metadata_success_multi_discarded_get_devices"
+                        ] += 1
                         _LOGGER.debug(
                             "GetDevices response frame (cmdId=%d) — discarding "
                             "(not a metadata request)", cmd_id
                         )
                     else:
+                        self._cmd_correlation_stats[
+                            "metadata_success_multi_discarded_unknown"
+                        ] += 1
                         _LOGGER.debug(
                             "Command response frame for unknown cmdId=%d — discarding",
                             cmd_id,
                         )
                     return
+                self._cmd_correlation_stats["metadata_success_multi_accepted"] += 1
 
         event = parse_event(frame)
         _LOGGER.debug(

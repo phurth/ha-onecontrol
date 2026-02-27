@@ -30,8 +30,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Connect in the background so we don't block HA bootstrap.
-    hass.async_create_task(coordinator.async_connect())
+    # Connect in a background task so bootstrap completion isn't blocked.
+    hass.async_create_background_task(
+        coordinator.async_connect(),
+        "ha_onecontrol_initial_connect",
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
