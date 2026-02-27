@@ -1308,6 +1308,25 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "Command error response for unknown cmdId=%d", cmd_id
                         )
                 return
+            # SuccessMulti (0x01): contains actual device/metadata entries.
+            # GetDevices and GetDevicesMetadata both use event_type=0x02 with
+            # response_type=0x01; the ONLY distinguisher is the cmdId in bytes 1-2.
+            # Without this gate, GetDevices device-row frames (payloadSize=10) are
+            # incorrectly passed to parse_metadata_response and silently skipped.
+            if response_type == 0x01 and len(frame) >= 3:
+                cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
+                if cmd_id not in self._pending_metadata_cmdids:
+                    if cmd_id in self._pending_get_devices_cmdids:
+                        _LOGGER.debug(
+                            "GetDevices response frame (cmdId=%d) — discarding "
+                            "(not a metadata request)", cmd_id
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Command response frame for unknown cmdId=%d — discarding",
+                            cmd_id,
+                        )
+                    return
 
         event = parse_event(frame)
         _LOGGER.debug(
