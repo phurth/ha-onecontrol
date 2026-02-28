@@ -159,6 +159,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._pending_metadata_entries: dict[int, dict[str, DeviceMetadata]] = {}
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
+        self._get_devices_loaded_tables: set[int] = set()
+        self._unknown_command_counts: dict[int, int] = {}
         self._cmd_correlation_stats: dict[str, int] = {
             "metadata_success_multi_accepted": 0,
             "metadata_success_multi_discarded_get_devices": 0,
@@ -167,6 +169,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "metadata_commit_success": 0,
             "metadata_commit_crc_mismatch": 0,
             "metadata_commit_count_mismatch": 0,
+            "metadata_waiting_get_devices": 0,
+            "metadata_retry_scheduled": 0,
             "command_error_unknown": 0,
             "get_devices_rejected": 0,
             "get_devices_completed": 0,
@@ -1074,11 +1078,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Failed to send metadata request: %s", exc)
 
     async def _retry_metadata_after_rejection(self, table_id: int) -> None:
-        """Retry GetDevicesMetadata 10s after a 0x0f rejection.
+        """Retry GetDevicesMetadata 10s after a rejection.
 
-        Clears the rejected/requested state so _send_metadata_request can proceed.
-        If the gateway rejects again the retry counter will increment and eventually
-        the give-up path in the error handler will stop further scheduling.
+        Mirrors official app behavior of continued retry attempts as long as the
+        tracker is active; do not permanently give up after a fixed retry count.
         """
         await asyncio.sleep(10.0)
         if not self._connected:
@@ -1086,8 +1089,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if table_id in self._metadata_loaded_tables:
             return
         _LOGGER.debug("Retrying metadata for table_id=%d after 0x0f rejection", table_id)
-        self._metadata_rejected_tables.discard(table_id)
         self._metadata_requested_tables.discard(table_id)
+        if table_id not in self._get_devices_loaded_tables:
+            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
+            _LOGGER.debug(
+                "Retry for metadata table %d deferred — waiting for GetDevices completion",
+                table_id,
+            )
+            return
         await self._send_metadata_request(table_id)
 
     async def _send_initial_get_devices(self) -> None:
@@ -1143,11 +1152,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         request before we ask for metadata.
         """
         await asyncio.sleep(1.5)
-        if (
-            table_id not in self._metadata_requested_tables
-            and table_id not in self._metadata_rejected_tables
-        ):
-            await self._send_metadata_request(table_id)
+        if table_id in self._metadata_loaded_tables:
+            return
+        if table_id in self._metadata_requested_tables:
+            return
+        if table_id not in self._get_devices_loaded_tables:
+            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
+            _LOGGER.debug(
+                "Metadata request deferred for table %d — waiting for GetDevices completion",
+                table_id,
+            )
+            return
+        await self._send_metadata_request(table_id)
 
     def _ensure_metadata_for_table(self, table_id: int) -> None:
         """Request metadata for an observed table_id if not yet requested/loaded/rejected.
@@ -1160,9 +1176,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         if (
             table_id in self._metadata_loaded_tables
-            or table_id in self._metadata_rejected_tables
             or table_id in self._metadata_requested_tables
         ):
+            return
+        if table_id not in self._get_devices_loaded_tables:
+            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
+            _LOGGER.debug(
+                "Observed table_id=%d but delaying metadata until GetDevices completes",
+                table_id,
+            )
             return
         _LOGGER.info("Requesting metadata for observed table_id=%d", table_id)
         self.hass.async_create_task(self._send_metadata_request(table_id))
@@ -1272,11 +1294,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 completed_get_devices_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
                 if completed_get_devices_table is not None:
                     self._cmd_correlation_stats["get_devices_completed"] += 1
+                    self._get_devices_loaded_tables.add(completed_get_devices_table)
                     _LOGGER.debug(
-                        "GetDevices completion frame (cmdId=%d table=%d)",
+                        "GetDevices completion frame (cmdId=%d table=%d, loaded_tables=%d)",
                         cmd_id,
                         completed_get_devices_table,
+                        len(self._get_devices_loaded_tables),
                     )
+                    if (
+                        completed_get_devices_table not in self._metadata_loaded_tables
+                        and completed_get_devices_table not in self._metadata_requested_tables
+                    ):
+                        _LOGGER.debug(
+                            "Scheduling metadata request after GetDevices completion for table %d",
+                            completed_get_devices_table,
+                        )
+                        self.hass.async_create_task(
+                            self._send_metadata_request(completed_get_devices_table)
+                        )
                     return
                 completed_table = self._pending_metadata_cmdids.pop(cmd_id, None)
                 if completed_table is not None and len(frame) >= 8:
@@ -1334,25 +1369,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if rejected_table is not None:
                     error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
                     if error_code == 0x0F:
-                        _MAX_RETRIES = 3
                         retry_count = self._metadata_retry_counts.get(rejected_table, 0) + 1
                         self._metadata_retry_counts[rejected_table] = retry_count
-                        self._metadata_rejected_tables.add(rejected_table)
-                        if retry_count <= _MAX_RETRIES:
-                            _LOGGER.warning(
-                                "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
-                                " — retry %d/%d in 10s",
-                                rejected_table, retry_count, _MAX_RETRIES,
-                            )
-                            self.hass.async_create_task(
-                                self._retry_metadata_after_rejection(rejected_table)
-                            )
-                        else:
-                            _LOGGER.warning(
-                                "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
-                                " after %d retries — giving up",
-                                rejected_table, _MAX_RETRIES,
-                            )
+                        self._cmd_correlation_stats["metadata_retry_scheduled"] += 1
+                        _LOGGER.warning(
+                            "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
+                            " — scheduling retry #%d in 10s",
+                            rejected_table,
+                            retry_count,
+                        )
+                        self.hass.async_create_task(
+                            self._retry_metadata_after_rejection(rejected_table)
+                        )
                     else:
                         _LOGGER.warning(
                             "Metadata request failed for table_id=%d (errorCode=0x%02x)",
@@ -1364,18 +1392,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     gd_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
                     if gd_table is not None:
                         self._cmd_correlation_stats["get_devices_rejected"] += 1
+                        self._get_devices_loaded_tables.discard(gd_table)
                         error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
                         _LOGGER.warning(
                             "GetDevices rejected by gateway for table_id=%d "
-                            "(cmdId=%d errorCode=0x%02x) — metadata may fail to load",
+                            "(cmdId=%d errorCode=0x%02x) — metadata requests will wait",
                             gd_table, cmd_id,
                             error_code if error_code >= 0 else 0,
                         )
                     else:
                         self._cmd_correlation_stats["command_error_unknown"] += 1
-                        _LOGGER.debug(
-                            "Command error response for unknown cmdId=%d", cmd_id
-                        )
+                        count = self._unknown_command_counts.get(cmd_id, 0) + 1
+                        self._unknown_command_counts[cmd_id] = count
+                        if count <= 3 or count in (10, 50, 100) or count % 500 == 0:
+                            _LOGGER.debug(
+                                "Command error response for unknown cmdId=%d (count=%d)",
+                                cmd_id,
+                                count,
+                            )
                 return
             # SuccessMulti (0x01): contains actual device/metadata entries.
             # GetDevices and GetDevicesMetadata both use event_type=0x02 with
@@ -1397,10 +1431,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._cmd_correlation_stats[
                             "metadata_success_multi_discarded_unknown"
                         ] += 1
-                        _LOGGER.debug(
-                            "Command response frame for unknown cmdId=%d — discarding",
-                            cmd_id,
-                        )
+                        count = self._unknown_command_counts.get(cmd_id, 0) + 1
+                        self._unknown_command_counts[cmd_id] = count
+                        if count <= 3 or count in (10, 50, 100) or count % 500 == 0:
+                            _LOGGER.debug(
+                                "Command response frame for unknown cmdId=%d — discarding (count=%d)",
+                                cmd_id,
+                                count,
+                            )
                     return
                 self._cmd_correlation_stats["metadata_success_multi_accepted"] += 1
                 staged = self._pending_metadata_entries.setdefault(cmd_id, {})
@@ -1480,11 +1518,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if (
                 event.table_id not in self._metadata_loaded_tables
                 and event.table_id not in self._metadata_requested_tables
-                and event.table_id not in self._metadata_rejected_tables
             ):
-                self.hass.async_create_task(
-                    self._request_metadata_after_delay(event.table_id)
-                )
+                if event.table_id in self._get_devices_loaded_tables:
+                    self.hass.async_create_task(
+                        self._request_metadata_after_delay(event.table_id)
+                    )
+                else:
+                    self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
+                    _LOGGER.debug(
+                        "GatewayInfo table %d waiting for GetDevices completion before metadata request",
+                        event.table_id,
+                    )
 
         elif isinstance(event, RvStatus):
             self.rv_status = event
@@ -1658,6 +1702,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_metadata_cmdids.clear()
         self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
+        self._get_devices_loaded_tables.clear()
+        self._unknown_command_counts.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
         self._pin_dbus_succeeded = False
