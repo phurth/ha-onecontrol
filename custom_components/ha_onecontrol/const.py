@@ -115,6 +115,9 @@ HVAC_SETPOINT_DEBOUNCE_S = 0.25
 HVAC_SETPOINT_RETRY_DELAY_S = 5.0
 HVAC_SETPOINT_MAX_RETRIES = 3
 
+# Relay switch optimistic-state guard window
+SWITCH_STATE_GUARD_S = 1.0
+
 # Observed capability bitmask bits (accumulated from status events)
 HVAC_CAP_GAS = 0x01
 HVAC_CAP_AC = 0x02

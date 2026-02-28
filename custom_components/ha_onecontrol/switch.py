@@ -9,6 +9,7 @@ Reference: INTERNALS.md § Relay Status, § Switch Command
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -19,7 +20,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import DOMAIN, SWITCH_STATE_GUARD_S
 from .coordinator import OneControlCoordinator
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.events import GeneratorStatus, RelayStatus
@@ -99,6 +100,8 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
             model="BLE Gateway",
             connections={("bluetooth", address)},
         )
+        self._optimistic_is_on: bool | None = None
+        self._optimistic_until: float = 0.0
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -107,6 +110,8 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
 
     @property
     def is_on(self) -> bool | None:
+        if self._optimistic_is_on is not None and time.monotonic() < self._optimistic_until:
+            return self._optimistic_is_on
         relay = self.coordinator.relays.get(self._key)
         return relay.is_on if relay else None
 
@@ -124,6 +129,8 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         return attrs
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._optimistic_is_on = True
+        self._optimistic_until = time.monotonic() + SWITCH_STATE_GUARD_S
         # Optimistic: update local state immediately for responsive UI
         relay = self.coordinator.relays.get(self._key)
         if relay:
@@ -137,6 +144,8 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         await self.coordinator.async_switch(self._table_id, self._device_id, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._optimistic_is_on = False
+        self._optimistic_until = time.monotonic() + SWITCH_STATE_GUARD_S
         relay = self.coordinator.relays.get(self._key)
         if relay:
             self.coordinator.relays[self._key] = RelayStatus(
@@ -158,6 +167,24 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
             and event.table_id == self._table_id
             and event.device_id == self._device_id
         ):
+            if (
+                self._optimistic_is_on is not None
+                and time.monotonic() < self._optimistic_until
+                and event.is_on != self._optimistic_is_on
+            ):
+                _LOGGER.debug(
+                    "Ignoring contradictory relay echo during guard window "
+                    "for %s (event=%s optimistic=%s)",
+                    self._key,
+                    event.is_on,
+                    self._optimistic_is_on,
+                )
+                return
+
+            if self._optimistic_is_on is not None and event.is_on == self._optimistic_is_on:
+                self._optimistic_until = 0.0
+                self._optimistic_is_on = None
+
             self.async_write_ha_state()
 
 
