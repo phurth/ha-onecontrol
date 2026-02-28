@@ -66,25 +66,6 @@ from HA during a live pairing attempt.
 **Push-to-Pair gateways work normally through ESPHome proxies.** Only PIN
 gateways are affected.
 
-### Experimental: pre-bond the ESP32 to the gateway
-
-It is possible to bond an ESP32 proxy device directly to the gateway before
-deploying it as a proxy. The bond is stored in the ESP32's NVS flash and
-survives OTA firmware updates (as long as flash is not erased). Once bonded,
-the proxy can connect to the gateway without a passkey exchange, and the
-integration handles application-layer authentication as normal.
-
-This approach is experimental. If you are attempting this, use the
-`pairing_test.yml` ESPHome configuration in the companion
-[android_ble_plugin_bridge](https://github.com/your-org/android_ble_plugin_bridge)
-repository. Key requirements:
-- Both the pairing helper firmware and the production proxy firmware must use
-  the **Bluedroid** BLE stack (not NimBLE) — bond storage is not compatible
-  between the two stacks
-- Flash the pairing helper to the **exact device** that will serve as the proxy —
-  bonds are not transferable between ESP32 units
-- OTA-flash the production proxy firmware **without erasing flash** after bonding
-
 ## Supported Devices
 
 - **Switches** — Relay-controlled devices (lights, water pump, water heaters, tank heater)
