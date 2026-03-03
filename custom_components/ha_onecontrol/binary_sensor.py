@@ -251,6 +251,10 @@ class OneControlGeneratorQuietHours(
         return f"{base} Quiet Hours"
 
     @property
+    def available(self) -> bool:
+        return self.coordinator.data_healthy and self._key in self.coordinator.generators
+
+    @property
     def is_on(self) -> bool | None:
         gen = self.coordinator.generators.get(self._key)
         if gen is None:

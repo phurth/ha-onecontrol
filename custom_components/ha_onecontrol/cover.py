@@ -105,6 +105,10 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
         return self.coordinator.device_name(self._table_id, self._device_id)
 
     @property
+    def available(self) -> bool:
+        return self.coordinator.data_healthy and self._key in self.coordinator.covers
+
+    @property
     def is_closed(self) -> bool | None:
         """Return True if the cover is fully closed (stopped, position 0 or unknown)."""
         cov = self.coordinator.covers.get(self._key)

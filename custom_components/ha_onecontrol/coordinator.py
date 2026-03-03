@@ -15,6 +15,7 @@ Reference: INTERNALS.md § Authentication Flow, § Device Metadata Retrieval
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import logging
 import time
 from dataclasses import dataclass, replace
@@ -128,7 +129,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=f"{DOMAIN}_{entry.unique_id}",
-            update_interval=None,  # push-based, no polling
+            update_interval=timedelta(seconds=5),
+            always_update=True,
         )
         self.entry = entry
         self.address: str = entry.data[CONF_ADDRESS]
@@ -136,6 +138,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── PIN-based pairing (legacy gateways) ──────────────────────
         self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
+        self._instance_tag: str = f"{id(self):x}"[-6:]
         # Android uses gateway_pin for both BLE bonding AND protocol auth.
         # bluetooth_pin is an optional override if the BLE PIN differs.
         self._bluetooth_pin: str = entry.data.get(
@@ -144,6 +147,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pin_agent_ctx: PinAgentContext | None = None  # active D-Bus agent context
         self._pin_dbus_succeeded: bool = False  # bonding completed this session
         self._pin_already_bonded: bool = False  # BlueZ "already bonded" seen (sticky — not reset on disconnect)
+        self._push_button_dbus_ok: bool = False
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -186,6 +190,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_metadata_crc: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_generation: int = 0
         self._consecutive_failures: int = 0
         self._last_lockout_clear: float = 0.0
         self._has_can_write: bool = False
@@ -237,6 +242,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Entity platform callbacks (typed)
         self._event_callbacks: list[Callable[[Any], None]] = []
+
+    @property
+    def instance_tag(self) -> str:
+        return self._instance_tag
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -739,6 +748,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         # ── D-Bus setup BEFORE Bleak connect ──────────────────────────
+        self._push_button_dbus_ok = False
+
         if self.is_pin_gateway:
             # Register the PIN agent NOW so it is waiting when BlueZ asks
             # for the PIN during client.pair() after GATT connect.
@@ -762,6 +773,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             dbus_ok = await pair_push_button(self.address, timeout=30.0)
             if dbus_ok:
+                self._push_button_dbus_ok = True
                 _LOGGER.info(
                     "D-Bus PushButton pairing OK for %s (bonded or already bonded)",
                     self.address,
@@ -843,23 +855,30 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Complete connection: connect, pair, enumerate, authenticate."""
         self._client = client
         self._connected = True
+        self.async_set_updated_data(self._build_data())
         _LOGGER.info("Connected to %s", self.address)
 
         # ── Pairing ────────────────────────────────────────────────────
         if not self.is_pin_gateway:
             # PushButton: D-Bus Just Works pairing ran pre-connect; call pair()
             # here as a belt-and-suspenders fallback in case it didn't bond.
-            try:
-                _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
-                if hasattr(client, "pair"):
-                    paired = await client.pair()
-                    _LOGGER.info("BLE pair() result: %s", paired)
-                else:
-                    _LOGGER.debug("pair() not available on client wrapper")
-            except NotImplementedError:
-                _LOGGER.info("pair() not implemented — may already be bonded")
-            except Exception as exc:
-                _LOGGER.warning("pair() failed: %s — continuing", exc)
+            if self._push_button_dbus_ok:
+                _LOGGER.info(
+                    "PushButton %s — skipping BLE pair(); D-Bus pairing already succeeded",
+                    self.address,
+                )
+            else:
+                try:
+                    _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
+                    if hasattr(client, "pair"):
+                        paired = await client.pair()
+                        _LOGGER.info("BLE pair() result: %s", paired)
+                    else:
+                        _LOGGER.debug("pair() not available on client wrapper")
+                except NotImplementedError:
+                    _LOGGER.info("pair() not implemented — may already be bonded")
+                except Exception as exc:
+                    _LOGGER.warning("pair() failed: %s — continuing", exc)
         elif self._pin_agent_ctx and self._pin_agent_ctx.already_bonded:
             # Already bonded in BlueZ — no re-pairing needed.
             _LOGGER.info("PIN gateway %s — already bonded, skipping pair()", self.address)
@@ -988,6 +1007,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if "unlocked" in verify_text.lower():
             _LOGGER.info("Step 1: gateway UNLOCKED")
             self._authenticated = True
+            self.async_set_updated_data(self._build_data())
         else:
             _LOGGER.warning("Step 1: unlock verify failed — got %s", verify.hex())
 
@@ -1054,6 +1074,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._client.write_gatt_char(KEY_CHAR_UUID, key, response=False)
             _LOGGER.info("Step 2: auth key written — authentication complete")
             self._authenticated = True
+            self.async_set_updated_data(self._build_data())
             self._start_heartbeat()
         except BleakError as exc:
             _LOGGER.error("Step 2: failed to write KEY: %s", exc)
@@ -1690,7 +1711,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _on_disconnect(self, client: BleakClient) -> None:
         """Handle unexpected BLE disconnect — schedule reconnect with backoff."""
-        _LOGGER.warning("OneControl %s disconnected", self.address)
+        _LOGGER.warning("OneControl %s disconnected (instance=%s)", self.address, self._instance_tag)
         self._stop_heartbeat()
         self._connected = False
         self._authenticated = False
@@ -1707,12 +1728,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._initial_get_devices_sent = False
         self._has_can_write = False
         self._pin_dbus_succeeded = False
+        self._push_button_dbus_ok = False
         # PIN agent context is cleaned up inside _finish_connect; if somehow
         # still set here, schedule async cleanup (callback is synchronous).
         if self._pin_agent_ctx:
             ctx = self._pin_agent_ctx
             self._pin_agent_ctx = None
             self.hass.async_create_task(ctx.cleanup())
+
+        self.async_set_updated_data(self._build_data())
 
         # Schedule automatic reconnection with exponential backoff
         self._schedule_reconnect()
@@ -1728,23 +1752,31 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
 
+        self._reconnect_generation += 1
+        generation = self._reconnect_generation
         delay = min(
             RECONNECT_BACKOFF_BASE * (2 ** self._consecutive_failures),
             RECONNECT_BACKOFF_CAP,
         )
         self._consecutive_failures += 1
         _LOGGER.info(
-            "Scheduling reconnect in %.0fs (attempt %d)",
-            delay, self._consecutive_failures,
+            "Scheduling reconnect in %.0fs (attempt %d, gen=%d, instance=%s)",
+            delay, self._consecutive_failures, generation, self._instance_tag,
         )
         self._reconnect_task = self.hass.async_create_task(
-            self._reconnect_with_delay(delay)
+            self._reconnect_with_delay(delay, generation)
         )
 
-    async def _reconnect_with_delay(self, delay: float) -> None:
+    async def _reconnect_with_delay(self, delay: float, generation: int) -> None:
         """Wait then attempt reconnection."""
         try:
             await asyncio.sleep(delay)
+            if generation != self._reconnect_generation:
+                _LOGGER.debug(
+                    "Skipping stale reconnect task (gen=%d current=%d instance=%s)",
+                    generation, self._reconnect_generation, self._instance_tag,
+                )
+                return
             if self._connected:
                 return  # Already reconnected by another path
 
@@ -1761,11 +1793,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 await self._remove_stale_bond()
 
-            _LOGGER.info("Attempting reconnection to %s...", self.address)
+            _LOGGER.info(
+                "Attempting reconnection to %s (gen=%d, instance=%s)...",
+                self.address, generation, self._instance_tag,
+            )
             await self.async_connect()
             # Success — reset backoff counter
             self._consecutive_failures = 0
-            _LOGGER.info("Reconnected to %s", self.address)
+            _LOGGER.info("Reconnected to %s (instance=%s)", self.address, self._instance_tag)
         except asyncio.CancelledError:
             pass
         except Exception as exc:

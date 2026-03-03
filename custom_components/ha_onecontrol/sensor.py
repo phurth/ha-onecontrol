@@ -152,6 +152,10 @@ class _OneControlSensorBase(CoordinatorEntity[OneControlCoordinator], SensorEnti
         )
         self._mac = mac
 
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data_healthy
+
 
 # ── System Sensors ────────────────────────────────────────────────────────
 
@@ -200,7 +204,7 @@ class OneControlTemperatureSensor(_OneControlSensorBase):
     def available(self) -> bool:
         """Only available when gateway actually reports a temperature."""
         data = self.coordinator.data
-        return bool(data and data.get("temperature") is not None)
+        return super().available and bool(data and data.get("temperature") is not None)
 
     @property
     def native_value(self) -> float | None:

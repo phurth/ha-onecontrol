@@ -133,6 +133,10 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
         return self.coordinator.device_name(self._table_id, self._device_id)
 
     @property
+    def available(self) -> bool:
+        return self.coordinator.data_healthy and self._key in self.coordinator.dimmable_lights
+
+    @property
     def is_on(self) -> bool | None:
         light = self.coordinator.dimmable_lights.get(self._key)
         return light.is_on if light else None
@@ -274,6 +278,10 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
     @property
     def name(self) -> str:
         return self.coordinator.device_name(self._table_id, self._device_id)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data_healthy and self._key in self.coordinator.rgb_lights
 
     @property
     def is_on(self) -> bool | None:

@@ -133,6 +133,10 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         return self.coordinator.device_name(self._table_id, self._device_id)
 
     @property
+    def available(self) -> bool:
+        return self.coordinator.data_healthy and self._zone is not None
+
+    @property
     def _zone(self) -> HvacZone | None:
         return self.coordinator.hvac_zones.get(self._key)
 
