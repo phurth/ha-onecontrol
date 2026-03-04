@@ -3,7 +3,7 @@
 Home Assistant HACS integration for OneControl BLE gateways (Lippert/LCI).
 
 Connects directly to OneControl BLE gateways via the HA Bluetooth stack, authenticates using the TEA protocol, and creates native HA entities for RV device monitoring and control.
-
+> **Disclaimer:** This is an independent community integration and is not affiliated with, endorsed by, or supported by Lippert Components or any of its affiliates. Use it at your own risk.
 ## Installation
 
 ### HACS (recommended)
