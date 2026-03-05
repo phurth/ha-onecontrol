@@ -42,6 +42,7 @@ from .const import (
     BLE_MTU_SIZE,
     CAN_WRITE_CHAR_UUID,
     CONF_BLUETOOTH_PIN,
+    CONF_BONDED_SOURCE,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
     DATA_READ_CHAR_UUID,
@@ -148,6 +149,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pin_dbus_succeeded: bool = False  # bonding completed this session
         self._pin_already_bonded: bool = False  # BlueZ "already bonded" seen (sticky — not reset on disconnect)
         self._push_button_dbus_ok: bool = False
+        # Source of the adapter/proxy used for the most recent HA-routed connect
+        # attempt.  Persisted to config entry options after successful step-1 auth
+        # so subsequent connects are pinned to the same adapter (bond affinity).
+        self._current_connect_source: str | None = None
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -739,9 +744,52 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.address, attempt, self._pairing_method,
         )
 
-        device = bluetooth.async_ble_device_from_address(
-            self.hass, self.address, connectable=True
-        )
+        # ── Source-pinning: prefer the adapter where the bond lives ─────────
+        # After the first successful authentication we persist the source (HA
+        # scanner ID — either an hciX adapter MAC or an ESPHome proxy name).
+        # On every subsequent connect we filter scanner candidates to that
+        # source, guaranteeing the connection goes through the adapter that
+        # holds the BLE bond (LTK), preventing ATT auth failures on proxies.
+        device = None
+        self._current_connect_source = None
+        bonded_source: str | None = self.entry.options.get(CONF_BONDED_SOURCE)
+
+        try:
+            candidates = bluetooth.async_scanner_devices_by_address(
+                self.hass, self.address, connectable=True
+            )
+        except Exception:  # API unavailable on this HA version
+            candidates = []
+
+        if bonded_source and candidates:
+            preferred = next(
+                (c for c in candidates if c.scanner.source == bonded_source), None
+            )
+            if preferred is not None:
+                device = preferred.ble_device
+                self._current_connect_source = preferred.scanner.source
+                _LOGGER.info(
+                    "Connecting to %s via bonded source %s (attempt %d)",
+                    self.address, bonded_source, attempt,
+                )
+            else:
+                _LOGGER.warning(
+                    "Bonded source %s not available for %s — falling back to HA routing",
+                    bonded_source, self.address,
+                )
+
+        if device is None:
+            device = bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            )
+            if device is not None and candidates:
+                # Capture the source so we can persist it on auth success
+                matched = next(
+                    (c for c in candidates if c.ble_device.address.upper() == device.address.upper()),
+                    None,
+                )
+                self._current_connect_source = matched.scanner.source if matched else None
+
         if device is None:
             raise BleakError(
                 f"OneControl device {self.address} not found by HA Bluetooth"
@@ -967,6 +1015,25 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # metadata at T+1500ms.  Older gateway firmware requires the device-list
         # request to be processed before it will serve GetDevicesMetadata.
         self.hass.async_create_task(self._send_initial_get_devices())
+
+        # ── Persist bonded source ─────────────────────────────────────
+        # Step 1 auth succeeded (reached here without exception), so the
+        # adapter/proxy used for this connection holds a valid bond.  Store
+        # it so future connects are pinned to the same source.
+        if self._current_connect_source is not None:
+            stored_source = self.entry.options.get(CONF_BONDED_SOURCE)
+            if stored_source != self._current_connect_source:
+                _LOGGER.info(
+                    "Persisting bonded source %s for %s",
+                    self._current_connect_source, self.address,
+                )
+                self.hass.config_entries.async_update_entry(
+                    self.entry,
+                    options={
+                        **self.entry.options,
+                        CONF_BONDED_SOURCE: self._current_connect_source,
+                    },
+                )
 
     # ------------------------------------------------------------------
     # Step 1: UNLOCK_STATUS challenge → KEY response

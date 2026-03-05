@@ -149,3 +149,4 @@ METADATA_PAYLOAD_SIZE_FULL = 17
 CONF_GATEWAY_PIN = "gateway_pin"
 CONF_BLUETOOTH_PIN = "bluetooth_pin"
 CONF_PAIRING_METHOD = "pairing_method"
+CONF_BONDED_SOURCE = "bonded_source"
