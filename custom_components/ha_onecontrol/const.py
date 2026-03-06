@@ -25,7 +25,9 @@ DISCOVERY_SERVICE_UUID = f"00000041{UUID_BASE}"
 # ---------------------------------------------------------------------------
 # Manufacturer / Advertisement
 # ---------------------------------------------------------------------------
-LIPPERT_MANUFACTURER_ID = 0x0499  # 1177 decimal — Lippert Components
+LIPPERT_MANUFACTURER_ID = 0x0499        # 1177 decimal — Lippert Components
+LIPPERT_MANUFACTURER_ID_ALT = 0x05C7   # 1479 decimal — LCI X4T2 / PIN-based gateway variant
+GATEWAY_NAME_PREFIX = "LCIRemote"      # All known gateway models advertise this name prefix
 
 # ---------------------------------------------------------------------------
 # TEA Encryption Constants (public / standard)

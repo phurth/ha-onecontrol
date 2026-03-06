@@ -19,7 +19,9 @@ from .const import (
     CONF_PAIRING_METHOD,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
+    GATEWAY_NAME_PREFIX,
     LIPPERT_MANUFACTURER_ID,
+    LIPPERT_MANUFACTURER_ID_ALT,
 )
 from .protocol.advertisement import PairingMethod
 
@@ -89,10 +91,16 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
 
             return await self.async_step_pairing_method()
 
-        # Build a list of discovered OneControl gateways
+        # Build a list of discovered OneControl gateways.
+        # Match on either known manufacturer ID or the "LCIRemote" name prefix
+        # to cover gateway variants that advertise a different company ID.
         devices: dict[str, str] = {}
         for info in async_discovered_service_info(self.hass):
-            if LIPPERT_MANUFACTURER_ID in info.manufacturer_data:
+            if (
+                LIPPERT_MANUFACTURER_ID in info.manufacturer_data
+                or LIPPERT_MANUFACTURER_ID_ALT in info.manufacturer_data
+                or (info.name and info.name.startswith(GATEWAY_NAME_PREFIX))
+            ):
                 devices[info.address] = info.name or info.address
 
         if not devices:
