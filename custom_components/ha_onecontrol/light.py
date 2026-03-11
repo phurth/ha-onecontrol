@@ -313,14 +313,17 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         light = self.coordinator.rgb_lights.get(self._key)
 
-        # Resolve RGB color
+        # Resolve RGB color — mirrors Android lastKnownRgbColor fallback:
+        # prefer explicit payload color, then last known non-zero color, then default white.
         rgb = kwargs.get(ATTR_RGB_COLOR)
         if rgb:
             r, g, b = rgb
-        elif light:
-            r, g, b = light.red, light.green, light.blue
         else:
-            r, g, b = 255, 255, 255
+            last = self.coordinator._last_known_rgb_color.get(self._key)
+            if last:
+                r, g, b = last
+            else:
+                r, g, b = 255, 255, 255
 
         # Scale R/G/B to requested brightness.
         # In ColorMode.RGB, brightness is encoded in the channel values directly.

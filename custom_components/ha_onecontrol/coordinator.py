@@ -235,6 +235,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Mirrors Android lastKnownDimmableBrightness — only updated when brightness > 0.
         self._last_known_dimmable_brightness: dict[str, int] = {}
 
+        # Last known RGB color (R, G, B) per device — updated only when mode > 0 (light is on).
+        # Mirrors Android lastKnownRgbColor — never overwritten by an off-state frame (R=0,G=0,B=0).
+        self._last_known_rgb_color: dict[str, tuple[int, int, int]] = {}
+
         # ── HVAC debounce / pending guard / retry ─────────────────────
         # Pending command guard: suppresses stale gateway echoes during command window.
         # Mirrors Android pendingHvacCommands.
@@ -1718,6 +1722,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, RgbLight):
             key = _device_key(event.table_id, event.device_id)
             self.rgb_lights[key] = event
+            # Only persist non-zero color — mirrors Android lastKnownRgbColor update guard.
+            if event.is_on:
+                self._last_known_rgb_color[key] = (event.red, event.green, event.blue)
             self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, CoverStatus):
