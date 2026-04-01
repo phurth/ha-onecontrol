@@ -110,42 +110,63 @@ _STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS = 30.0
 # Covers gateways that need minutes to fully boot after a power cycle.
 _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
 
-# Seconds to wait after metadata loads before seeding relay entities for silent
+# Seconds to wait after metadata loads before seeding entities for silent
 # (always-off) devices.  Lets the initial BLE event burst settle first.
-_METADATA_RELAY_SEED_DELAY_S = 2.0
+_METADATA_SEED_DELAY_S = 2.0
 
-# Function codes that should NOT produce seeded relay-switch entities — these are
-# system/infrastructure devices, not end-user controllable loads.
-_METADATA_SEED_SKIP_CODES: frozenset[int] = frozenset({
-    0,    # Unknown Device
-    1,    # Diagnostic Tool
-    2,    # MyRV Tablet
-    108,  # MyRV Touchscreen
-    183,  # Network Bridge
-    184,  # Ethernet Bridge
-    185,  # WiFi Bridge
-    297,  # AquaFi
-    298,  # Connect Anywhere
-    304,  # Tire Linc
-    320,  # Monitor Panel
-    321,  # Camera
-    322,  # Jayco AUS TBB GW
-    323,  # Gateway RVLink
-    329,  # Trailer Brake Controller
-    352,  # Anti Lock Braking System
-    353,  # LOCAP Gateway
-    354,  # Bootloader
-    364,  # WiFi Booster
-    371,  # Axle1 Brake Controller
-    372,  # Axle2 Brake Controller
-    373,  # Axle3 Brake Controller
-    403,  # Base Camp Touchscreen
+# Function codes for simple on/off relay (switch/light/fan) loads.
+# Only these are seeded as RelayStatus switch entities; everything else is
+# seeded as a read-only UnknownDeviceSeed sensor so no device is silently dropped.
+_RELAY_SEED_FUNCTION_CODES: frozenset[int] = frozenset({
+    5,                                        # Water Pump
+    # All light variants
+    7, 8, 9,                                  # Light, Flood Light, Work Light
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,  # Front/Rear Bedroom lights
+    21, 22,                                   # Front/Rear Hall lights
+    23, 24, 25, 26, 27, 28, 29, 30, 31,       # Bathroom lights
+    32, 33, 34, 35, 36, 37, 38, 39, 40,       # Kitchen lights
+    41, 42, 43, 44,                            # Living Room lights
+    45, 46,                                    # Garage lights
+    47, 48, 49,                                # Security/Porch/Awning light
+    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,  # Misc room lights
+    61, 62, 63, 64, 65, 66,                   # Ceiling/Entry/Bed/Lav/Shower/Galley
+    120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,  # Patio/hutch/scare etc.
+    143, 144, 145, 146, 147, 149,             # Exterior/accent/security/hitch lights
+    167,                                       # Fireplace
+    169, 170, 171, 172,                        # Front Cap/Step/DS Flood/Interior lights
+    177, 178, 179, 180, 181, 182,              # Stall/Main/Bath/Bunk/Bed/Cabinet lights
+    195, 196,                                  # Compartment/Trunk lights
+    220, 221, 222, 223, 224, 225, 226, 227,   # Accent lights
+    264, 265, 266, 267, 268, 269,              # Fans
+    271, 272, 273, 274, 275, 276, 277, 278, 279, 280,  # More lights
+    289, 290, 291, 292, 293, 294,              # Mens/Womens/Service/ODS/Underbody/Speaker
+    301, 302,                                  # Conditional lights (If Equip)
+    305, 306,                                  # Locker lights
+    308, 309, 310, 311, 312, 313, 314,         # Rock/Chassis/Shower/Living Rm/Flood lights
+    360, 362, 363, 366,                        # Jacks Lights, Step lights, Soffit
+    385, 386, 387, 388, 389, 391,              # Awning lights (various)
+    392, 393, 394, 395, 396, 397,              # Scene lights
+    398, 399,                                  # Computer Fan, Battery Fan
+    402,                                       # Dump Light
+    406, 410, 411, 412, 413, 414,              # Pendant/Theater/Utility/Chase/Floor/RTT
 })
 
 
 def _device_key(table_id: int, device_id: int) -> str:
     """Canonical string key for a (table, device) pair."""
     return f"{table_id:02x}:{device_id:02x}"
+
+
+@dataclass
+class UnknownDeviceSeed:
+    """Sentinel fired through event callbacks for metadata-known devices with no
+    implemented entity type.  Causes sensor.py to create a read-only diagnostic
+    sensor so the device is visible in HA even before full support is added."""
+
+    table_id: int
+    device_id: int
+    function_code: int
+    function_name: str
 
 
 @dataclass
@@ -269,6 +290,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.device_locks: dict[str, DeviceLock] = {}
         self.generators: dict[str, GeneratorStatus] = {}
         self.hour_meters: dict[str, HourMeter] = {}
+        self.unknown_devices: dict[str, UnknownDeviceSeed] = {}
         self.rtc: RealTimeClock | None = None
         self.system_lockout_level: int | None = None
 
@@ -808,7 +830,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for status_dict in (
             self.relays, self.dimmable_lights, self.rgb_lights, self.covers,
             self.hvac_zones, self.tanks, self.device_online, self.device_locks,
-            self.generators, self.hour_meters,
+            self.generators, self.hour_meters, self.unknown_devices,
         ):
             for key in status_dict:
                 t = int(key.split(":")[0], 16)
@@ -1718,7 +1740,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             staged_count,
                         )
                         self.hass.async_create_task(
-                            self._async_seed_silent_relays(completed_table)
+                            self._async_seed_silent_devices(completed_table)
                         )
                 return
             if response_type == 0x82:
@@ -2030,22 +2052,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             key.upper(), meta.function_name, meta.function_instance, name,
         )
 
-    async def _async_seed_silent_relays(self, table_id: int) -> None:
-        """Seed relay-switch entities for metadata-known devices that never emit BLE events.
+    async def _async_seed_silent_devices(self, table_id: int) -> None:
+        """Seed entities for metadata-known devices that never emit BLE events.
 
-        Devices that are persistently OFF never broadcast a RelayStatus (0x06) event,
-        so event-driven discovery in switch.py never creates an entity for them.  After
-        waiting _METADATA_RELAY_SEED_DELAY_S for the initial BLE burst to settle, we
-        synthesise a RelayStatus(is_on=False) for every metadata entry that still has
-        no discovered state, then fire it through the normal event-callback chain so
-        switch.py creates the entity just as if a real 0x06 frame had arrived.
+        After waiting _METADATA_SEED_DELAY_S for the initial BLE event burst to
+        settle, every metadata entry that still has no discovered state is seeded:
+          - Known relay/light/fan function codes → RelayStatus(is_on=False) stub,
+            fired through callbacks so switch.py creates a switch entity.
+          - Everything else → UnknownDeviceSeed, fired through callbacks so
+            sensor.py creates a read-only diagnostic sensor.  This ensures all
+            metadata-known devices appear in HA regardless of whether their type
+            is fully implemented yet.
         """
-        await asyncio.sleep(_METADATA_RELAY_SEED_DELAY_S)
+        await asyncio.sleep(_METADATA_SEED_DELAY_S)
 
         for key, meta in list(self._metadata_raw.items()):
             if meta.table_id != table_id:
-                continue
-            if meta.function_name in _METADATA_SEED_SKIP_CODES:
                 continue
             # Already discovered via a live event of any recognised type — skip.
             if (
@@ -2058,24 +2080,42 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 or key in self.generators
                 or key in self.hour_meters
                 or key in self.device_locks
+                or key in self.unknown_devices
             ):
                 continue
-            stub = RelayStatus(
-                table_id=meta.table_id,
-                device_id=meta.device_id,
-                is_on=False,
-            )
-            self.relays[key] = stub
-            _LOGGER.info(
-                "Seeding silent relay entity for %s (func=%d) from metadata",
-                self.device_names.get(key, key),
-                meta.function_name,
-            )
+            device_name = self.device_names.get(key, key)
+            if meta.function_name in _RELAY_SEED_FUNCTION_CODES:
+                stub = RelayStatus(
+                    table_id=meta.table_id,
+                    device_id=meta.device_id,
+                    is_on=False,
+                )
+                self.relays[key] = stub
+                _LOGGER.info(
+                    "Seeding silent relay entity for %s (func=%d) from metadata",
+                    device_name,
+                    meta.function_name,
+                )
+                event: RelayStatus | UnknownDeviceSeed = stub
+            else:
+                seed = UnknownDeviceSeed(
+                    table_id=meta.table_id,
+                    device_id=meta.device_id,
+                    function_code=meta.function_name,
+                    function_name=device_name,
+                )
+                self.unknown_devices[key] = seed
+                _LOGGER.info(
+                    "Seeding unknown-type sensor for %s (func=%d) from metadata",
+                    device_name,
+                    meta.function_name,
+                )
+                event = seed
             for cb in self._event_callbacks:
                 try:
-                    cb(stub)
+                    cb(event)
                 except Exception:  # noqa: BLE001
-                    _LOGGER.exception("Error in event callback during relay seed")
+                    _LOGGER.exception("Error in event callback during device seed")
 
     def _build_data(self) -> dict[str, Any]:
         """Build the coordinator data dict consumed by entities."""

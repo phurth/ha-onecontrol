@@ -36,7 +36,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
+from .coordinator import OneControlCoordinator, UnknownDeviceSeed
 from .protocol.events import CoverStatus, GeneratorStatus, HourMeter, TankLevel
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +65,7 @@ async def async_setup_entry(
     discovered_generators: set[str] = set()
     discovered_hour_meters: set[str] = set()
     discovered_covers: set[str] = set()
+    discovered_unknown: set[str] = set()
 
     @callback
     def _on_event(event: Any) -> None:
@@ -101,6 +102,12 @@ async def async_setup_entry(
                     discovered_covers.add(key)
                     new.append(OneControlCoverStateSensor(coordinator, address, item.table_id, item.device_id))
 
+            elif isinstance(item, UnknownDeviceSeed):
+                key = f"{item.table_id:02x}:{item.device_id:02x}"
+                if key not in discovered_unknown:
+                    discovered_unknown.add(key)
+                    new.append(OneControlUnknownDeviceSensor(coordinator, address, item))
+
         if new:
             async_add_entities(new)
 
@@ -127,6 +134,10 @@ async def async_setup_entry(
         if key not in discovered_covers:
             discovered_covers.add(key)
             entities.append(OneControlCoverStateSensor(coordinator, address, cov.table_id, cov.device_id))
+    for key, unk in coordinator.unknown_devices.items():
+        if key not in discovered_unknown:
+            discovered_unknown.add(key)
+            entities.append(OneControlUnknownDeviceSensor(coordinator, address, unk))
 
     async_add_entities(entities)
 
@@ -581,3 +592,49 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
             and event.device_id == self._device_id
         ):
             self.async_write_ha_state()
+
+
+# ── Unknown Device Sensors ────────────────────────────────────────────────────
+
+
+class OneControlUnknownDeviceSensor(_OneControlSensorBase):
+    """Read-only diagnostic sensor for metadata-known devices with no implemented type.
+
+    Created by the metadata seeder for any device whose function code is not yet
+    handled by a dedicated entity platform.  Shows the device name and function
+    code so the device is visible in HA and the information is available for
+    future implementation or user reporting.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:help-rhombus-outline"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        seed: UnknownDeviceSeed,
+    ) -> None:
+        super().__init__(coordinator, address)
+        self._table_id = seed.table_id
+        self._device_id = seed.device_id
+        self._key = f"{seed.table_id:02x}:{seed.device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_unknown_{seed.device_id:02x}"
+
+    @property
+    def name(self) -> str:
+        return self.coordinator.device_name(self._table_id, self._device_id)
+
+    @property
+    def native_value(self) -> str:
+        return "detected"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        unk = self.coordinator.unknown_devices.get(self._key)
+        if unk is None:
+            return {}
+        return {
+            "function_code": unk.function_code,
+            "function_name": unk.function_name,
+        }
