@@ -309,10 +309,10 @@ def parse_relay_status(data: bytes) -> RelayStatus | None:
     """Parse relay status (0x05/0x06).
 
     INTERNALS.md § Relay Status:
-      Standard 5-byte, extended 9-byte with DTC at bytes 5-6 (BE).
+      Compact 4-byte, standard 5-byte, extended 9-byte with DTC at bytes 5-6 (BE).
       Status low nibble: 0x01=ON, 0x00=OFF.
     """
-    if len(data) < 5:
+    if len(data) < 4:
         return None
     status_byte = data[3] & 0xFF
     is_on = (status_byte & 0x0F) == 0x01
