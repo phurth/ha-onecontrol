@@ -10,7 +10,7 @@ import asyncio
 import logging
 import socket
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ..protocol.ids_can_wire import (
     compose_ids_can_extended_wire_frame,
@@ -41,7 +41,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _IDS_SESSION_REMOTE_CONTROL = 0x0004
 _IDS_SESSION_REMOTE_CONTROL_CYPHER = 0xB16B5E95
-_IDS_COMMAND_SETTLE_WINDOW_S = 1.2
+_IDS_COMMAND_SETTLE_WINDOW_S = 8.0
 _HVAC_INVALID_TEMPERATURE_RAW_VALUES = {0x8000, 0x2FF0}
 
 
@@ -64,6 +64,7 @@ class IdsCanRuntime:
         self._ids_session_last_heartbeat_at: dict[int, float] = {}
         self._ids_active_session_target: int | None = None
         self._ids_pending_status_expectations: dict[tuple[int, int], tuple[bool, float]] = {}
+        self._ids_command_locks: dict[int, asyncio.Lock] = {}
 
     def _record_recent_command_target(self, target_address: int) -> None:
         """Track recent IDS command targets for response correlation logs."""
@@ -81,6 +82,10 @@ class IdsCanRuntime:
             desired_on,
             time.monotonic() + _IDS_COMMAND_SETTLE_WINDOW_S,
         )
+
+    def _clear_pending_status_expectation(self, device_type: int, device_id: int) -> None:
+        """Clear pending status expectation for a device when command send fails."""
+        self._ids_pending_status_expectations.pop((device_type & 0xFF, device_id & 0xFF), None)
 
     def _should_accept_status(self, device_type: int, device_id: int, observed_on: bool) -> bool:
         """Gate status updates during a small post-command settle window."""
@@ -157,6 +162,72 @@ class IdsCanRuntime:
             raw.hex(),
         )
         return True
+
+    def _get_command_lock(self, target_address: int) -> asyncio.Lock:
+        """Return per-target lock to serialize IDS commands per device."""
+        target = target_address & 0xFF
+        lock = self._ids_command_locks.get(target)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ids_command_locks[target] = lock
+        return lock
+
+    async def _send_ids_command_with_retry(
+        self,
+        target_address: int,
+        compose_frame: Callable[[], bytes],
+        command_name: str,
+        max_attempts: int = 3,
+    ) -> tuple[bool, bytes | None]:
+        """Serialize and retry IDS command sends with session establishment."""
+        target = target_address & 0xFF
+        lock = self._get_command_lock(target)
+        async with lock:
+            for attempt in range(1, max_attempts + 1):
+                if not self._c.is_ethernet_gateway or not self._c._connected or self._c._eth_writer is None:
+                    _LOGGER.warning(
+                        "PACKET TX IDS %s aborted dst=0x%02X reason=transport-not-ready attempt=%d/%d",
+                        command_name,
+                        target,
+                        attempt,
+                        max_attempts,
+                    )
+                    return False, None
+
+                session_ok = await self.ensure_remote_control_session(target)
+                if not session_ok:
+                    _LOGGER.warning(
+                        "PACKET TX IDS %s session-not-ready dst=0x%02X attempt=%d/%d",
+                        command_name,
+                        target,
+                        attempt,
+                        max_attempts,
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(0.2 * attempt)
+                        continue
+                    return False, None
+
+                raw = compose_frame()
+                try:
+                    self._record_recent_command_target(target)
+                    self._c._eth_writer.write(cobs_encode(raw))
+                    await self._c._eth_writer.drain()
+                    self._c._last_ethernet_tx_time = time.monotonic()
+                    return True, raw
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "PACKET TX IDS %s write failed dst=0x%02X attempt=%d/%d err=%s",
+                        command_name,
+                        target,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(0.2 * attempt)
+
+            return False, None
 
     async def ensure_remote_control_session(self, target_address: int) -> bool:
         """Best-effort IDS REMOTE_CONTROL session open for command-capable devices."""
@@ -835,25 +906,26 @@ class IdsCanRuntime:
             )
             return False
 
-        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
-        if not session_ok:
-            return False
-
         clamped_brightness = min(max(brightness, 0), 255)
         mode = 0x00 if clamped_brightness == 0 else 0x01
         payload = bytes([mode, clamped_brightness, 0x00, 0x00, 0xDC, 0x00, 0xDC, 0x00])
 
-        raw = compose_ids_can_extended_wire_frame(
-            message_type=0x82,
-            source_address=self._ids_controller_source_address,
-            target_address=device_id & 0xFF,
-            message_data=0x00,
-            payload=payload,
+        self._set_pending_status_expectation(identity.device_type, device_id, clamped_brightness > 0)
+
+        sent, raw = await self._send_ids_command_with_retry(
+            device_id & 0xFF,
+            lambda: compose_ids_can_extended_wire_frame(
+                message_type=0x82,
+                source_address=self._ids_controller_source_address,
+                target_address=device_id & 0xFF,
+                message_data=0x00,
+                payload=payload,
+            ),
+            "light-set",
         )
-        self._record_recent_command_target(device_id & 0xFF)
-        self._c._eth_writer.write(cobs_encode(raw))
-        await self._c._eth_writer.drain()
-        self._c._last_ethernet_tx_time = time.monotonic()
+        if not sent or raw is None:
+            self._clear_pending_status_expectation(identity.device_type, device_id)
+            return False
 
         # Optimistic state mirrors BLE behavior and is corrected by incoming status.
         self._ensure_event_store_maps()
@@ -865,7 +937,6 @@ class IdsCanRuntime:
         )
         self._c.dimmable_lights[key] = event
         self._dispatch_state_event(event)
-        self._set_pending_status_expectation(identity.device_type, device_id, clamped_brightness > 0)
 
         _LOGGER.warning(
             "PACKET TX IDS light-set src=0x%02X dst=0x%02X cmd=0x00 mode=0x%02X brightness=%d payload=%s raw=%s",
@@ -916,10 +987,6 @@ class IdsCanRuntime:
             )
             return False
 
-        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
-        if not session_ok:
-            return False
-
         effect_mode = mode & 0xFF
         clamped_brightness = min(max(brightness, 0), 255)
         dur = duration & 0xFF
@@ -937,17 +1004,22 @@ class IdsCanRuntime:
             (ct2 >> 8) & 0xFF,
         ])
 
-        raw = compose_ids_can_extended_wire_frame(
-            message_type=0x82,
-            source_address=self._ids_controller_source_address,
-            target_address=device_id & 0xFF,
-            message_data=0x00,
-            payload=payload,
+        self._set_pending_status_expectation(identity.device_type, device_id, clamped_brightness > 0)
+
+        sent, raw = await self._send_ids_command_with_retry(
+            device_id & 0xFF,
+            lambda: compose_ids_can_extended_wire_frame(
+                message_type=0x82,
+                source_address=self._ids_controller_source_address,
+                target_address=device_id & 0xFF,
+                message_data=0x00,
+                payload=payload,
+            ),
+            "light-effect",
         )
-        self._record_recent_command_target(device_id & 0xFF)
-        self._c._eth_writer.write(cobs_encode(raw))
-        await self._c._eth_writer.drain()
-        self._c._last_ethernet_tx_time = time.monotonic()
+        if not sent or raw is None:
+            self._clear_pending_status_expectation(identity.device_type, device_id)
+            return False
 
         # Optimistic state mirrors requested brightness/effect mode until status arrives.
         self._ensure_event_store_maps()
@@ -959,7 +1031,6 @@ class IdsCanRuntime:
         )
         self._c.dimmable_lights[key] = event
         self._dispatch_state_event(event)
-        self._set_pending_status_expectation(identity.device_type, device_id, clamped_brightness > 0)
 
         _LOGGER.warning(
             "PACKET TX IDS light-effect src=0x%02X dst=0x%02X mode=0x%02X brightness=%d duration=%d ct1=%d ct2=%d payload=%s raw=%s",
@@ -1016,10 +1087,6 @@ class IdsCanRuntime:
             )
             return False
 
-        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
-        if not session_ok:
-            return False
-
         mode_byte = mode & 0xFF
         r = min(max(red, 0), 255)
         g = min(max(green, 0), 255)
@@ -1038,17 +1105,22 @@ class IdsCanRuntime:
 
         payload = bytes([mode_byte, r, g, b, auto, interval_msb, interval_lsb, 0x00])
 
-        raw = compose_ids_can_extended_wire_frame(
-            message_type=0x82,
-            source_address=self._ids_controller_source_address,
-            target_address=device_id & 0xFF,
-            message_data=0x00,
-            payload=payload,
+        self._set_pending_status_expectation(identity.device_type, device_id, mode_byte > 0)
+
+        sent, raw = await self._send_ids_command_with_retry(
+            device_id & 0xFF,
+            lambda: compose_ids_can_extended_wire_frame(
+                message_type=0x82,
+                source_address=self._ids_controller_source_address,
+                target_address=device_id & 0xFF,
+                message_data=0x00,
+                payload=payload,
+            ),
+            "rgb-set",
         )
-        self._record_recent_command_target(device_id & 0xFF)
-        self._c._eth_writer.write(cobs_encode(raw))
-        await self._c._eth_writer.drain()
-        self._c._last_ethernet_tx_time = time.monotonic()
+        if not sent or raw is None:
+            self._clear_pending_status_expectation(identity.device_type, device_id)
+            return False
 
         self._ensure_event_store_maps()
         current = self._c.rgb_lights.get(key)
@@ -1068,7 +1140,6 @@ class IdsCanRuntime:
         )
         self._c.rgb_lights[key] = event
         self._dispatch_state_event(event)
-        self._set_pending_status_expectation(identity.device_type, device_id, mode_byte > 0)
 
         _LOGGER.warning(
             "PACKET TX IDS rgb-set src=0x%02X dst=0x%02X mode=0x%02X rgb=(%d,%d,%d) auto_off=%d i1=0x%02X i2=0x%02X payload=%s raw=%s",
@@ -1124,10 +1195,6 @@ class IdsCanRuntime:
             )
             return False
 
-        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
-        if not session_ok:
-            return False
-
         command_byte = (
             (heat_mode & 0x07)
             | ((heat_source & 0x03) << 4)
@@ -1137,17 +1204,19 @@ class IdsCanRuntime:
         high = min(max(high_trip_f, 0), 255)
         payload = bytes([command_byte & 0xFF, low, high])
 
-        raw = compose_ids_can_extended_wire_frame(
-            message_type=0x82,
-            source_address=self._ids_controller_source_address,
-            target_address=device_id & 0xFF,
-            message_data=0x00,
-            payload=payload,
+        sent, raw = await self._send_ids_command_with_retry(
+            device_id & 0xFF,
+            lambda: compose_ids_can_extended_wire_frame(
+                message_type=0x82,
+                source_address=self._ids_controller_source_address,
+                target_address=device_id & 0xFF,
+                message_data=0x00,
+                payload=payload,
+            ),
+            "hvac-set",
         )
-        self._record_recent_command_target(device_id & 0xFF)
-        self._c._eth_writer.write(cobs_encode(raw))
-        await self._c._eth_writer.drain()
-        self._c._last_ethernet_tx_time = time.monotonic()
+        if not sent or raw is None:
+            return False
 
         self._ensure_event_store_maps()
         current = self._c.hvac_zones.get(key)
@@ -1214,23 +1283,23 @@ class IdsCanRuntime:
             )
             return False
 
-        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
-        if not session_ok:
-            return False
-
         # RelayBasicLatching Type2 parity:
         # Off=commandByte 0x00, On=commandByte 0x01, empty data payload.
-        raw = compose_ids_can_extended_wire_frame(
-            message_type=0x82,
-            source_address=self._ids_controller_source_address,
-            target_address=device_id & 0xFF,
-            message_data=0x01 if turn_on else 0x00,
-            payload=b"",
+        self._set_pending_status_expectation(identity.device_type, device_id, turn_on)
+        sent, raw = await self._send_ids_command_with_retry(
+            device_id & 0xFF,
+            lambda: compose_ids_can_extended_wire_frame(
+                message_type=0x82,
+                source_address=self._ids_controller_source_address,
+                target_address=device_id & 0xFF,
+                message_data=0x01 if turn_on else 0x00,
+                payload=b"",
+            ),
+            "relay-toggle",
         )
-        self._record_recent_command_target(device_id & 0xFF)
-        self._c._eth_writer.write(cobs_encode(raw))
-        await self._c._eth_writer.drain()
-        self._c._last_ethernet_tx_time = time.monotonic()
+        if not sent or raw is None:
+            self._clear_pending_status_expectation(identity.device_type, device_id)
+            return False
 
         # Optimistic state mirrors BLE behavior and is corrected by incoming status.
         self._ensure_event_store_maps()
@@ -1243,7 +1312,6 @@ class IdsCanRuntime:
         )
         self._c.relays[key] = event
         self._dispatch_state_event(event)
-        self._set_pending_status_expectation(identity.device_type, device_id, turn_on)
 
         _LOGGER.warning(
             "PACKET TX IDS relay-toggle src=0x%02X dst=0x%02X cmd=0x%02X on=%s raw=%s",
