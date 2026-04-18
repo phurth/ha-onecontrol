@@ -45,7 +45,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "hourmeter",
         )
         pattern = re.compile(
-            r"^([0-9a-f]{12})_("
+            r"^([a-z0-9\.]+)_("
             + "|".join(re.escape(t) for t in _DEVICE_TYPES)
             + r")_([0-9a-f]{2})([0-9a-f]{2})$"
         )

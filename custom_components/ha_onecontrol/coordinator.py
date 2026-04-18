@@ -106,7 +106,7 @@ from .protocol.events import (
 )
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.tea import calculate_step1_key, calculate_step2_key
-from .runtime import IdsCanRuntime, MyRvLinkRuntime
+from .runtime import IdsCanRuntime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -353,7 +353,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Protocol runtimes: keep coordinator as HA-facing facade while
         # transport/protocol orchestration is split by backend.
         self._ids_runtime = IdsCanRuntime(self)
-        self._myrvlink_runtime = MyRvLinkRuntime(self, self._ids_runtime)
 
         # Cancel non-critical reconnect/heartbeat tasks as HA stops.
         if hasattr(self.hass, "bus") and hasattr(self.hass.bus, "async_listen_once"):
