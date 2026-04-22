@@ -108,6 +108,8 @@ Gateway Device
 <img width="2036" height="642" alt="image" src="https://github.com/user-attachments/assets/7df9fafc-f233-48e0-897c-bfcb450eebf3" />
 Example Entities
 <img width="1344" height="2106" alt="image" src="https://github.com/user-attachments/assets/156051c5-c65b-4912-ba77-1e6ec49b15dc" />
+Additional Example
+<img width="877" height="2662" alt="image" src="https://github.com/user-attachments/assets/3f133e11-d92e-4475-82d8-2a4ebf8f61e6" />
 
 ## License
 
