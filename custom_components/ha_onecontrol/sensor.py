@@ -31,12 +31,12 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .entity_helpers import build_gateway_device_info
 from .protocol.events import CoverStatus, GeneratorStatus, HourMeter, TankLevel
 
 _LOGGER = logging.getLogger(__name__)
@@ -142,12 +142,9 @@ class _OneControlSensorBase(CoordinatorEntity[OneControlCoordinator], SensorEnti
         super().__init__(coordinator)
         self._address = address
         mac = address.replace(":", "").lower()
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
         self._mac = mac
 

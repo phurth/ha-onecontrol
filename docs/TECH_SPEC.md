@@ -2,7 +2,7 @@
 
 ## 1. Purpose and Scope
 
-`ha_onecontrol` is a Home Assistant BLE integration for Lippert/LCI OneControl gateways. It provides native entity discovery and control for relays, lights, HVAC zones, covers, tanks, generator telemetry, and diagnostics.
+`ha_onecontrol` is a Home Assistant integration for Lippert/LCI OneControl gateways. It provides native entity discovery and control for relays, lights, HVAC zones, covers, tanks, generator telemetry, and diagnostics.
 
 This document describes the current HA-native implementation and excludes mobile bridge specifics.
 
@@ -11,24 +11,29 @@ This document describes the current HA-native implementation and excludes mobile
 - **Domain:** `ha_onecontrol`
 - **Primary runtime component:** `OneControlCoordinator`
 - **Platforms:** `binary_sensor`, `button`, `climate`, `light`, `sensor`, `switch`
-- **Transport:** BLE GATT via Home Assistant Bluetooth stack
+- **Transport:** BLE GATT via Home Assistant Bluetooth stack; experimental IDS CAN-to-Ethernet bridge path
 - **Coordinator mode:** push/event-driven (`update_interval=None`)
 
 ## 3. Configuration and Entry Setup
 
 - BLE discovery uses Lippert manufacturer advertisement data.
-- Config flow supports two pairing models:
+- Ethernet setup can optionally prefill host/port using UDP bridge advertisements (`Mfg=IDS` or `Product=CAN_TO_ETHERNET_GATEWAY`).
+- Config flow supports two transport families:
+  - BLE transport
+  - Ethernet bridge transport (experimental)
+- BLE pairing models include:
   - push-to-pair gateways
   - legacy PIN gateways
 - Core credentials:
   - `gateway_pin` (required)
   - `bluetooth_pin` (optional override)
+  - `eth_host`/`eth_port` (Ethernet mode)
 
 ## 4. Runtime Lifecycle
 
 1. Entry setup creates coordinator and forwards platforms.
 2. Initial connect runs as background task (non-blocking startup).
-3. BLE session authenticates and enables notifications.
+3. Transport session is established (BLE authenticate+notify, or Ethernet socket connect).
 4. COBS/CRC decode pipeline parses protocol events.
 5. Parsed state maps are updated and listener callbacks refresh entities.
 

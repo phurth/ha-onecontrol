@@ -266,6 +266,23 @@ class DeviceMetadata:
     function_instance: int = 0
 
 
+@dataclass
+class DeviceIdentity:
+    """Parsed identity from GetDevices SuccessMulti (event 0x02 responseType 0x01).
+
+    Mirrors MyRvLinkDeviceIdsCan/Host payload fields in the decompiled app.
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    protocol: int = 0
+    device_type: int = 0
+    device_instance: int = 0
+    product_id: int = 0
+    product_mac: str = ""
+    raw_device_capability: int = 0
+
+
 # ── Parsers ───────────────────────────────────────────────────────────────
 
 
@@ -667,7 +684,7 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
             # new gateway variants or firmware versions in the field.
             device_id = (start_id + index) & 0xFF
             entry_hex = data[offset : offset + 2 + min(payload_size, 32)].hex(" ").upper()
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Metadata entry[%d]: UNKNOWN combination — table=%d device=0x%02x "
                 "protocol=0x%02x payload_size=%d — skipping. Raw: %s",
                 index, table_id, device_id, protocol, payload_size, entry_hex,
@@ -677,11 +694,64 @@ def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
         index += 1
 
     if len(results) != count:
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Metadata count mismatch for table=%d: frame declared %d entries, "
             "decoded %d (skipped %d). This may indicate an unknown protocol variant.",
             table_id, count, len(results), count - len(results),
         )
+
+    return results
+
+
+def parse_get_devices_response(data: bytes) -> list[DeviceIdentity]:
+    """Parse GetDevices SuccessMulti payload rows (event 0x02, responseType 0x01).
+
+    Frame layout:
+      [cmdIdL][cmdIdH][0x02][0x01][tableId][startId][count] + entries...
+      entry = [protocol][payloadSize][payload...]
+
+    For Host/IdsCan entries with payloadSize==10, payload bytes follow decompiled
+    MyRvLinkDeviceHost/MyRvLinkDeviceIdsCan fields:
+      [deviceType][deviceInstance][productIdHi][productIdLo][mac(6 bytes)]
+    """
+    if len(data) < 7:
+        return []
+
+    table_id = data[4] & 0xFF
+    start_id = data[5] & 0xFF
+    count = data[6] & 0xFF
+
+    results: list[DeviceIdentity] = []
+    offset = 7
+    index = 0
+
+    while index < count and offset + 2 <= len(data):
+        protocol = data[offset] & 0xFF
+        payload_size = data[offset + 1] & 0xFF
+        payload_start = offset + 2
+        payload_end = payload_start + payload_size
+        if payload_end > len(data):
+            break
+
+        if protocol in (METADATA_PROTOCOL_HOST, METADATA_PROTOCOL_IDS_CAN) and payload_size == 10:
+            payload = data[payload_start:payload_end]
+            device_id = (start_id + index) & 0xFF
+            product_id = int.from_bytes(payload[2:4], "big")
+            product_mac = payload[4:10].hex().upper()
+            results.append(
+                DeviceIdentity(
+                    table_id=table_id,
+                    device_id=device_id,
+                    protocol=protocol,
+                    device_type=payload[0] & 0xFF,
+                    device_instance=payload[1] & 0xFF,
+                    product_id=product_id,
+                    product_mac=product_mac,
+                )
+            )
+
+        offset = payload_end
+        index += 1
 
     return results
 

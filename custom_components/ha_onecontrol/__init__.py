@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
+
+if TYPE_CHECKING:
+    from .coordinator import OneControlCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,7 +45,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "hourmeter",
         )
         pattern = re.compile(
-            r"^([0-9a-f]{12})_("
+            r"^([a-z0-9\.]+)_("
             + "|".join(re.escape(t) for t in _DEVICE_TYPES)
             + r")_([0-9a-f]{2})([0-9a-f]{2})$"
         )
@@ -94,6 +97,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up OneControl from a config entry."""
+    from .coordinator import OneControlCoordinator
+
     hass.data.setdefault(DOMAIN, {})
 
     existing: OneControlCoordinator | None = hass.data[DOMAIN].get(entry.entry_id)
@@ -109,6 +114,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.exception("Failed disconnecting stale OneControl coordinator")
 
     coordinator = OneControlCoordinator(hass, entry)
+
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     # Store coordinator for platform setup
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -130,6 +137,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    from .coordinator import OneControlCoordinator
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
@@ -142,3 +151,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_disconnect()
 
     return unload_ok
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload config entry when options are updated."""
+    await hass.config_entries.async_reload(entry.entry_id)

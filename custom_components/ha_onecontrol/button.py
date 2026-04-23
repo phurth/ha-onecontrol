@@ -14,12 +14,12 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .entity_helpers import build_gateway_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,12 +57,9 @@ class OneControlClearLockoutButton(
         super().__init__(coordinator)
         mac = address.replace(":", "").lower()
         self._attr_unique_id = f"{mac}_clear_lockout"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
 
     @property
@@ -98,12 +95,9 @@ class OneControlRefreshMetadataButton(
         super().__init__(coordinator)
         mac = address.replace(":", "").lower()
         self._attr_unique_id = f"{mac}_refresh_metadata"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
 
     @property

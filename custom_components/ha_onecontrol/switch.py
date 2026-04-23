@@ -16,12 +16,12 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, SWITCH_STATE_GUARD_S
 from .coordinator import OneControlCoordinator
+from .entity_helpers import build_gateway_device_info
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.events import GeneratorStatus, RelayStatus
 
@@ -93,12 +93,9 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
         self._attr_unique_id = f"{mac}_switch_{device_id:02x}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
         self._optimistic_is_on: bool | None = None
         self._optimistic_until: float = 0.0
@@ -219,12 +216,9 @@ class OneControlGeneratorSwitch(CoordinatorEntity[OneControlCoordinator], Switch
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
         self._attr_unique_id = f"{mac}_gen_switch_{device_id:02x}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
         self._unsub = coordinator.register_event_callback(self._on_event)
 

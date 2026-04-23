@@ -1,7 +1,7 @@
 """Tests for COBS encoder/decoder with CRC8."""
 
-from custom_components.onecontrol.protocol.cobs import CobsByteDecoder, cobs_encode
-from custom_components.onecontrol.protocol.crc8 import crc8
+from custom_components.ha_onecontrol.protocol.cobs import CobsByteDecoder, cobs_encode
+from custom_components.ha_onecontrol.protocol.crc8 import crc8
 
 
 class TestCobsByteDecoder:

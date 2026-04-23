@@ -2,10 +2,26 @@
   "config": {
     "step": {
       "user": {
+        "title": "Select Connection Type",
+        "description": "Choose whether you want to connect through Bluetooth or an IDS CAN-to-Ethernet bridge.",
+        "data": {
+          "connection_type": "Connection type"
+        }
+      },
+      "user_ble": {
         "title": "Select OneControl Gateway",
         "description": "Choose a discovered OneControl BLE gateway to set up.",
         "data": {
           "address": "Gateway"
+        }
+      },
+      "ethernet": {
+        "title": "Configure CAN-to-Ethernet Bridge",
+        "description": "If the bridge was discovered over UDP, the fields are prefilled. Otherwise enter them manually. Typical defaults are {default_host}:{default_port}.",
+        "data": {
+          "eth_host": "Bridge host/IP",
+          "eth_port": "Bridge port",
+          "gateway_pin": "Gateway PIN (optional compatibility setting)"
         }
       },
       "pairing_method": {
@@ -32,11 +48,31 @@
       }
     },
     "error": {
-      "invalid_pin": "PIN must be exactly 6 digits"
+      "invalid_pin": "PIN must be exactly 6 digits",
+      "invalid_host": "Host is required",
+      "invalid_port": "Port must be between 1 and 65535",
+      "cannot_connect": "Failed to connect to the bridge endpoint"
     },
     "abort": {
       "already_configured": "This gateway is already configured",
       "no_devices_found": "No OneControl gateways found. Make sure Bluetooth is enabled and the gateway is powered on."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "External Device Naming",
+        "description": "Optional: provide OneControl manifest/snapshot JSON content (paste from diagnostics export) or local file paths to improve naming when gateway metadata is unavailable. Pasted JSON takes priority over path input.",
+        "data": {
+          "naming_manifest_path": "Manifest JSON path",
+          "naming_snapshot_path": "Snapshot JSON path",
+          "naming_manifest_json": "Manifest JSON content",
+          "naming_snapshot_json": "Snapshot JSON content"
+        }
+      }
+    },
+    "error": {
+      "invalid_naming_file": "Unable to read or parse the supplied manifest/snapshot file"
     }
   }
 }

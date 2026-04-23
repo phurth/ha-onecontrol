@@ -21,3 +21,9 @@ TEST_PLAN.md
 BT_ADAPTER_PINNING.md
 BT
 .vscode/
+Decompiled/
+OneControlAppLogs/
+ha_config/
+docker-compose.ha-dev.yml
+ha-onecontrol.sln
+docs/IDS_CAN_CSHARP_REFERENCE.md

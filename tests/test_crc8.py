@@ -1,6 +1,6 @@
 """Tests for CRC8 (init=0x55, polynomial 0x07)."""
 
-from custom_components.onecontrol.protocol.crc8 import crc8
+from custom_components.ha_onecontrol.protocol.crc8 import crc8
 
 
 class TestCrc8:
