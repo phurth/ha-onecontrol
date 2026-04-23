@@ -1,5 +1,9 @@
 """Tests for TEA encryption — verify against known values from the Android app."""
 
+from custom_components.ha_onecontrol.runtime.ids_can_runtime import (
+    IdsCanRuntime,
+    _IDS_SESSION_REMOTE_CONTROL_CYPHER,
+)
 from custom_components.ha_onecontrol.protocol.tea import (
     MASK32,
     STEP1_CIPHER,
@@ -123,3 +127,32 @@ class TestStep2Key:
         assert k1[:4] == k2[:4]
         # PIN portions differ
         assert k1[4:10] != k2[4:10]
+
+
+class TestIdsCanSessionCipher:
+    """Regression guard for the IDS-CAN REMOTE_CONTROL session cipher constant.
+
+    The expected output below was computed with the correct constant (0xB16B00B5)
+    and differs from the output of the previously wrong constant (0xB16B5E95).
+    Any future change to _IDS_SESSION_REMOTE_CONTROL_CYPHER will break this test.
+    """
+
+    def test_cipher_constant_matches_decompiled_source(self):
+        # SESSION_ID(4, 2976579765u) in IDS.Core.IDS_CAN.Descriptors/SESSION_ID.cs
+        assert _IDS_SESSION_REMOTE_CONTROL_CYPHER == 0xB16B00B5, (
+            "IDS REMOTE_CONTROL session cipher must match decompiled SESSION_ID.cs "
+            "(value=4, cypher=2976579765). Wrong constant causes KEY_NOT_CORRECT on "
+            "every SESSION_TRANSMIT_KEY, silently blocking all device commands."
+        )
+
+    def test_encrypt_known_vector(self):
+        """Output must match the value computed from the correct C# cipher."""
+        # Computed from the C# Encrypt() implementation in SESSION_ID.cs with
+        # seed=0xDEADBEEF and cypher=0xB16B00B5 (REMOTE_CONTROL session).
+        # Old wrong cypher (0xB16B5E95) would produce 0xDC3AFD9F instead.
+        result = IdsCanRuntime._ids_encrypt_session_seed(None, 0xDEADBEEF)  # type: ignore[arg-type]
+        assert result == 0x2A053086, (
+            f"IDS session cipher produced 0x{result:08X}, expected 0x2A053086. "
+            "Check _IDS_SESSION_REMOTE_CONTROL_CYPHER — wrong value causes "
+            "KEY_NOT_CORRECT (0x0D) on every session auth attempt."
+        )

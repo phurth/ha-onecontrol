@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 _IDS_SESSION_REMOTE_CONTROL = 0x0004
-_IDS_SESSION_REMOTE_CONTROL_CYPHER = 0xB16B5E95
+_IDS_SESSION_REMOTE_CONTROL_CYPHER = 0xB16B00B5
 _IDS_COMMAND_SETTLE_WINDOW_S = 8.0
 _HVAC_INVALID_TEMPERATURE_RAW_VALUES = {0x8000, 0x2FF0}
 
@@ -248,7 +248,22 @@ class IdsCanRuntime:
                     sent_heartbeat = await self._send_ids_request(target, 0x44, heartbeat_payload)
                     if sent_heartbeat:
                         self._ids_session_last_heartbeat_at[target] = now
-                return True
+                        # Yield once so the read loop can process a session-close
+                        # rejection that may arrive immediately after the heartbeat.
+                        await asyncio.sleep(0)
+                        if target not in self._ids_session_opened_at:
+                            _LOGGER.warning(
+                                "PACKET TX IDS session-heartbeat rejected dst=0x%02X; re-opening",
+                                target,
+                            )
+                            # Fall through to fresh session open below.
+                            pass
+                        else:
+                            return True
+                    else:
+                        return True
+                else:
+                    return True
 
             previous_target = self._ids_active_session_target
             if previous_target is not None and previous_target != target:
@@ -289,13 +304,16 @@ class IdsCanRuntime:
                     await asyncio.wait_for(event.wait(), timeout=1.2)
                 except TimeoutError:
                     _LOGGER.warning(
-                        "PACKET TX IDS session-open timeout dst=0x%02X attempt=%d/%d; skipping IDS command send",
+                        "PACKET TX IDS session-open timeout dst=0x%02X attempt=%d/%d",
                         target,
                         attempt,
                         max_attempts,
                     )
                     self._ids_session_seed_requested_at.pop(target, None)
                     self._ids_session_results.pop(target, None)
+                    if attempt < max_attempts:
+                        await asyncio.sleep(0.15)
+                        continue
                     return False
 
                 result = self._ids_session_results.get(target)
@@ -1333,6 +1351,21 @@ class IdsCanRuntime:
             self._c._ethernet_reader_task.cancel()
         self._c._ethernet_reader_task = None
         self._ids_pending_status_expectations.clear()
+        # IDS sessions are bound to the TCP connection. After a transport close the
+        # device has no active session, so any cached opened_at timestamps are stale.
+        # Clear all session state here so the first command after reconnect goes
+        # through a fresh handshake rather than falsely reusing a closed session.
+        self._ids_session_opened_at.clear()
+        self._ids_session_last_heartbeat_at.clear()
+        self._ids_session_results.clear()
+        self._ids_session_seed_requested_at.clear()
+        self._ids_session_last_status_code.clear()
+        self._ids_active_session_target = None
+        # Cancel any pending session waiters so in-flight open attempts don't
+        # block indefinitely after the transport is gone.
+        for event in self._ids_session_waiters.values():
+            event.set()
+        self._ids_session_waiters.clear()
 
     def handle_frame(self, frame: bytes) -> bool:
         """Handle IDS-CAN/Ethernet command envelopes and cmdId correlation.
@@ -1438,7 +1471,10 @@ class IdsCanRuntime:
                         likely_related_to_recent_tx = (
                             target_seen_at is not None and (now - target_seen_at) <= 2.5
                         )
-                        log_level = logging.WARNING if likely_related_to_recent_tx else logging.DEBUG
+                        # Always log session-auth responses at WARNING so rejection
+                        # codes (e.g. INVALID_KEY, IN_MOTION_LOCKOUT) are visible.
+                        is_session_request = request_code in {0x42, 0x43, 0x44, 0x45}
+                        log_level = logging.WARNING if (likely_related_to_recent_tx or is_session_request) else logging.DEBUG
                         _LOGGER.log(
                             log_level,
                             "PACKET RX IDS response-status src=0x%02X dst=0x%02X req=0x%02X(%s) status=0x%02X(%s) related_to_recent_tx=%s payload=%s",
