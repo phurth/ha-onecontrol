@@ -9,7 +9,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
-from .const import DOMAIN
+from .const import (
+    CONF_BLUETOOTH_PIN,
+    CONF_GATEWAY_FAMILY,
+    CONF_PAIRING_METHOD,
+    GATEWAY_FAMILY_X180T,
+    DOMAIN,
+)
 from .coordinator import OneControlCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,7 +38,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.version,
     )
 
-    if entry.version == 1:
+    version = entry.version
+
+    if version == 1:
         # v1→v2: drop table_id from device entity unique_ids.
         # Old format: {mac12hex}_{type}_{table:02x}{device:02x}
         # New format: {mac12hex}_{type}_{device:02x}
@@ -88,6 +96,33 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info(
             "Migration of OneControl entry %s to version 2 complete", entry.entry_id
         )
+        version = 2
+
+    if version == 2:
+        if (
+            entry.data.get(CONF_GATEWAY_FAMILY) == GATEWAY_FAMILY_X180T
+            and entry.data.get(CONF_PAIRING_METHOD) != "pin"
+            and CONF_BLUETOOTH_PIN in entry.data
+        ):
+            new_data = {
+                key: value
+                for key, value in entry.data.items()
+                if key != CONF_BLUETOOTH_PIN
+            }
+            hass.config_entries.async_update_entry(
+                entry,
+                data=new_data,
+                version=3,
+            )
+            _LOGGER.info(
+                "Migrated X180T push-button entry %s by removing stale bluetooth_pin",
+                entry.entry_id,
+            )
+        else:
+            hass.config_entries.async_update_entry(entry, version=3)
+            _LOGGER.info(
+                "Migration of OneControl entry %s to version 3 complete", entry.entry_id
+            )
 
     return True
 
