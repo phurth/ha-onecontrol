@@ -662,7 +662,6 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
 class OneControlLevelerPositionSensor(_OneControlSensorBase):
     """Leveler position sensor — created dynamically as levelers are discovered."""
 
-    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:format-horizontal-align-center"
 
     def __init__(
@@ -722,7 +721,6 @@ class OneControlLevelerPositionSensor(_OneControlSensorBase):
 class OneControlTankAlertSensor(_OneControlSensorBase):
     """Tank alert sensor — alert type and status."""
 
-    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:water-alert"
 
     def __init__(

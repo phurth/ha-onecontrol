@@ -118,11 +118,39 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "Migrated X180T push-button entry %s by removing stale bluetooth_pin",
                 entry.entry_id,
             )
+            version = 3
         else:
             hass.config_entries.async_update_entry(entry, version=3)
             _LOGGER.info(
                 "Migration of OneControl entry %s to version 3 complete", entry.entry_id
             )
+            version = 3
+
+    if version == 3:
+        ent_reg = er.async_get(hass)
+        entries = er.async_entries_for_config_entry(ent_reg, entry.entry_id)
+        cover_sensor_pattern = re.compile(r"^([0-9a-f]{12})_cover_([0-9a-f]{2})$")
+
+        for ent in entries:
+            if ent.domain != "sensor":
+                continue
+            match = cover_sensor_pattern.match(ent.unique_id or "")
+            if not match:
+                continue
+            mac, device = match.groups()
+            new_unique_id = f"{mac}_cover_state_{device}"
+            ent_reg.async_update_entity(ent.entity_id, new_unique_id=new_unique_id)
+            _LOGGER.info(
+                "Migration: renamed cover sensor %s → %s",
+                ent.unique_id,
+                new_unique_id,
+            )
+
+        hass.config_entries.async_update_entry(entry, version=4)
+        _LOGGER.info(
+            "Migration of OneControl entry %s to version 4 complete", entry.entry_id
+        )
+        version = 4
 
     return True
 

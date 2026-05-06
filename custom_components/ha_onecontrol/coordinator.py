@@ -1817,8 +1817,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await asyncio.sleep(0.5)
                 verify = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
                 _LOGGER.debug("CAN BLE: key/seed unlock verify=%s", verify.hex())
-                # Check if unlock succeeded (should be "unlocked" or non-zero)
-                if verify.lower() == b"unlocked" or (len(verify) > 0 and verify[0] != 0x00):
+                # Only accept explicit unlocked status values to avoid false positives
+                # from textual or status-style responses.
+                if verify.lower() == b"unlocked" or verify == b"\x01":
                     unlock_success = True
                     _LOGGER.debug("CAN BLE: key/seed unlock successful")
                 else:
@@ -3703,7 +3704,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # For CAN BLE gateways, add extra delay on first reconnect to let BlueZ settle
         # after the disconnect. CAN BLE disconnects can leave BlueZ in "InProgress" state
         # if we reconnect too quickly.
-        if self._can_ble_confirmed and self._consecutive_failures == 1:
+        if self._can_ble_confirmed and self._consecutive_failures == 0:
             delay = 2.0  # Give BlueZ 2s to clean up after CAN BLE disconnect
             _LOGGER.debug(
                 "CAN BLE disconnect detected — delaying reconnect by %.1fs to allow BlueZ cleanup",

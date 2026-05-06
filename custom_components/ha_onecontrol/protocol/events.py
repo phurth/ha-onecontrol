@@ -32,6 +32,7 @@ from ..const import (
     EVENT_RGB_LIGHT,
     EVENT_RV_STATUS,
     EVENT_SESSION_STATUS,
+    EVENT_TANK_ALERT,
     EVENT_TANK_SENSOR,
     EVENT_TANK_SENSOR_V2,
     METADATA_PAYLOAD_SIZE_FULL,
@@ -790,6 +791,8 @@ def parse_event(data: bytes) -> Any:
         return parse_tank_status(data)
     if event_type == EVENT_TANK_SENSOR_V2:
         return parse_tank_status_v2(data)
+    if event_type == EVENT_TANK_ALERT:
+        return parse_tank_alert(data)
     if event_type == EVENT_DIMMABLE_LIGHT:
         return parse_dimmable_light(data)
     if event_type == EVENT_RGB_LIGHT:
