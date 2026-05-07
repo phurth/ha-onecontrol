@@ -103,11 +103,13 @@ from .protocol.events import (
     GeneratorStatus,
     HourMeter,
     HvacZone,
+    LevelerStatus,
     RealTimeClock,
     RelayStatus,
     RgbLight,
     RvStatus,
     SystemLockout,
+    TankAlert,
     TankLevel,
     parse_event,
     parse_metadata_response,
@@ -115,7 +117,9 @@ from .protocol.events import (
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.function_names import get_friendly_name
 from .protocol.tea import (
+    CAN_BLE_KEY_SEED_CIPHER,
     RC_CYPHER,
+    X180T_KEY_SEED_CIPHER,
     calculate_can_ble_key_seed_key,
     calculate_step1_key,
     calculate_step2_key,
@@ -307,9 +311,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._instance_tag: str = f"{id(self):x}"[-6:]
         # Android uses gateway_pin for both BLE bonding AND protocol auth.
         # bluetooth_pin is an optional override if the BLE PIN differs.
+        # For X180T, BLE pairing is Just Works, so don't use gateway_pin as bluetooth_pin
+        bluetooth_pin_default = "" if self._gateway_family == GATEWAY_FAMILY_X180T else self.gateway_pin
         self._bluetooth_pin: str = entry.data.get(
-            CONF_BLUETOOTH_PIN, ""
-        ) or self.gateway_pin
+            CONF_BLUETOOTH_PIN, bluetooth_pin_default
+        )
+        if self.is_x180t_gateway and self._pairing_method != "pin":
+            if self._bluetooth_pin:
+                _LOGGER.warning(
+                    "X180T push-button gateway %s ignoring configured bluetooth_pin; using Just Works pairing",
+                    self.address,
+                )
+            self._bluetooth_pin = ""
         self._pin_agent_ctx: PinAgentContext | None = None  # active D-Bus agent context
         self._pin_dbus_succeeded: bool = False  # bonding completed this session
         self._pin_already_bonded: bool = False  # BlueZ "already bonded" seen (sticky — not reset on disconnect)
@@ -426,6 +439,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.device_locks: dict[str, DeviceLock] = {}
         self.generators: dict[str, GeneratorStatus] = {}
         self.hour_meters: dict[str, HourMeter] = {}
+        self.levelers: dict[str, LevelerStatus] = {}
+        self.tank_alerts: dict[str, TankAlert] = {}
         self.rtc: RealTimeClock | None = None
         self.system_lockout_level: int | None = None
 
@@ -1132,7 +1147,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for status_dict in (
             self.relays, self.dimmable_lights, self.rgb_lights, self.covers,
             self.hvac_zones, self.tanks, self.device_online, self.device_locks,
-            self.generators, self.hour_meters, self.unknown_devices,
+            self.generators, self.hour_meters, self.levelers, self.tank_alerts, self.unknown_devices,
         ):
             for key in status_dict:
                 t = int(key.split(":")[0], 16)
@@ -1431,13 +1446,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address,
                 )
         elif self.is_x180t_gateway:
-            # Official X180T flow connects first, then creates the bond.  Keep
-            # an agent registered for the upcoming post-connect pair(). Some
-            # X180T panels have both a Connect button and a 6-digit BLE PIN.
-            if self._bluetooth_pin:
-                ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
-            else:
-                ctx = await prepare_push_button_agent(self.address)
+            # Official X180T flow connects first, then creates the bond.
+            _LOGGER.info(
+                "X180T gateway %s (pairing_method=%s) — registering Just Works agent",
+                self.address,
+                self._pairing_method,
+            )
+            ctx = await prepare_push_button_agent(self.address)
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._push_button_dbus_ok = True
@@ -1445,6 +1460,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.info(
                     "X180T gateway %s — already bonded, connecting directly",
                     self.address,
+                )
+            else:
+                _LOGGER.debug(
+                    "X180T gateway %s — agent registered: %s",
+                    self.address,
+                    ctx.agent_registered if ctx else "ctx is None",
                 )
         elif is_pin_pairing_supported():
             _LOGGER.info(
@@ -1534,10 +1555,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address, adapter,
                 )
         elif self.is_x180t_gateway:
-            if self._bluetooth_pin:
-                ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
-            else:
-                ctx = await prepare_push_button_agent(self.address)
+            ctx = await prepare_push_button_agent(self.address)
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._push_button_dbus_ok = True
@@ -1571,7 +1589,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._client = client
         self._connected = True
         self.async_set_updated_data(self._build_data())
-        _LOGGER.info("Connected to %s", self.address)
+        _LOGGER.debug("Connected to %s", self.address)
 
         # Official parity: request MTU 185 when supported.
         # Keep this best-effort so older backends/paths continue to work.
@@ -1609,25 +1627,32 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if hasattr(client, "pair"):
                         paired = await client.pair()
                         _LOGGER.info("BLE pair() result: %s", paired)
-                        if self.is_x180t_gateway and not paired:
+                        if not paired:
+                            # Check if BlueZ reports bonded despite pair() returning False
                             if await async_is_locally_bonded(self.address):
                                 _LOGGER.info(
-                                    "X180T BLE pair() returned %s but BlueZ reports bonded",
+                                    "BLE pair() returned %s but BlueZ reports bonded — proceeding",
                                     paired,
                                 )
-                                self._push_button_dbus_ok = True
-                                self._pin_already_bonded = True
+                                paired = True
                             else:
-                                raise BleakError("X180T BLE bonding returned False")
-                    elif self.is_x180t_gateway:
-                        if await async_is_locally_bonded(self.address):
-                            _LOGGER.info(
-                                "X180T pair() unavailable but BlueZ reports bonded"
-                            )
-                            self._push_button_dbus_ok = True
-                            self._pin_already_bonded = True
-                        else:
-                            raise BleakError("X180T BLE bonding returned False")
+                                # For X180T, retry pairing once after a short delay
+                                if self.is_x180t_gateway:
+                                    _LOGGER.info("X180T pairing failed, retrying after delay...")
+                                    await asyncio.sleep(1.0)
+                                    paired = await client.pair()
+                                    _LOGGER.info("BLE pair() retry result: %s", paired)
+                                    if not paired and await async_is_locally_bonded(self.address):
+                                        _LOGGER.info("BLE pair() retry failed but BlueZ reports bonded — proceeding")
+                                        paired = True
+                                if not paired:
+                                    _LOGGER.warning(
+                                        "BLE pair() failed and not bonded — auth may fail"
+                                    )
+                        if paired:
+                            # Wait for bond to stabilize before proceeding with auth
+                            await asyncio.sleep(1.0)
+                            _LOGGER.debug("Bond established, proceeding with authentication")
                     else:
                         _LOGGER.debug("pair() not available on client wrapper")
                 except NotImplementedError:
@@ -1691,14 +1716,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             services = client.services
             if services:
                 svc_uuids = [s.uuid for s in services]
-                _LOGGER.info("GATT services: %s", svc_uuids)
+                _LOGGER.debug("GATT services: %s", svc_uuids)
                 # Check for CAN_WRITE and UNLOCK_STATUS to identify gateway protocol
                 _has_unlock_status = False
                 for svc in services:
                     for char in svc.characteristics:
                         if char.uuid == CAN_WRITE_CHAR_UUID:
                             self._has_can_write = True
-                            _LOGGER.info("CAN_WRITE characteristic available")
+                            _LOGGER.debug("CAN_WRITE characteristic available")
                         if char.uuid == UNLOCK_STATUS_CHAR_UUID:
                             _has_unlock_status = True
                 # CAN-only gateways expose CAN service but no MyRvLink AUTH service.
@@ -1730,7 +1755,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # ── Enable notifications ──────────────────────────────────────
             await self._enable_notifications(client)
 
-        _LOGGER.info("OneControl %s — notifications enabled, waiting for SEED", self.address)
+        _LOGGER.debug("OneControl %s — notifications enabled, waiting for SEED", self.address)
 
         # For non-PIN gateways authenticated in step 1, start the heartbeat now.
         # PIN gateways become authenticated in _authenticate_step2 after the
@@ -1777,24 +1802,38 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # BleManager performs this before BleCommunicationsAdapter opens the CAN
         # service on X180T-style gateways.  It is harmless on gateways that do not
         # expose these characteristics and may be required before writes are honored.
+        unlock_success = False
         try:
             seed_data = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
             if seed_data.lower() == b"unlocked":
-                _LOGGER.info("CAN BLE: key/seed unlock already verified")
+                _LOGGER.debug("CAN BLE: key/seed unlock already verified")
+                unlock_success = True
             elif len(seed_data) >= 4:
                 seed = bytes(seed_data[:4])
-                key = calculate_can_ble_key_seed_key(seed)
-                _LOGGER.info("CAN BLE: key/seed unlock seed=%s key=computed", seed.hex())
+                cipher = X180T_KEY_SEED_CIPHER if self.is_x180t_gateway else CAN_BLE_KEY_SEED_CIPHER
+                key = calculate_can_ble_key_seed_key(seed, cipher)
+                _LOGGER.debug("CAN BLE: key/seed unlock seed=%s key=computed", seed.hex())
                 await client.write_gatt_char(KEY_CHAR_UUID, key, response=True)
                 await asyncio.sleep(0.5)
                 verify = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
-                _LOGGER.info("CAN BLE: key/seed unlock verify=%s", verify.hex())
+                _LOGGER.debug("CAN BLE: key/seed unlock verify=%s", verify.hex())
+                # Only accept explicit unlocked status values to avoid false positives
+                # from textual or status-style responses.
+                if verify.lower() == b"unlocked" or verify == b"\x01":
+                    unlock_success = True
+                    _LOGGER.debug("CAN BLE: key/seed unlock successful")
+                else:
+                    _LOGGER.warning("CAN BLE: key/seed unlock failed — verify=%s", verify.hex())
             else:
                 _LOGGER.debug("CAN BLE: key/seed unlock seed unavailable: %s", seed_data.hex())
         except BleakError as exc:
             _LOGGER.debug("CAN BLE: key/seed unlock not available (%s)", exc)
         except Exception as exc:
             _LOGGER.warning("CAN BLE: key/seed unlock failed (%s) — proceeding", exc)
+
+        # For X180T gateways, key/seed unlock is required
+        if self.is_x180t_gateway and not unlock_success:
+            raise BleakError("X180T CAN BLE key/seed unlock failed")
 
         # --- Gateway protocol version ---
         # Official app selects session strategy from this value:
@@ -1803,13 +1842,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             version_data = bytes(await client.read_gatt_char(CAN_VERSION_CHAR_UUID))
             decoded_version = _official_can_ble_gateway_version_from_part(version_data)
             self._can_ble_gateway_version = decoded_version
-            _LOGGER.info(
+            _LOGGER.debug(
                 "CAN BLE: software part/version char=%s official_gateway_version=%s",
                 version_data.hex(),
                 decoded_version,
             )
         except BleakError as exc:
-            _LOGGER.info(
+            _LOGGER.debug(
                 "CAN BLE: software part/version char unavailable (%s); gateway_version remains %s",
                 exc,
                 self._can_ble_gateway_version,
@@ -1818,58 +1857,54 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("CAN BLE: software part/version decode failed (%s)", exc)
 
         # --- PIN unlock ---
-        try:
-            lock_data = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
-            locked = len(lock_data) == 0 or lock_data[0] == 0x00
-            _LOGGER.info(
-                "CAN BLE: PASSWORD_UNLOCK read = %s (locked=%s)", lock_data.hex(), locked
-            )
-            if locked:
-                pin_bytes = b"" if self.is_x180t_gateway else self.gateway_pin.encode("utf-8")
-                _LOGGER.info(
-                    "CAN BLE: writing %s to PASSWORD_UNLOCK",
-                    "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
+        # Skip PASSWORD_UNLOCK for X180T gateways as they use key/seed unlock only
+        if not self.is_x180t_gateway:
+            try:
+                lock_data = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
+                locked = len(lock_data) == 0 or lock_data[0] == 0x00
+                _LOGGER.debug(
+                    "CAN BLE: PASSWORD_UNLOCK read = %s (locked=%s)", lock_data.hex(), locked
                 )
+                if locked:
+                    pin_bytes = self.gateway_pin.encode("utf-8")
+                    _LOGGER.debug("CAN BLE: writing gateway PIN to PASSWORD_UNLOCK")
 
-                unlock_ok = False
-                verify = b""
-                for attempt in range(2):
-                    await client.write_gatt_char(
-                        PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=False
-                    )
-                    await asyncio.sleep(1.0)
-                    verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
-                    if len(verify) > 0 and verify[0] != 0x00:
-                        unlock_ok = True
-                        break
-                    if attempt == 0:
-                        _LOGGER.warning(
-                            "CAN BLE: PIN unlock verify still locked (%s), retrying write",
-                            verify.hex(),
+                    unlock_ok = False
+                    verify = b""
+                    for attempt in range(2):
+                        await client.write_gatt_char(
+                            PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=False
                         )
+                        await asyncio.sleep(1.0)
+                        verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
+                        if len(verify) > 0 and verify[0] != 0x00:
+                            unlock_ok = True
+                            break
+                        if attempt == 0:
+                            _LOGGER.warning(
+                                "CAN BLE: PIN unlock verify still locked (%s), retrying write",
+                                verify.hex(),
+                            )
 
-                if unlock_ok:
-                    _LOGGER.info(
-                        "CAN BLE: PIN unlock verified = %s", verify.hex()
-                    )
-                else:
-                    raise BleakError(
-                        f"CAN BLE unlock failed — verify={verify.hex() or 'empty'}"
-                    )
-        except BleakError as exc:
-            if self.is_x180t_gateway:
-                _LOGGER.warning("CAN BLE: X180T unlock failed (%s)", exc)
-                raise BleakError("X180T CAN BLE unlock failed") from exc
-            _LOGGER.warning(
-                "CAN BLE: PASSWORD_UNLOCK char not accessible (%s) — proceeding", exc
-            )
+                    if unlock_ok:
+                        _LOGGER.debug(
+                            "CAN BLE: PIN unlock verified = %s", verify.hex()
+                        )
+                    else:
+                        raise BleakError(
+                            f"CAN BLE unlock failed — verify={verify.hex() or 'empty'}"
+                        )
+            except BleakError as exc:
+                _LOGGER.warning(
+                    "CAN BLE: PASSWORD_UNLOCK char not accessible (%s) — proceeding", exc
+                )
 
         if self._can_ble_gateway_version == "Unknown":
             try:
                 version_data = bytes(await client.read_gatt_char(CAN_VERSION_CHAR_UUID))
                 decoded_version = _official_can_ble_gateway_version_from_part(version_data)
                 self._can_ble_gateway_version = decoded_version
-                _LOGGER.info(
+                _LOGGER.debug(
                     "CAN BLE: post-unlock software part/version char=%s official_gateway_version=%s",
                     version_data.hex(),
                     decoded_version,
@@ -1886,7 +1921,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # --- Subscribe CAN_READ for inbound frames ---
         try:
             await client.start_notify(CAN_READ_CHAR_UUID, self._on_can_read)
-            _LOGGER.info("CAN BLE: subscribed to CAN_READ (%s)", CAN_READ_CHAR_UUID)
+            _LOGGER.debug("CAN BLE: subscribed to CAN_READ (%s)", CAN_READ_CHAR_UUID)
+            await asyncio.sleep(0.1)  # Brief delay to allow subscription to settle
+            
+            # Try reading one CAN_READ byte to verify subscription is active
+            try:
+                test_read = await client.read_gatt_char(CAN_READ_CHAR_UUID)
+                _LOGGER.debug("CAN BLE: CAN_READ subscription verified (test read: %d bytes)", len(test_read))
+            except Exception as read_exc:
+                _LOGGER.debug("CAN BLE: CAN_READ test read not available: %s (normal for notify-only)", read_exc)
         except BleakError as exc:
             _LOGGER.warning("CAN BLE: could not subscribe CAN_READ: %s", exc)
             self._can_read_subscribed = False
@@ -1911,12 +1954,19 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._flush_can_commands(client)
 
         # --- Kick off discovery and start link keepalive ---
+        # Send immediate discovery to establish baseline connection and trigger first response
         await self._send_can_device_discovery(client)
+        _LOGGER.debug("CAN BLE: initial device discovery sent")
+        
+        # Ensure any old keepalive task is cancelled
         if self._can_keepalive_task and not self._can_keepalive_task.done():
             self._can_keepalive_task.cancel()
+        
+        # Start keepalive loop which will send periodic discovery frames
         self._can_keepalive_task = self.hass.async_create_background_task(
             self._can_keepalive_loop(client), name="ha_onecontrol_can_keepalive"
         )
+        _LOGGER.debug("CAN BLE: keepalive loop started for persistent connection")
 
     def _on_can_read(
         self, characteristic: BleakGATTCharacteristic, data: bytearray
@@ -1930,7 +1980,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         All other values: try V1 raw IDS-CAN parse directly.
         """
         raw = bytes(data)
-        _LOGGER.debug("CAN RX raw (%d bytes): %s", len(raw), raw.hex())
+        # Update last event time for keepalive tracking
+        self._last_event_time = time.monotonic()
+        if len(raw) > 0:
+            _LOGGER.debug("CAN RX raw (%d bytes, type=0x%02X): %s", len(raw), raw[0] if raw else 0, raw.hex())
         can_frames = _decode_v2_ble_can_frames(raw)
         if not can_frames:
             # V1 or unrecognised — try raw parse
@@ -2111,6 +2164,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:
             _LOGGER.warning("CAN BLE: failed to send device discovery: %s", exc)
 
+    async def _send_can_keepalive_status(self, client: BleakClient) -> None:
+        """Send a DEVICE_STATUS message as keepalive to maintain CAN BLE connection."""
+        try:
+            source = self._gateway_can_address & 0xFF
+            frame = compose_ids_can_standard_wire_frame(
+                message_type=0x03,  # DEVICE_STATUS
+                source_address=source,
+                payload=b"",
+            )
+            await self._write_can_frame(client, frame, label="DEVICE_STATUS keepalive")
+            _LOGGER.debug("CAN BLE: sent DEVICE_STATUS keepalive from 0x%02X", source)
+        except Exception as exc:
+            _LOGGER.warning("CAN BLE: failed to send keepalive status: %s", exc)
+
     def _choose_can_local_host_address(self) -> int:
         """Choose a likely-unused IDS-CAN local host address.
 
@@ -2275,16 +2342,34 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Keep CAN-only BLE links active during idle windows.
 
         Some CAN-only gateways drop idle BLE links quickly unless periodic
-        host traffic is present. Send a lightweight discovery request every
-        few seconds while connected/authenticated.
+        host traffic is present. Send keepalive frames every 3 seconds to keep
+        the link alive and establish baseline connectivity.
         """
         try:
+            # Send first keepalive immediately (no sleep) to prevent early disconnect
+            if (
+                self._connected
+                and self._authenticated
+                and self._can_read_subscribed
+                and self._client is client
+            ):
+                _LOGGER.debug("CAN BLE: sending immediate keepalive (no delay)")
+                try:
+                    await self._advertise_can_local_host_identity(
+                        client, reason="keepalive-initial", force=False
+                    )
+                    await self._send_can_device_discovery(client)
+                except Exception as exc:
+                    _LOGGER.warning("CAN BLE: initial keepalive failed: %s", exc)
+            
+            # Then enter periodic keepalive loop
             while (
                 self._connected
                 and self._authenticated
                 and self._can_read_subscribed
                 and self._client is client
             ):
+                # Shorter interval (3s) to keep connection alive with periodic discovery traffic
                 await asyncio.sleep(3.0)
                 if not (
                     self._connected
@@ -2293,7 +2378,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     and self._client is client
                 ):
                     break
-                # Avoid interleaving broadcast discovery traffic with
+                # Avoid interleaving broadcast keepalive traffic with
                 # REMOTE_CONTROL session open/heartbeat traffic.
                 if (
                     self._rc_session_seed_future is not None
@@ -2301,15 +2386,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     or self._rc_session_open
                 ):
                     continue
-                _LOGGER.debug("CAN BLE: keepalive tick")
-                await self._advertise_can_local_host_identity(
-                    client, reason="keepalive", force=False
-                )
-                await self._send_can_device_discovery(client)
+                _LOGGER.debug("CAN BLE: keepalive tick (connected=%s authenticated=%s subscribed=%s)",
+                    self._connected, self._authenticated, self._can_read_subscribed)
+                try:
+                    await self._advertise_can_local_host_identity(
+                        client, reason="keepalive", force=False
+                    )
+                    await self._send_can_device_discovery(client)
+                except Exception as exc:
+                    _LOGGER.warning("CAN BLE: keepalive tick failed: %s", exc)
+                    # Don't break; let normal disconnect handling deal with it
         except asyncio.CancelledError:
-            pass
+            _LOGGER.debug("CAN BLE: keepalive loop cancelled")
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("CAN BLE: keepalive loop ended due to error: %s", exc)
+            _LOGGER.warning("CAN BLE: keepalive loop ended due to error: %s", exc)
 
     async def _flush_can_commands(self, client: BleakClient) -> None:
         """Flush any relay/cover commands queued while the gateway was disconnected.
@@ -2984,7 +3074,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 table_id,
             )
             return
-        _LOGGER.info("Requesting metadata for observed table_id=%d", table_id)
+        _LOGGER.debug("Requesting metadata for observed table_id=%d", table_id)
         self.hass.async_create_task(self._send_metadata_request(table_id))
 
     # ------------------------------------------------------------------
@@ -2999,7 +3089,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._heartbeat_task = self.hass.async_create_background_task(
             self._heartbeat_loop(), name="ha_onecontrol_heartbeat"
         )
-        _LOGGER.info("Heartbeat started (every %.0fs)", HEARTBEAT_INTERVAL)
+        _LOGGER.debug("Heartbeat started (every %.0fs)", HEARTBEAT_INTERVAL)
 
     def _stop_heartbeat(self) -> None:
         """Cancel the heartbeat loop."""
@@ -3439,6 +3529,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.hour_meters[key] = event
             self._ensure_metadata_for_table(event.table_id)
 
+        elif isinstance(event, LevelerStatus):
+            key = _device_key(event.table_id, event.device_id)
+            self.levelers[key] = event
+            self._ensure_metadata_for_table(event.table_id)
+
+        elif isinstance(event, TankAlert):
+            key = _device_key(event.table_id, event.device_id)
+            self.tank_alerts[key] = event
+            self._ensure_metadata_for_table(event.table_id)
+
         elif isinstance(event, RealTimeClock):
             self.rtc = event
 
@@ -3535,7 +3635,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _on_disconnect(self, client: BleakClient) -> None:
         """Handle unexpected BLE disconnect — schedule reconnect with backoff."""
-        _LOGGER.warning("OneControl %s disconnected (instance=%s)", self.address, self._instance_tag)
+        _LOGGER.debug("OneControl %s disconnected (instance=%s)", self.address, self._instance_tag)
         self._stop_heartbeat()
         self._connected = False
         self._authenticated = False
@@ -3570,6 +3670,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._rc_heartbeat_task.cancel()
         self._rc_heartbeat_task = None
         if self._can_keepalive_task and not self._can_keepalive_task.done():
+            _LOGGER.debug("Cancelling CAN keepalive task on disconnect")
             self._can_keepalive_task.cancel()
         self._can_keepalive_task = None
         self._pin_dbus_succeeded = False
@@ -3599,12 +3700,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._reconnect_generation += 1
         generation = self._reconnect_generation
-        delay = min(
-            RECONNECT_BACKOFF_BASE * (2 ** self._consecutive_failures),
-            RECONNECT_BACKOFF_CAP,
-        )
+        
+        # For CAN BLE gateways, add extra delay on first reconnect to let BlueZ settle
+        # after the disconnect. CAN BLE disconnects can leave BlueZ in "InProgress" state
+        # if we reconnect too quickly.
+        if self._can_ble_confirmed and self._consecutive_failures == 0:
+            delay = 2.0  # Give BlueZ 2s to clean up after CAN BLE disconnect
+            _LOGGER.debug(
+                "CAN BLE disconnect detected — delaying reconnect by %.1fs to allow BlueZ cleanup",
+                delay
+            )
+        else:
+            delay = min(
+                RECONNECT_BACKOFF_BASE * (2 ** self._consecutive_failures),
+                RECONNECT_BACKOFF_CAP,
+            )
+        
         self._consecutive_failures += 1
-        _LOGGER.info(
+        _LOGGER.debug(
             "Scheduling reconnect in %.0fs (attempt %d, gen=%d, instance=%s)",
             delay, self._consecutive_failures, generation, self._instance_tag,
         )
@@ -3638,7 +3751,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 await self._remove_stale_bond()
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Attempting reconnection to %s (gen=%d, instance=%s)...",
                 self.address, generation, self._instance_tag,
             )
@@ -3649,7 +3762,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # it a partial failure and keep the backoff counter intact.
             if self._authenticated or self._pin_dbus_succeeded:
                 self._consecutive_failures = 0
-                _LOGGER.info("Reconnected to %s (instance=%s)", self.address, self._instance_tag)
+                _LOGGER.debug("Reconnected to %s (instance=%s)", self.address, self._instance_tag)
             else:
                 _LOGGER.warning(
                     "async_connect returned but %s is not authenticated — "

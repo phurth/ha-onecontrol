@@ -25,12 +25,14 @@ from ..const import (
     EVENT_HBRIDGE_2,
     EVENT_HOUR_METER,
     EVENT_HVAC_STATUS,
+    EVENT_LEVELER,
     EVENT_REAL_TIME_CLOCK,
     EVENT_RELAY_BASIC_LATCHING_1,
     EVENT_RELAY_BASIC_LATCHING_2,
     EVENT_RGB_LIGHT,
     EVENT_RV_STATUS,
     EVENT_SESSION_STATUS,
+    EVENT_TANK_ALERT,
     EVENT_TANK_SENSOR,
     EVENT_TANK_SENSOR_V2,
     METADATA_PAYLOAD_SIZE_FULL,
@@ -54,11 +56,17 @@ class GatewayInformation:
 
 @dataclass
 class RvStatus:
-    """System voltage and temperature (event 0x07)."""
+    """System voltage and temperature (event 0x07).
 
-    voltage: float | None = None  # Volts (8.8 fixed-point BE)
+    Format: [0x07][voltH][voltL][tempH][tempL][flags][acVoltH][acVoltL]
+    DC voltage and temperature are required (8.8 fixed-point big-endian).
+    AC voltage is optional (extended frame, 8.8 fixed-point big-endian).
+    """
+
+    voltage: float | None = None  # DC Volts (8.8 fixed-point BE)
     temperature: float | None = None  # °F (8.8 fixed-point BE, signed)
     feature_flags: int = 0  # data[5]
+    ac_voltage: float | None = None  # AC Volts if extended frame (8.8 fixed-point BE)
 
 
 @dataclass
@@ -113,6 +121,34 @@ class TankLevel:
     table_id: int = 0
     device_id: int = 0
     level: int = 0  # 0-100 %
+
+
+@dataclass
+class TankAlert:
+    """Tank alert status (level or connectivity events).
+
+    Generated when tank level crosses alert threshold or tank connectivity lost.
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    alert_type: int = 0  # 0=connectivity, 1=low_level, 2=high_level
+    is_triggered: bool = False  # True if alert is active
+
+
+@dataclass
+class LevelerStatus:
+    """Leveler/jack system status (event 0x10).
+
+    Leveling systems report their current position/state.
+    Status byte format depends on leveler type (automatic, multi-leg, air-bag, etc.).
+    """
+
+    table_id: int = 0
+    device_id: int = 0
+    is_active: bool = False  # True when leveler is operating
+    position_code: int = 0  # Leveler position (0=retracted, 1=extended, 2=mid, etc.)
+    level_achieved: bool = False  # True when desired level achieved
 
 
 @dataclass
@@ -287,8 +323,10 @@ def parse_gateway_information(data: bytes) -> GatewayInformation | None:
 def parse_rv_status(data: bytes) -> RvStatus | None:
     """Parse RvStatus (0x07).
 
-    Format: [0x07][voltH][voltL][tempH][tempL][flags]
+    Standard format (6 bytes): [0x07][voltH][voltL][tempH][tempL][flags]
+    Extended format (8+ bytes): ... + [acVoltH][acVoltL]
     Both voltage and temperature are unsigned 8.8 fixed-point big-endian.
+    AC voltage is optional (extended frame, 8.8 fixed-point big-endian).
     """
     if len(data) < 6:
         return None
@@ -297,12 +335,17 @@ def parse_rv_status(data: bytes) -> RvStatus | None:
     t_raw = (data[3] << 8) | data[4]
 
     voltage = None if v_raw == 0xFFFF else v_raw / 256.0
+    ac_voltage = None
+    if len(data) >= 8:
+        ac_raw = (data[6] << 8) | data[7]
+        ac_voltage = None if ac_raw == 0xFFFF else ac_raw / 256.0
+    
     if t_raw in (0xFFFF, 0x7FFF):
         temperature = None
     else:
         temperature = t_raw / 256.0
 
-    return RvStatus(voltage=voltage, temperature=temperature, feature_flags=data[5])
+    return RvStatus(voltage=voltage, temperature=temperature, feature_flags=data[5], ac_voltage=ac_voltage)
 
 
 def parse_relay_status(data: bytes) -> RelayStatus | None:
@@ -587,6 +630,42 @@ def parse_hour_meter(data: bytes) -> HourMeter | None:
     )
 
 
+def parse_leveler_status(data: bytes) -> LevelerStatus | None:
+    """Parse Leveler status (0x10).
+
+    Format: [0x10][tableId][deviceId][status][position]
+      status bit 0: is_active (leveler operating)
+      status bit 1: level_achieved (desired level reached)
+      position: 0=retracted, 1=extended, 2=mid, 3=error
+    """
+    if len(data) < 5:
+        return None
+    status = data[3]
+    return LevelerStatus(
+        table_id=data[1],
+        device_id=data[2],
+        is_active=bool(status & 0x01),
+        position_code=data[4] if len(data) > 4 else 0,
+        level_achieved=bool(status & 0x02),
+    )
+
+
+def parse_tank_alert(data: bytes) -> TankAlert | None:
+    """Parse TankAlert status.
+
+    Tank alerts are triggered when level crosses thresholds or connectivity lost.
+    Format: [type][tableId][deviceId][alertType][isTriggered]
+    """
+    if len(data) < 5:
+        return None
+    return TankAlert(
+        table_id=data[1],
+        device_id=data[2],
+        alert_type=data[3],
+        is_triggered=bool(data[4]),
+    )
+
+
 def parse_metadata_response(data: bytes) -> list[DeviceMetadata]:
     """Parse GetDevicesMetadata response (event 0x02).
 
@@ -712,6 +791,8 @@ def parse_event(data: bytes) -> Any:
         return parse_tank_status(data)
     if event_type == EVENT_TANK_SENSOR_V2:
         return parse_tank_status_v2(data)
+    if event_type == EVENT_TANK_ALERT:
+        return parse_tank_alert(data)
     if event_type == EVENT_DIMMABLE_LIGHT:
         return parse_dimmable_light(data)
     if event_type == EVENT_RGB_LIGHT:
@@ -724,6 +805,8 @@ def parse_event(data: bytes) -> Any:
         return parse_cover_status(data)
     if event_type == EVENT_HOUR_METER:
         return parse_hour_meter(data)
+    if event_type == EVENT_LEVELER:
+        return parse_leveler_status(data)
     if event_type == EVENT_REAL_TIME_CLOCK:
         return parse_real_time_clock(data)
     if event_type == EVENT_DEVICE_COMMAND:

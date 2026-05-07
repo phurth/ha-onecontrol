@@ -82,6 +82,7 @@ EVENT_HOUR_METER = 0x0F
 EVENT_LEVELER = 0x10
 EVENT_SESSION_STATUS = 0x1A
 EVENT_TANK_SENSOR_V2 = 0x1B
+EVENT_TANK_ALERT = 0x1C
 EVENT_REAL_TIME_CLOCK = 0x20
 
 # ---------------------------------------------------------------------------

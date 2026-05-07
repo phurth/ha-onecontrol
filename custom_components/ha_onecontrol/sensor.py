@@ -2,10 +2,13 @@
 
 Creates sensor entities for:
   - System voltage (RvStatus event 0x07)
+  - AC voltage (RvStatus event 0x07, extended frame) — when available
   - System temperature (RvStatus event 0x07) — diagnostic, unavailable when gateway lacks sensor
   - Tank levels (TankSensorStatus events 0x0C / 0x1B)
+  - Tank alerts (threshold/connectivity events)
   - Generator status (event 0x0A)
   - Hour meter (event 0x0F)
+  - Leveler position (event 0x10)
   - Cover / slide / awning STATE (events 0x0D/0x0E) — no control, safety
   - Gateway diagnostics: device count, table ID, protocol version
 
@@ -37,7 +40,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
-from .protocol.events import CoverStatus, GeneratorStatus, HourMeter, TankLevel
+from .protocol.events import CoverStatus, GeneratorStatus, HourMeter, LevelerStatus, TankAlert, TankLevel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +57,7 @@ async def async_setup_entry(
     # Always-present sensors
     entities: list[SensorEntity] = [
         OneControlVoltageSensor(coordinator, address),
+        OneControlAcVoltageSensor(coordinator, address),
         OneControlTemperatureSensor(coordinator, address),
         # Diagnostic sensors
         OneControlDeviceCountSensor(coordinator, address),
@@ -65,6 +69,8 @@ async def async_setup_entry(
     discovered_generators: set[str] = set()
     discovered_hour_meters: set[str] = set()
     discovered_covers: set[str] = set()
+    discovered_levelers: set[str] = set()
+    discovered_tank_alerts: set[str] = set()
 
     @callback
     def _on_event(event: Any) -> None:
@@ -101,6 +107,18 @@ async def async_setup_entry(
                     discovered_covers.add(key)
                     new.append(OneControlCoverStateSensor(coordinator, address, item.table_id, item.device_id))
 
+            elif isinstance(item, LevelerStatus):
+                key = f"{item.table_id:02x}:{item.device_id:02x}"
+                if key not in discovered_levelers:
+                    discovered_levelers.add(key)
+                    new.append(OneControlLevelerPositionSensor(coordinator, address, item.table_id, item.device_id))
+
+            elif isinstance(item, TankAlert):
+                key = f"{item.table_id:02x}:{item.device_id:02x}"
+                if key not in discovered_tank_alerts:
+                    discovered_tank_alerts.add(key)
+                    new.append(OneControlTankAlertSensor(coordinator, address, item.table_id, item.device_id))
+
         if new:
             async_add_entities(new)
 
@@ -127,6 +145,14 @@ async def async_setup_entry(
         if key not in discovered_covers:
             discovered_covers.add(key)
             entities.append(OneControlCoverStateSensor(coordinator, address, cov.table_id, cov.device_id))
+    for key, lev in coordinator.levelers.items():
+        if key not in discovered_levelers:
+            discovered_levelers.add(key)
+            entities.append(OneControlLevelerPositionSensor(coordinator, address, lev.table_id, lev.device_id))
+    for key, alert in coordinator.tank_alerts.items():
+        if key not in discovered_tank_alerts:
+            discovered_tank_alerts.add(key)
+            entities.append(OneControlTankAlertSensor(coordinator, address, alert.table_id, alert.device_id))
     async_add_entities(entities)
 
 
@@ -185,6 +211,36 @@ class OneControlVoltageSensor(_OneControlSensorBase):
         data = self.coordinator.data
         if data and "voltage" in data:
             return data["voltage"]
+        return None
+
+
+class OneControlAcVoltageSensor(_OneControlSensorBase):
+    """AC voltage from RvStatus events (extended frame).
+
+    Only available on gateways with AC voltage monitoring capability.
+    """
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_name = "AC Voltage"
+    _attr_icon = "mdi:flash"
+
+    def __init__(self, coordinator: OneControlCoordinator, address: str) -> None:
+        super().__init__(coordinator, address)
+        self._attr_unique_id = f"{self._mac}_ac_voltage"
+
+    @property
+    def available(self) -> bool:
+        """Only available when AC voltage is present."""
+        rv_status = self.coordinator.rv_status
+        return super().available and bool(rv_status and rv_status.ac_voltage is not None)
+
+    @property
+    def native_value(self) -> float | None:
+        rv_status = self.coordinator.rv_status
+        if rv_status and rv_status.ac_voltage is not None:
+            return rv_status.ac_voltage
         return None
 
 
@@ -564,7 +620,8 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
 
     @property
     def name(self) -> str:
-        return self.coordinator.device_name(self._table_id, self._device_id)
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base}"
 
     @property
     def native_value(self) -> str | None:
@@ -599,3 +656,121 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
             self.async_write_ha_state()
 
 
+# ── Leveler Sensors ───────────────────────────────────────────────────────
+
+
+class OneControlLevelerPositionSensor(_OneControlSensorBase):
+    """Leveler position sensor — created dynamically as levelers are discovered."""
+
+    _attr_icon = "mdi:format-horizontal-align-center"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator, address)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_leveler_position_{device_id:02x}"
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base} Position"
+
+    @property
+    def native_value(self) -> str | None:
+        leveler = self.coordinator.levelers.get(self._key)
+        if not leveler:
+            return None
+        positions = {0: "retracted", 1: "extended", 2: "mid", 3: "error"}
+        return positions.get(leveler.position_code, f"unknown_{leveler.position_code}")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        leveler = self.coordinator.levelers.get(self._key)
+        if not leveler:
+            return {}
+        return {
+            "is_active": leveler.is_active,
+            "level_achieved": leveler.level_achieved,
+            "raw_position_code": leveler.position_code,
+        }
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, LevelerStatus)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()
+
+
+# ── Tank Alert Sensors ────────────────────────────────────────────────────
+
+
+class OneControlTankAlertSensor(_OneControlSensorBase):
+    """Tank alert sensor — alert type and status."""
+
+    _attr_icon = "mdi:water-alert"
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator, address)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_tank_alert_{device_id:02x}"
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base} Alert"
+
+    @property
+    def native_value(self) -> str | None:
+        alert = self.coordinator.tank_alerts.get(self._key)
+        if not alert:
+            return None
+        alert_types = {0: "connectivity", 1: "low_level", 2: "high_level"}
+        alert_type_str = alert_types.get(alert.alert_type, f"unknown_{alert.alert_type}")
+        return "triggered" if alert.is_triggered else f"{alert_type_str}_clear"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        alert = self.coordinator.tank_alerts.get(self._key)
+        if not alert:
+            return {}
+        return {
+            "alert_type": {0: "connectivity", 1: "low_level", 2: "high_level"}.get(
+                alert.alert_type, f"unknown_{alert.alert_type}"
+            ),
+            "is_triggered": alert.is_triggered,
+        }
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, TankAlert)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()

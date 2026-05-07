@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Deploy ha-onecontrol to Home Assistant instance via SSH
 #
-# Usage: ./scripts/deploy.sh [host] [port]
-#   host: SSH host (default: root@10.115.19.131)
-#   port: SSH port (default: 22)
+# Usage: ./scripts/deploy.sh user@host [port]
+#   host: SSH host (required)
+#   port: SSH port (optional, default: 22)
 
 set -euo pipefail
 
-HOST="${1:-root@100.127.141.49}"
+if [ "$#" -lt 1 ]; then
+  echo "Usage: $0 user@host [port]"
+  echo "  host: SSH host (required)"
+  echo "  port: SSH port (optional, default: 22)"
+  exit 1
+fi
+
+HOST="$1"
 PORT="${2:-22}"
 COMPONENT_DIR="custom_components/ha_onecontrol"
 REMOTE_DIR="/homeassistant/custom_components/ha_onecontrol"

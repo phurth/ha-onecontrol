@@ -243,8 +243,6 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
             fields = {}
             if self._pairing_method == PairingMethod.PIN:
                 fields[vol.Required(CONF_BLUETOOTH_PIN)] = str
-            else:
-                fields[vol.Optional(CONF_BLUETOOTH_PIN, default="")] = str
             step_id = "confirm_x180t"
         elif self._pairing_method == PairingMethod.PIN:
             fields[vol.Optional(CONF_BLUETOOTH_PIN, default="")] = str
