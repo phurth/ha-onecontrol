@@ -142,6 +142,13 @@ _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
 # (always-off) devices.  Lets the initial BLE event burst settle first.
 _METADATA_SEED_DELAY_S = 2.0
 
+# IDS-CAN relay command verification/retry tuning.
+# V1 gateways can emit delayed DEVICE_STATUS updates after a command even when
+# the action actually succeeded, so use a longer confirmation window there.
+_CAN_COMMAND_VERIFY_TIMEOUT_S = 0.55
+_CAN_COMMAND_VERIFY_TIMEOUT_V1_S = 1.10
+_CAN_COMMAND_VERIFY_POLL_S = 0.05
+
 # Function codes for definite on/off relay loads that are NEVER dimmable or RGB.
 # Light function codes are intentionally excluded: any light can be wired as a
 # relay, dimmable, or RGB device — we cannot tell from function code alone which
@@ -620,6 +627,26 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return True when official app would use IdsCanSessionManagerAuto."""
         return self._can_ble_gateway_version == "V1"
 
+    def _can_command_verify_timeout(self) -> float:
+        """Return relay confirmation timeout tuned by gateway family/version."""
+        return (
+            _CAN_COMMAND_VERIFY_TIMEOUT_V1_S
+            if self._is_can_ble_v1_gateway()
+            else _CAN_COMMAND_VERIFY_TIMEOUT_S
+        )
+
+    async def _wait_for_can_relay_state(self, device_id: int, state: bool, timeout: float) -> bool:
+        """Wait briefly for DEVICE_STATUS feedback to reflect a relay command."""
+        key = _device_key(0, device_id)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            relay = self.relays.get(key)
+            if relay is not None and relay.is_on == state:
+                return True
+            await asyncio.sleep(_CAN_COMMAND_VERIFY_POLL_S)
+        relay = self.relays.get(key)
+        return relay is not None and relay.is_on == state
+
     async def async_can_switch(self, device_id: int, state: bool) -> None:
         """Send relay on/off via IDS-CAN COMMAND frame to CAN_WRITE.
 
@@ -660,7 +687,38 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 frame.hex(),
             )
             try:
+                verify_timeout = self._can_command_verify_timeout()
                 await self._write_can_frame(self._client, frame, label="relay COMMAND")
+                if not await self._wait_for_can_relay_state(
+                    device_id, state, timeout=verify_timeout
+                ):
+                    _LOGGER.warning(
+                        "CAN BLE: relay COMMAND not confirmed from DEVICE_STATUS for device=0x%02X state=%s within %.2fs; retrying once",
+                        device_id,
+                        "ON" if state else "OFF",
+                        verify_timeout,
+                    )
+                    await self._advertise_can_local_host_identity(
+                        self._client, reason="pre-command-retry", force=True
+                    )
+                    session_ok = await self._ensure_remote_control_session(self._client, device_id)
+                    if not session_ok:
+                        _LOGGER.warning(
+                            "CAN BLE: relay COMMAND retry skipped — REMOTE_CONTROL activation failed for device=0x%02X gateway_version=%s",
+                            device_id,
+                            self._can_ble_gateway_version,
+                        )
+                        return
+                    await self._write_can_frame(self._client, frame, label="relay COMMAND retry")
+                    if not await self._wait_for_can_relay_state(
+                        device_id, state, timeout=verify_timeout
+                    ):
+                        _LOGGER.warning(
+                            "CAN BLE: relay COMMAND retry still unconfirmed for device=0x%02X state=%s within %.2fs",
+                            device_id,
+                            "ON" if state else "OFF",
+                            verify_timeout,
+                        )
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
         else:
@@ -2495,11 +2553,33 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 seed = int.from_bytes(payload[2:6], "big")
                 _LOGGER.debug("CAN BLE: session seed rx 0x%08X", seed)
                 self._rc_session_seed_future.set_result(seed)
+            elif self._rc_session_seed_future and not self._rc_session_seed_future.done():
+                _LOGGER.warning(
+                    "CAN BLE: malformed SESSION_REQUEST_SEED response payload=%s (len=%d)",
+                    payload.hex(),
+                    len(payload),
+                )
+                self._rc_session_seed_future.set_exception(
+                    RuntimeError(
+                        f"malformed SESSION_REQUEST_SEED response payload={payload.hex()} len={len(payload)}"
+                    )
+                )
 
         elif msg == 0x43:  # SESSION_TRANSMIT_KEY response — payload: [sid×2]
             if len(payload) == 2 and self._rc_session_key_future and not self._rc_session_key_future.done():
                 _LOGGER.debug("CAN BLE: session key confirmed — REMOTE_CONTROL session open")
                 self._rc_session_key_future.set_result(None)
+            elif self._rc_session_key_future and not self._rc_session_key_future.done():
+                _LOGGER.warning(
+                    "CAN BLE: malformed SESSION_TRANSMIT_KEY response payload=%s (len=%d)",
+                    payload.hex(),
+                    len(payload),
+                )
+                self._rc_session_key_future.set_exception(
+                    RuntimeError(
+                        f"malformed SESSION_TRANSMIT_KEY response payload={payload.hex()} len={len(payload)}"
+                    )
+                )
 
         elif msg in (0x44, 0x45):  # Device closing the session (heartbeat close / session end)
             if len(payload) >= 3:
@@ -2600,52 +2680,68 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             _LOGGER.debug("CAN BLE: preflight call completed")
 
-            for dst in target_candidates:
-                for sid_bytes in sid_candidates:
-                    for src in source_candidates:
-                        seed_req = compose_ids_can_extended_wire_frame(
-                            message_type=0x80,
-                            source_address=src,
-                            target_address=dst,
-                            message_data=0x42,  # SESSION_REQUEST_SEED
-                            payload=sid_bytes,
-                        )
-                        self._rc_session_seed_future = loop.create_future()
-                        try:
-                            _LOGGER.debug(
-                                "CAN BLE: SESSION_REQUEST_SEED tx src=0x%02X dst=0x%02X sid=%s frame=%s",
-                                src,
-                                dst,
-                                sid_bytes.hex(),
-                                seed_req.hex(),
+            max_seed_rounds = 2 if v1_gateway else 1
+            for seed_round in range(max_seed_rounds):
+                if seed_round > 0:
+                    _LOGGER.debug(
+                        "CAN BLE: retrying explicit SESSION_REQUEST_SEED for V1 device 0x%02X (attempt %d/%d)",
+                        device_id,
+                        seed_round + 1,
+                        max_seed_rounds,
+                    )
+                    await self._advertise_can_local_host_identity(
+                        client, reason="pre-seed-retry", force=True
+                    )
+                    await asyncio.sleep(0.05)
+
+                for dst in target_candidates:
+                    for sid_bytes in sid_candidates:
+                        for src in source_candidates:
+                            seed_req = compose_ids_can_extended_wire_frame(
+                                message_type=0x80,
+                                source_address=src,
+                                target_address=dst,
+                                message_data=0x42,  # SESSION_REQUEST_SEED
+                                payload=sid_bytes,
                             )
-                            await self._write_can_frame(client, seed_req, label="SESSION_REQUEST_SEED")
-                            seed = await asyncio.wait_for(
-                                asyncio.shield(self._rc_session_seed_future), timeout=0.45
-                            )
-                            selected_source = src
-                            selected_target = dst
-                            selected_sid_bytes = sid_bytes
+                            self._rc_session_seed_future = loop.create_future()
+                            try:
+                                _LOGGER.debug(
+                                    "CAN BLE: SESSION_REQUEST_SEED tx src=0x%02X dst=0x%02X sid=%s frame=%s",
+                                    src,
+                                    dst,
+                                    sid_bytes.hex(),
+                                    seed_req.hex(),
+                                )
+                                await self._write_can_frame(client, seed_req, label="SESSION_REQUEST_SEED")
+                                seed = await asyncio.wait_for(
+                                    asyncio.shield(self._rc_session_seed_future), timeout=0.45
+                                )
+                                selected_source = src
+                                selected_target = dst
+                                selected_sid_bytes = sid_bytes
+                                break
+                            except asyncio.TimeoutError:
+                                _LOGGER.debug(
+                                    "CAN BLE: SESSION_REQUEST_SEED timeout for src=0x%02X dst=0x%02X sid=%s",
+                                    src,
+                                    dst,
+                                    sid_bytes.hex(),
+                                )
+                                continue
+                            except Exception as exc:
+                                _LOGGER.warning(
+                                    "CAN BLE: SESSION_REQUEST_SEED error for src=0x%02X dst=0x%02X sid=%s: %s",
+                                    src,
+                                    dst,
+                                    sid_bytes.hex(),
+                                    exc,
+                                )
+                                continue
+                            finally:
+                                self._rc_session_seed_future = None
+                        if selected_source is not None:
                             break
-                        except asyncio.TimeoutError:
-                            _LOGGER.debug(
-                                "CAN BLE: SESSION_REQUEST_SEED timeout for src=0x%02X dst=0x%02X sid=%s",
-                                src,
-                                dst,
-                                sid_bytes.hex(),
-                            )
-                            continue
-                        except Exception as exc:
-                            _LOGGER.warning(
-                                "CAN BLE: SESSION_REQUEST_SEED error for src=0x%02X dst=0x%02X sid=%s: %s",
-                                src,
-                                dst,
-                                sid_bytes.hex(),
-                                exc,
-                            )
-                            continue
-                        finally:
-                            self._rc_session_seed_future = None
                     if selected_source is not None:
                         break
                 if selected_source is not None:
