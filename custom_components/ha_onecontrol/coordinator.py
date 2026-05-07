@@ -2342,7 +2342,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Keep CAN-only BLE links active during idle windows.
 
         Some CAN-only gateways drop idle BLE links quickly unless periodic
-        host traffic is present. Send keepalive frames every 30 seconds to keep
+        host traffic is present. Send keepalive frames every 3 seconds to keep
         the link alive and establish baseline connectivity.
         """
         try:
@@ -2358,7 +2358,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self._advertise_can_local_host_identity(
                         client, reason="keepalive-initial", force=False
                     )
-                    await self._send_can_keepalive_status(client)
+                    await self._send_can_device_discovery(client)
                 except Exception as exc:
                     _LOGGER.warning("CAN BLE: initial keepalive failed: %s", exc)
             
@@ -2369,8 +2369,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 and self._can_read_subscribed
                 and self._client is client
             ):
-                # Longer interval (30s) to keep connection alive without excessive traffic
-                await asyncio.sleep(30.0)
+                # Shorter interval (3s) to keep connection alive with periodic discovery traffic
+                await asyncio.sleep(3.0)
                 if not (
                     self._connected
                     and self._authenticated
@@ -2392,7 +2392,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self._advertise_can_local_host_identity(
                         client, reason="keepalive", force=False
                     )
-                    await self._send_can_keepalive_status(client)
+                    await self._send_can_device_discovery(client)
                 except Exception as exc:
                     _LOGGER.warning("CAN BLE: keepalive tick failed: %s", exc)
                     # Don't break; let normal disconnect handling deal with it

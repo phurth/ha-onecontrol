@@ -615,13 +615,13 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_cover_state_{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_cover_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
     def name(self) -> str:
         base = self.coordinator.device_name(self._table_id, self._device_id)
-        return f"{base} State"
+        return f"{base}"
 
     @property
     def native_value(self) -> str | None:
