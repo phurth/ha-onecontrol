@@ -212,9 +212,10 @@ class HvacZone:
 class CoverStatus:
     """H-Bridge / cover status (event 0x0D/0x0E).
 
-    INTERNALS.md § Cover/Slide/Awning:
-      STATE-ONLY.  No commands (safety: no limit switches, 19-39A motors).
-      0xC0=stopped, 0xC2=opening, 0xC3=closing.
+        INTERNALS.md § Cover/Slide/Awning:
+            STATE-ONLY.  No commands (safety: no limit switches, 19-39A motors).
+            Legacy host events use 0xC0=stopped, 0xC2=opening, 0xC3=closing.
+            IDS-CAN DEVICE_STATUS commonly reports 0x00 for stopped/idle.
     """
 
     table_id: int = 0
@@ -225,7 +226,7 @@ class CoverStatus:
     @property
     def ha_state(self) -> str:
         """HA-compatible state string."""
-        return {0xC2: "opening", 0xC3: "closing", 0xC0: "stopped"}.get(
+        return {0xC2: "opening", 0xC3: "closing", 0xC0: "stopped", 0x00: "stopped"}.get(
             self.status, "unknown"
         )
 
