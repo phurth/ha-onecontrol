@@ -311,7 +311,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
 
         # ── PIN-based pairing (MyRVLink PIN gateways) ─────────────────
-        self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
+        # Do NOT default to "push_button": a missing method is unknown, not a
+        # push-to-pair assertion.  Real entries always store the user's choice
+        # (config flow), so this default only guards malformed/legacy entries —
+        # leave it UNKNOWN so is_pin_gateway is False without implying the method.
+        self._pairing_method: str = entry.data.get(
+            CONF_PAIRING_METHOD, "unknown"  # PairingMethod.UNKNOWN.value
+        )
         self._gateway_family: str = entry.data.get(
             CONF_GATEWAY_FAMILY, GATEWAY_FAMILY_LEGACY
         )

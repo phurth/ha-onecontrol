@@ -10,7 +10,11 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_RECONFIGURE,
+    ConfigFlow,
+    ConfigFlowResult,
+)
 from homeassistant.const import CONF_ADDRESS
 
 from .const import (
@@ -32,6 +36,12 @@ from .protocol.advertisement import PairingMethod, parse_gateway_advertisement
 
 _LOGGER = logging.getLogger(__name__)
 
+# Sentinel shown when the advertisement can't tell us the pairing method (legacy
+# gateways).  Forces the user to choose explicitly rather than letting the form
+# silently default to its first option (push-to-pair), which mislabeled PIN
+# gateways that expose a Connect button but pair with a PIN.
+_PAIRING_METHOD_UNSET = "unset"
+
 
 class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OneControl."""
@@ -46,6 +56,9 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self._pairing_method: PairingMethod = PairingMethod.UNKNOWN
         self._gateway_family: str = GATEWAY_FAMILY_LEGACY
         self._advertised_gateway_version: str | None = None
+        # Pre-fill values when reconfiguring an existing entry.
+        self._current_gateway_pin: str | None = None
+        self._current_bt_pin: str = ""
 
     def _set_discovery_info(self, discovery_info: BluetoothServiceInfoBleak) -> None:
         """Store discovery info and parse official advertisement metadata."""
@@ -150,6 +163,41 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     # ------------------------------------------------------------------
+    # Reconfigure an existing entry (change pairing method / PIN in place)
+    # ------------------------------------------------------------------
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Re-ask the pairing method and PIN for an already-configured gateway.
+
+        Lets a user correct a mislabeled gateway (e.g. a PIN gateway that was
+        onboarded as push-to-pair) without deleting and re-adding it.  Reuses the
+        pairing-method → confirm steps; the difference is the final action
+        updates and reloads the existing entry instead of creating a new one.
+        """
+        entry = self._get_reconfigure_entry()
+        self._address = entry.data[CONF_ADDRESS]
+        self._name = entry.title
+        self._gateway_family = entry.data.get(
+            CONF_GATEWAY_FAMILY, GATEWAY_FAMILY_LEGACY
+        )
+        self._advertised_gateway_version = entry.data.get(
+            CONF_ADVERTISED_GATEWAY_VERSION
+        )
+        self._current_gateway_pin = entry.data.get(CONF_GATEWAY_PIN)
+        self._current_bt_pin = entry.data.get(CONF_BLUETOOTH_PIN, "")
+        try:
+            # Pre-select the gateway's currently-stored method in the form.
+            self._pairing_method = PairingMethod(
+                entry.data.get(CONF_PAIRING_METHOD, PairingMethod.UNKNOWN.value)
+            )
+        except ValueError:
+            self._pairing_method = PairingMethod.UNKNOWN
+
+        return await self.async_step_pairing_method()
+
+    # ------------------------------------------------------------------
     # Pairing method selection
     # ------------------------------------------------------------------
 
@@ -164,22 +212,41 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         ):
             return await self.async_step_confirm()
 
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._pairing_method = PairingMethod(user_input[CONF_PAIRING_METHOD])
-            return await self.async_step_confirm()
+            chosen = user_input[CONF_PAIRING_METHOD]
+            if chosen == _PAIRING_METHOD_UNSET:
+                errors[CONF_PAIRING_METHOD] = "select_pairing_method"
+            else:
+                self._pairing_method = PairingMethod(chosen)
+                return await self.async_step_confirm()
+
+        # Pre-select a method ONLY when the advertisement told us authoritatively
+        # (modern TLV BleCapability → PIN or PUSH_BUTTON).  Legacy gateways arrive
+        # as UNKNOWN and the advertisement cannot distinguish PIN from push-to-pair,
+        # so force an explicit choice rather than letting the form default to its
+        # first option (which silently mislabeled PIN gateways as push-to-pair).
+        options: dict[str, str] = {
+            PairingMethod.PIN.value: "PIN/passkey pairing (6-digit Bluetooth PIN)",
+            PairingMethod.PUSH_BUTTON.value: "Push-to-Pair (has a physical Connect button)",
+        }
+        if self._pairing_method in (PairingMethod.PIN, PairingMethod.PUSH_BUTTON):
+            method_key: Any = vol.Required(
+                CONF_PAIRING_METHOD, default=self._pairing_method.value
+            )
+        else:
+            options = {
+                _PAIRING_METHOD_UNSET: "— Select your gateway's pairing method —",
+                **options,
+            }
+            method_key = vol.Required(
+                CONF_PAIRING_METHOD, default=_PAIRING_METHOD_UNSET
+            )
 
         return self.async_show_form(
             step_id="pairing_method",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_PAIRING_METHOD): vol.In(
-                        {
-                            PairingMethod.PUSH_BUTTON.value: "Push-to-Pair (has a physical Connect button)",
-                            PairingMethod.PIN.value: "PIN/passkey pairing (6-digit Bluetooth PIN)",
-                        }
-                    )
-                }
-            ),
+            data_schema=vol.Schema({method_key: vol.In(options)}),
+            errors=errors,
             description_placeholders={"name": self._name or "OneControl"},
         )
 
@@ -213,6 +280,19 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_BLUETOOTH_PIN] = "invalid_pin"
 
             if not errors:
+                # Reconfigure: update the changed fields on the existing entry,
+                # preserving everything else, then reload.
+                if self.source == SOURCE_RECONFIGURE:
+                    entry = self._get_reconfigure_entry()
+                    new_data = {**entry.data}
+                    new_data[CONF_GATEWAY_PIN] = pin
+                    new_data[CONF_PAIRING_METHOD] = self._pairing_method.value
+                    if bt_pin:
+                        new_data[CONF_BLUETOOTH_PIN] = bt_pin
+                    else:
+                        new_data.pop(CONF_BLUETOOTH_PIN, None)
+                    return self.async_update_reload_and_abort(entry, data=new_data)
+
                 data = {
                     CONF_ADDRESS: self._address,
                     CONF_GATEWAY_PIN: pin,
@@ -232,9 +312,11 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         # Build the form — always ask for gateway PIN; show BT PIN field
-        # only for PIN-based gateways.
+        # only for PIN-based gateways.  When reconfiguring, pre-fill the values
+        # already stored on the entry.
+        gateway_pin_default = self._current_gateway_pin or DEFAULT_GATEWAY_PIN
         fields: dict[Any, Any] = {
-            vol.Required(CONF_GATEWAY_PIN, default=DEFAULT_GATEWAY_PIN): str,
+            vol.Required(CONF_GATEWAY_PIN, default=gateway_pin_default): str,
         }
 
         # For PIN gateways, show a separate step with extra context
@@ -242,10 +324,14 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         if self._gateway_family == GATEWAY_FAMILY_X180T:
             fields = {}
             if self._pairing_method == PairingMethod.PIN:
-                fields[vol.Required(CONF_BLUETOOTH_PIN)] = str
+                fields[
+                    vol.Required(CONF_BLUETOOTH_PIN, default=self._current_bt_pin)
+                ] = str
             step_id = "confirm_x180t"
         elif self._pairing_method == PairingMethod.PIN:
-            fields[vol.Optional(CONF_BLUETOOTH_PIN, default="")] = str
+            fields[
+                vol.Optional(CONF_BLUETOOTH_PIN, default=self._current_bt_pin)
+            ] = str
             step_id = "confirm_pin"
 
         return self.async_show_form(

@@ -12,14 +12,30 @@ from custom_components.ha_onecontrol.protocol.advertisement import (
 )
 
 
-def test_legacy_pairing_info_push_button_active() -> None:
-    """Legacy first-byte PairingInfo remains supported."""
+def test_legacy_pairing_info_does_not_infer_method() -> None:
+    """Legacy first-byte PairingInfo reports button capability/state but NOT the
+    pairing method.
+
+    Bit 0 ("push-to-pair button present on the bus") is a hardware capability —
+    a PIN gateway can also expose a Connect button — so it must not be read as
+    "pairs via push-to-pair".  The legacy advertisement doesn't encode the
+    method, so it stays UNKNOWN and the config flow asks the user.
+    """
     caps = parse_manufacturer_data({LIPPERT_MANUFACTURER_ID: bytes([0x03])})
 
-    assert caps.pairing_method == PairingMethod.PUSH_BUTTON
-    assert caps.supports_push_to_pair is True
-    assert caps.pairing_enabled is True
+    assert caps.pairing_method == PairingMethod.UNKNOWN
+    assert caps.supports_push_to_pair is True  # bit 0: Connect button present
+    assert caps.pairing_enabled is True  # bit 1: button currently pressed
     assert caps.uses_modern_tlv is False
+
+
+def test_no_manufacturer_data_is_unknown() -> None:
+    """Absence of Lippert manufacturer data must not be assumed push-to-pair."""
+    caps = parse_manufacturer_data({})
+
+    assert caps.pairing_method == PairingMethod.UNKNOWN
+    assert caps.supports_push_to_pair is False
+    assert caps.pairing_enabled is False
 
 
 def test_modern_tlv_display_only_maps_to_pin() -> None:

@@ -39,11 +39,13 @@
       }
     },
     "error": {
-      "invalid_pin": "PIN must be exactly 6 digits"
+      "invalid_pin": "PIN must be exactly 6 digits",
+      "select_pairing_method": "Select whether your gateway uses Push-to-Pair or a PIN."
     },
     "abort": {
       "already_configured": "This gateway is already configured",
-      "no_devices_found": "No OneControl gateways found. Make sure Bluetooth is enabled and the gateway is powered on."
+      "no_devices_found": "No OneControl gateways found. Make sure Bluetooth is enabled and the gateway is powered on.",
+      "reconfigure_successful": "Gateway pairing settings updated."
     }
   }
 }

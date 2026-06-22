@@ -160,10 +160,14 @@ def parse_manufacturer_data(
     raw = manufacturer_data.get(LIPPERT_MANUFACTURER_ID)
 
     if raw is None or len(raw) == 0:
-        # No Lippert data → default to push-to-pair (newer gateway assumption)
+        # No Lippert manufacturer data in this advertisement.  Its absence does
+        # NOT imply a pairing method — legacy PIN gateways are among the units
+        # that advertise no parseable manufacturer payload.  Leave the method
+        # UNKNOWN so the config flow asks the user explicitly instead of silently
+        # assuming push-to-pair (which mislabeled PIN gateways).
         return GatewayCapabilities(
-            pairing_method=PairingMethod.PUSH_BUTTON,
-            supports_push_to_pair=True,
+            pairing_method=PairingMethod.UNKNOWN,
+            supports_push_to_pair=False,
             pairing_enabled=False,
         )
 
@@ -171,14 +175,20 @@ def parse_manufacturer_data(
     if tlv is not None:
         return tlv
 
+    # Legacy (non-TLV) PairingInfo first byte:
+    #   Bit 0: IsPushToPairButtonPresentOnBus — a hardware *capability*
+    #   Bit 1: PairingEnabled — button currently pressed (pairing window open)
+    # Bit 0 only reports that a Connect button exists on the bus; it does NOT
+    # mean the gateway pairs via push-to-pair.  A gateway can expose the button
+    # and still require a PIN, so the method must not be inferred from it.  The
+    # legacy advertisement does not encode the method, so leave it UNKNOWN and
+    # let the config flow ask.
     pairing_info = raw[0] & 0xFF
     has_push_button = bool(pairing_info & 0x01)
     pairing_active = bool(pairing_info & 0x02)
 
-    method = PairingMethod.PUSH_BUTTON if has_push_button else PairingMethod.PIN
-
     return GatewayCapabilities(
-        pairing_method=method,
+        pairing_method=PairingMethod.UNKNOWN,
         supports_push_to_pair=has_push_button,
         pairing_enabled=pairing_active,
     )
