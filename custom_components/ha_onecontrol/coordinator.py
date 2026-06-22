@@ -391,6 +391,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_metadata_crc: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        # Terminal teardown flag.  Set once in async_disconnect (unload / stale
+        # supersession); prevents this instance from ever reconnecting again, so
+        # an unloaded coordinator can't keep running as a "zombie" alongside its
+        # replacement on the shared adapter.
+        self._closed: bool = False
         self._reconnect_generation: int = 0
         self._consecutive_failures: int = 0
         self._last_lockout_clear: float = 0.0
@@ -1226,13 +1231,23 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_connect(self) -> None:
         """Establish BLE connection and authenticate."""
+        if self._closed:
+            return
         async with self._connect_lock:
-            if self._connected:
+            if self._closed or self._connected:
                 return
             await self._do_connect()
 
     async def async_disconnect(self) -> None:
-        """Disconnect from the gateway."""
+        """Disconnect from the gateway and permanently close this coordinator.
+
+        This is a terminal teardown — it is only called when the config entry is
+        unloaded or when a stale coordinator is superseded during setup.  Set
+        ``_closed`` first so that the ``client.disconnect()`` below (which fires
+        ``_on_disconnect``) and any in-flight connect ladder cannot re-arm a
+        reconnect on this dead instance.
+        """
+        self._closed = True
         self._stop_heartbeat()
         self._cancel_startup_bootstrap()
         self._cancel_reconnect()
@@ -1251,6 +1266,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         max_attempts = 3
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
+            if self._closed:
+                return
             try:
                 await self._try_connect(attempt)
                 return
@@ -1275,6 +1292,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await asyncio.sleep(delay)
 
         assert last_exc is not None
+
+        if self._closed:
+            return
 
         # Stale bond detection: if BlueZ reported "already bonded" at any point
         # this session but all connection attempts still failed, the bond is stale
@@ -1326,6 +1346,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not hci_adapters:
             hci_adapters = ["hci0"]
         for adapter in hci_adapters:
+            if self._closed:
+                return
             _LOGGER.info(
                 "Direct BLE connect to %s via %s", self.address, adapter,
             )
@@ -3786,8 +3808,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.async_set_updated_data(self._build_data())
 
-        # Schedule automatic reconnection with exponential backoff
-        self._schedule_reconnect()
+        # Schedule automatic reconnection with exponential backoff — unless this
+        # coordinator has been torn down (terminal close).  Without this guard the
+        # client.disconnect() inside async_disconnect would re-arm a reconnect and
+        # the unloaded instance would keep running as a zombie.
+        if not self._closed:
+            self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
         """Schedule a reconnect attempt with exponential backoff.
@@ -3797,6 +3823,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         prevents multiple concurrent reconnect coroutines from racing each other
         into BlueZ's "InProgress" error state.
         """
+        if self._closed:
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
 
@@ -3831,6 +3859,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Wait then attempt reconnection."""
         try:
             await asyncio.sleep(delay)
+            if self._closed:
+                return
             if generation != self._reconnect_generation:
                 _LOGGER.debug(
                     "Skipping stale reconnect task (gen=%d current=%d instance=%s)",

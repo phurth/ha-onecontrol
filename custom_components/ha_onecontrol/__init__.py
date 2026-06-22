@@ -162,8 +162,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator.instance_tag,
     )
 
-    # Connect in a background task so bootstrap completion isn't blocked.
-    hass.async_create_background_task(
+    # Connect in a background task so bootstrap completion isn't blocked.  Tie it
+    # to the entry (not the global loop) so Home Assistant cancels it on unload —
+    # otherwise an in-flight connect ladder could outlive the entry and keep
+    # driving the adapter after a reload.
+    entry.async_create_background_task(
+        hass,
         coordinator.async_connect(),
         "ha_onecontrol_initial_connect",
     )
