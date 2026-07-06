@@ -2,7 +2,7 @@
 
 Home Assistant HACS integration for OneControl BLE gateways (Lippert/LCI).
 
-Connects directly to OneControl BLE gateways via the HA Bluetooth stack, authenticates using the TEA protocol, and creates native HA entities for RV device monitoring and control.
+Connects directly to OneControl BLE gateways via the HA Bluetooth stack, authenticates using the TEA protocol, and creates native HA entities for RV device monitoring and control.
 > **Disclaimer:** This is an independent community integration and is not affiliated with, endorsed by, or supported by Lippert Components or any of its affiliates. Use it at your own risk.
 ## Installation
 
@@ -22,7 +22,7 @@ Copy `custom\_components/onecontrol/` to your HA `config/custom\_components/` di
 
 ## Configuration
 
-During setup, the integration discovers OneControl gateways via BLE advertisements. You will be asked to select your **gateway type** — check the physical hardware:
+During setup, the integration discovers OneControl gateways via BLE advertisements. You will be asked to select your **gateway type** — check the physical hardware:
 
 | Gateway type | How to identify |
 | - | - |
@@ -56,27 +56,32 @@ PIN-based gateways can require a BLE passkey exchange during bonding that requir
 
 ### Direct USB Bluetooth adapter (supported)
 
-The integration registers a BlueZ D-Bus agent that provides the passkey automatically during bonding. No manual steps required beyond entering the PIN in the config flow. This path is confirmed working.
+The integration registers a BlueZ D-Bus agent that provides the passkey automatically during bonding. No manual steps required beyond entering the PIN in the config flow. This path is confirmed working.
 
-**Compatible hardware:** the Raspberry Pi's built-in Bluetooth adapter, or any USB Bluetooth dongle recognized by the HA host. To extend range as much as possible, a USB adapter with an antenna is highly recommended.
+**Compatible hardware:** the Raspberry Pi's built-in Bluetooth adapter, or any USB Bluetooth dongle recognized by the HA host. To extend range as much as possible, a USB adapter with an antenna is highly recommended.
 
 ### ESPHome Bluetooth Proxy (not supported for PIN gateways)
 
-ESPHome proxies forward GATT operations but do not relay BLE passkey/pairing events back to the HA host. The passkey exchange must happen on the device with the BLE radio, which is the ESP32 — but the ESP32 has no way to receive the PIN from HA during a live pairing attempt.
+ESPHome proxies forward GATT operations but do not relay BLE passkey/pairing events back to the HA host. The passkey exchange must happen on the device with the BLE radio, which is the ESP32 — but the ESP32 has no way to receive the PIN from HA during a live pairing attempt.
 
-**Push-to-Pair gateways work normally through ESPHome proxies.** Only PIN gateways are affected.
+**Push-to-Pair gateways work normally through ESPHome proxies.** Only PIN gateways are affected.
 
 ### Experimental: pre-bond the ESP32 to the gateway
 
-It is possible to bond an ESP32 proxy device directly to the gateway before deploying it as a proxy. The bond is stored in the ESP32's NVS flash and survives OTA firmware updates (as long as flash is not erased). Once bonded, the proxy can connect to the gateway without a passkey exchange, and the integration handles application-layer authentication as normal.
+It is possible to bond an ESP32 proxy device directly to the gateway before deploying it as a proxy. The bond is stored in the ESP32's NVS flash and survives OTA firmware updates (as long as flash is not erased). Once bonded, the proxy can connect to the gateway without a passkey exchange, and the integration handles application-layer authentication as normal.
 
-This approach is experimental. If you are attempting this, use the `pairing\_test.yml` ESPHome configuration. Key requirements:
+This approach is experimental and has not yet been field-validated end to end — if you try it, please report results (success or failure) on the [issue tracker](https://github.com/phurth/ha-onecontrol/issues). If you are attempting this, use the [`docs/pairing_test.yml`](docs/pairing_test.yml) ESPHome configuration; the full step-by-step procedure is in that file's header comments. Key requirements:
 
-- Both the pairing helper firmware and the production proxy firmware must use the **Bluedroid** BLE stack (not NimBLE) — bond storage is not compatible between the two stacks
+- Both the pairing helper firmware and the production proxy firmware must use the **Bluedroid** BLE stack (not NimBLE) — bond storage is not compatible between the two stacks. Bluedroid is currently the ESPHome default, but keep the helper's `sdkconfig_options` block in the production proxy config as insurance.
 
-- Flash the pairing helper to the **exact device** that will serve as the proxy — bonds are not transferable between ESP32 units
+- Flash the pairing helper to the **exact device** that will serve as the proxy — bonds are not transferable between ESP32 units
+
+- The BLE passkey must be entered as an **integer** (a sticker PIN of "012345" is `passkey: 12345` — leading zeros are stripped; YAML would otherwise parse it as octal). The leading zero *does* still matter for the PIN entered in the integration's config flow.
 
 - OTA-flash the production proxy firmware **without erasing flash** after bonding
+
+- On HA 2026.6+, check the proxy's Bluetooth scanner mode: the "Auto" default can leave proxies passive-only when a local adapter is also present. If the gateway isn't discovered or connections fail, set the proxy's Scanning mode to **Active** in the Bluetooth integration options.
+
 ## Supported Devices
 
 - **Switches** — Relay-controlled devices (lights, water pump, water heaters, tank heater)
