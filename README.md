@@ -29,6 +29,7 @@ During setup, the integration discovers OneControl gateways via BLE advertisemen
 | **Push-to-Pair** | Has a physical "Connect" button on the RV control panel |
 | **PIN-based** | No Connect button — uses only the 6-digit PIN sticker |
 
+> **The Connect-button test isn't always definitive.** Some gateways — notably the **Unity X1.5** — ship in both variants: some units require PIN bonding, while others use a "just works" pairing that the integration handles as **Push-to-Pair**, even though the unit has only a PIN sticker and no Connect button. If you pick **PIN** and setup fails to connect (or repeatedly disconnects), **delete the entry and re-add it as Push-to-Pair** — you can leave the button step and just enter the PIN. On these gateways the PIN is still used, just at a different layer, so Push-to-Pair with your sticker PIN is the correct choice even with no physical button to press.
 
 ### Push-to-Pair gateways (newer)
 

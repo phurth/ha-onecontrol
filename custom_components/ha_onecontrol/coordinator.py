@@ -408,6 +408,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # during the PIN-auth window on reconnect (prevents session open with no CAN_READ).
         self._can_read_subscribed: bool = False
         self._can_device_types: dict[int, int] = {}  # source_address → IDS-CAN device_type
+        # NETWORK (mt=0x00) frames are broadcast by EVERY node on the IDS-CAN
+        # bus, each carrying its own protocol version and in-motion-lockout
+        # bits.  Track them per source so gateway-level state is a stable
+        # aggregate instead of whatever frame arrived last.
+        self._can_protocol_by_source: dict[int, int] = {}  # source_address → protocol version
+        self._can_lockout_by_source: dict[int, int] = {}  # source_address → lockout level
         # Commands queued while CAN BLE gateway is between connections.
         # Tuple: (frame_bytes, enqueue_monotonic, device_id)
         # device_id is needed so flush can open the REMOTE_CONTROL session first.
@@ -2169,17 +2175,46 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mt = wire.message_type
         src = wire.source_address
 
-        if mt == 0x00 and decoded is not None:  # NETWORK — synthesize gateway_info + lockout
+        if mt == 0x00 and decoded is not None:  # NETWORK — per-node status heartbeat
+            # Every node on the IDS-CAN bus broadcasts a NETWORK frame carrying
+            # its OWN protocol version and lockout bits (the frame's source is
+            # an endpoint device, not the gateway).  Overwriting gateway-level
+            # state from each frame made the Protocol Version sensor flap
+            # between every node's value many times a second.  Instead, record
+            # per source and aggregate:
+            #   * lockout  = MAX across nodes — the coach is in lockout if ANY
+            #     node reports it; matches the official app's
+            #     LogicalDeviceService.InMotionLockoutLevel (max of active
+            #     sources).
+            #   * protocol = MAX observed on the bus — a stable value; the coach
+            #     gateway is the highest-versioned node in practice (e.g. 20 vs
+            #     accessory 12/19).
+            # Only push a coordinator update when an aggregate actually changes,
+            # so unchanged heartbeats no longer churn HA state / the recorder.
             proto = int(decoded.fields.get("protocol_version", 0))
             lockout = int(decoded.fields.get("in_motion_lockout_level", 0))
-            self.system_lockout_level = lockout
+            self._can_protocol_by_source[src] = proto
+            self._can_lockout_by_source[src] = lockout
+
+            agg_proto = max(self._can_protocol_by_source.values())
+            agg_lockout = max(self._can_lockout_by_source.values())
+
+            changed = (
+                self.system_lockout_level != agg_lockout
+                or self.gateway_info is None
+                or self.gateway_info.protocol_version != agg_proto
+                or self.gateway_info.device_count != len(self._can_device_types)
+            )
+
+            self.system_lockout_level = agg_lockout
             self.gateway_info = GatewayInformation(
-                protocol_version=proto,
+                protocol_version=agg_proto,
                 table_id=0,
                 device_count=len(self._can_device_types),
             )
             self._last_event_time = time.monotonic()
-            self.async_set_updated_data(self._build_data())
+            if changed:
+                self.async_set_updated_data(self._build_data())
             return
 
         if mt == 0x02 and decoded is not None:  # DEVICE_ID
@@ -3780,6 +3815,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._has_can_write = False
         self._is_can_ble = False
         self._can_device_types = {}
+        self._can_protocol_by_source.clear()
+        self._can_lockout_by_source.clear()
         # Tear down any open REMOTE_CONTROL session — will be re-opened on next connect.
         self._can_read_subscribed = False
         self._can_local_host_claimed = False
