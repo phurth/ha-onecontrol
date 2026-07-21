@@ -76,7 +76,7 @@ body:
         ```yaml
         logger:
           logs:
-            custom_components.onecontrol: debug
+            custom_components.ha_onecontrol: debug
         ```
         Then paste the relevant log lines here.
       render: text
