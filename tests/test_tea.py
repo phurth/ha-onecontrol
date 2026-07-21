@@ -88,20 +88,20 @@ class TestStep2Key:
 
     def test_output_length(self):
         seed = b"\x01\x02\x03\x04"
-        key = calculate_step2_key(seed, "090336")
+        key = calculate_step2_key(seed, "000000")
         assert len(key) == 16
 
     def test_pin_embedded(self):
         """PIN bytes should appear at offset 4-9."""
         seed = b"\x01\x02\x03\x04"
-        pin = "090336"
+        pin = "000000"
         key = calculate_step2_key(seed, pin)
         assert key[4:10] == pin.encode("ascii")
 
     def test_zero_padding(self):
         """Bytes 10-15 should be zero."""
         seed = b"\x01\x02\x03\x04"
-        key = calculate_step2_key(seed, "090336")
+        key = calculate_step2_key(seed, "000000")
         assert key[10:16] == b"\x00\x00\x00\x00\x00\x00"
 
     def test_little_endian_encrypted_seed(self):
@@ -109,14 +109,14 @@ class TestStep2Key:
         import struct
 
         seed_bytes = b"\x78\x56\x34\x12"  # LE → seed = 0x12345678
-        key = calculate_step2_key(seed_bytes, "090336")
+        key = calculate_step2_key(seed_bytes, "000000")
         encrypted = struct.unpack("<I", key[:4])[0]
         expected = tea_encrypt(STEP2_CIPHER, 0x12345678)
         assert encrypted == expected
 
     def test_different_pins_different_keys(self):
         seed = b"\x01\x02\x03\x04"
-        k1 = calculate_step2_key(seed, "090336")
+        k1 = calculate_step2_key(seed, "000000")
         k2 = calculate_step2_key(seed, "123456")
         assert k1 != k2
         # Encrypted seed portion should be the same
