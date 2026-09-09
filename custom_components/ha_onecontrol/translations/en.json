@@ -47,5 +47,16 @@
       "no_devices_found": "No OneControl gateways found. Make sure Bluetooth is enabled and the gateway is powered on.",
       "reconfigure_successful": "Gateway pairing settings updated."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "OneControl Options",
+        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\nOnly enable this if you understand and accept that risk.",
+        "data": {
+          "enable_cover_control": "Enable awning/slide (cover) control"
+        }
+      }
+    }
   }
 }

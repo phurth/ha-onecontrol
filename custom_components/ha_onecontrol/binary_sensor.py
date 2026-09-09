@@ -21,6 +21,9 @@ from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
+
+
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -30,6 +33,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.events import GeneratorStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +60,8 @@ async def async_setup_entry(
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, GeneratorStatus):
+            if not is_valid_device_id(event.device_id):
+                return
             key = f"{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered_gen_quiet:
                 discovered_gen_quiet.add(key)

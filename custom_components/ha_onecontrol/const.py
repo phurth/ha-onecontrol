@@ -11,13 +11,11 @@ AUTH_SERVICE_UUID = f"00000010{UUID_BASE}"
 SEED_CHAR_UUID = f"00000011{UUID_BASE}"
 UNLOCK_STATUS_CHAR_UUID = f"00000012{UUID_BASE}"
 KEY_CHAR_UUID = f"00000013{UUID_BASE}"
-AUTH_STATUS_CHAR_UUID = f"00000014{UUID_BASE}"
 
 DATA_SERVICE_UUID = f"00000030{UUID_BASE}"
 DATA_WRITE_CHAR_UUID = f"00000033{UUID_BASE}"
 DATA_READ_CHAR_UUID = f"00000034{UUID_BASE}"
 
-CAN_SERVICE_UUID = f"00000000{UUID_BASE}"
 CAN_WRITE_CHAR_UUID = f"00000001{UUID_BASE}"
 CAN_READ_CHAR_UUID = f"00000002{UUID_BASE}"
 CAN_VERSION_CHAR_UUID = f"00000004{UUID_BASE}"
@@ -25,14 +23,17 @@ PASSWORD_UNLOCK_CHAR_UUID = f"00000005{UUID_BASE}"
 
 X180T_DISCOVERY_SERVICE_UUID = f"0000000f{UUID_BASE}"
 
-DISCOVERY_SERVICE_UUID = f"00000041{UUID_BASE}"
-
 # ---------------------------------------------------------------------------
 # Manufacturer / Advertisement
 # ---------------------------------------------------------------------------
 LIPPERT_MANUFACTURER_ID = 0x0499        # 1177 decimal — Lippert Components
 LIPPERT_MANUFACTURER_ID_ALT = 0x05C7   # 1479 decimal — LCI X4T2 / PIN-based gateway variant
 GATEWAY_NAME_PREFIX = "LCIRemote"      # All known gateway models advertise this name prefix
+
+# Official IDS-CAN product and device identifiers
+X180T_PRODUCT_ID = 163  # MULTIFUNCTION_UNITY_X180T_ASSEMBLY
+ONECONTROL_ANDROID_MOBILE_APP_PRODUCT_ID = 46
+ANDROID_MOBILE_DEVICE_TYPE = 22
 
 # ---------------------------------------------------------------------------
 # TEA Encryption Constants (public / standard)
@@ -51,7 +52,6 @@ DEFAULT_GATEWAY_PIN = "000000"
 # ---------------------------------------------------------------------------
 # Timing (seconds)
 # ---------------------------------------------------------------------------
-AUTH_TIMEOUT = 10.0
 UNLOCK_VERIFY_DELAY = 0.5
 NOTIFICATION_ENABLE_DELAY = 0.2
 BLE_MTU_SIZE = 185
@@ -96,18 +96,13 @@ CMD_ACTION_GENERATOR = 0x42
 CMD_ACTION_DIMMABLE = 0x43
 CMD_ACTION_RGB = 0x44
 CMD_ACTION_HVAC = 0x45
+CMD_ACTION_GENERATOR_PRIME = 0x46  # GeneratorGenie prime (fuel pump prime before start)
 
-# ---------------------------------------------------------------------------
-# HVAC mode constants (from INTERNALS.md § HVAC Command)
-# ---------------------------------------------------------------------------
 HVAC_MODE_OFF = 0
 HVAC_MODE_HEAT = 1
 HVAC_MODE_COOL = 2
 HVAC_MODE_HEAT_COOL = 3
-HVAC_MODE_SCHEDULE = 4
-
-HVAC_SOURCE_GAS = 0
-HVAC_SOURCE_HEAT_PUMP = 1
+HVAC_MODE_SCHEDULE = 4  # Programmed schedule mode
 
 HVAC_FAN_AUTO = 0
 HVAC_FAN_HIGH = 1
@@ -131,6 +126,7 @@ HVAC_CAP_GAS = 0x01
 HVAC_CAP_AC = 0x02
 HVAC_CAP_HEAT_PUMP = 0x04
 HVAC_CAP_MULTISPEED_FAN = 0x08
+HVAC_CAP_ELECTRIC_HEAT = 0x10  # Electric heat (distinct from gas)
 
 # Heat source preset names (match Android / HA climate preset_mode)
 HVAC_PRESET_GAS = "Prefer Gas"
@@ -140,9 +136,6 @@ HVAC_PRESET_NONE = "none"
 # ---------------------------------------------------------------------------
 # Cover status byte values (state-only, no commands — INTERNALS.md § Cover)
 # ---------------------------------------------------------------------------
-COVER_STOPPED = 0xC0
-COVER_OPENING = 0xC2
-COVER_CLOSING = 0xC3
 
 # ---------------------------------------------------------------------------
 # Metadata protocol constants (INTERNALS.md § Device Metadata Retrieval)
@@ -160,6 +153,7 @@ CONF_PAIRING_METHOD = "pairing_method"
 CONF_BONDED_SOURCE = "bonded_source"
 CONF_GATEWAY_FAMILY = "gateway_family"
 CONF_ADVERTISED_GATEWAY_VERSION = "advertised_gateway_version"
+CONF_ENABLE_COVER_CONTROL = "enable_cover_control"
 
 GATEWAY_FAMILY_LEGACY = "legacy"
 GATEWAY_FAMILY_X180T = "x180t_can_ble"

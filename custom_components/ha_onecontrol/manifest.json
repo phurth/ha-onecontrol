@@ -1,16 +1,6 @@
 {
   "domain": "ha_onecontrol",
   "name": "OneControl",
-  "codeowners": [
-    "@phurth"
-  ],
-  "config_flow": true,
-  "dependencies": [
-    "bluetooth_adapters"
-  ],
-  "documentation": "https://github.com/phurth/ha-onecontrol",
-  "issue_tracker": "https://github.com/phurth/ha-onecontrol/issues",
-  "integration_type": "device",
   "bluetooth": [
     {
       "manufacturer_id": 1177
@@ -25,10 +15,20 @@
       "local_name": "LCIRemote*"
     }
   ],
+  "codeowners": [
+    "@phurth"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "bluetooth_adapters"
+  ],
+  "documentation": "https://github.com/phurth/ha-onecontrol",
+  "integration_type": "device",
   "iot_class": "local_push",
+  "issue_tracker": "https://github.com/phurth/ha-onecontrol/issues",
   "requirements": [
     "bleak>=0.21.0",
     "bleak-retry-connector>=3.1.0"
   ],
-  "version": "1.0.43"
+  "version": "1.0.44"
 }

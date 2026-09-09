@@ -225,10 +225,17 @@ class CoverStatus:
 
     @property
     def ha_state(self) -> str:
-        """HA-compatible state string."""
-        return {0xC2: "opening", 0xC3: "closing", 0xC0: "stopped", 0x00: "stopped"}.get(
-            self.status, "unknown"
-        )
+        """Motor state string.
+
+        Returns the motor/controller state, NOT the cover position:
+          - ``"opening"``  — motor is extending
+          - ``"closing"``  — motor is retracting
+          - ``"stopped"``  — motor is idle (0x00 IDS-CAN, 0xC0 legacy host)
+
+        HA cover open/closed state is derived from ``position`` (when available),
+        not from this property.  See ``is_closed`` in ``cover.py``.
+        """
+        return {0xC2: "opening", 0xC3: "closing"}.get(self.status, "stopped")
 
 
 @dataclass
@@ -427,6 +434,7 @@ def parse_tank_status(data: bytes) -> list[TankLevel]:
     INTERNALS.md § Tank Sensors:
       Format: [0x0C][tableId][deviceId1][level1][deviceId2][level2]...
       Each tank = 2 bytes. Number of tanks = (len - 2) / 2.
+      Raw gauge values: 0 = 0% (empty), 255 = 100% (full) → converted to 0-100%
     """
     if len(data) < 4:
         return []
@@ -434,18 +442,26 @@ def parse_tank_status(data: bytes) -> list[TankLevel]:
     tanks: list[TankLevel] = []
     idx = 2
     while idx + 1 < len(data):
+        raw_level = data[idx + 1]
+        level_pct = max(0, min(100, int(raw_level * 100 / 255)))
+        _LOGGER.debug("Tank %02x:%02x raw_level=%d -> level_pct=%d", table_id, data[idx], raw_level, level_pct)
         tanks.append(
-            TankLevel(table_id=table_id, device_id=data[idx], level=data[idx + 1])
+            TankLevel(table_id=table_id, device_id=data[idx], level=level_pct)
         )
         idx += 2
     return tanks
 
 
 def parse_tank_status_v2(data: bytes) -> TankLevel | None:
-    """Parse TankSensorStatusV2 (0x1B) — single tank per event."""
+    """Parse TankSensorStatusV2 (0x1B) — single tank per event.
+    
+    Raw gauge values: 0 = 0% (empty), 255 = 100% (full) → converted to 0-100%
+    """
     if len(data) < 4:
         return None
-    return TankLevel(table_id=data[1], device_id=data[2], level=data[3])
+    raw_level = data[3]
+    level_pct = max(0, min(100, int(raw_level * 100 / 255)))
+    return TankLevel(table_id=data[1], device_id=data[2], level=level_pct)
 
 
 def parse_dimmable_light(data: bytes) -> DimmableLight | None:

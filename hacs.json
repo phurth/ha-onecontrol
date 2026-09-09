@@ -1,8 +1,5 @@
 {
   "name": "OneControl",
   "render_readme": true,
-  "homeassistant": "2024.1.0",
-  "domains": [
-    "ha_onecontrol"
-  ]
+  "homeassistant": "2024.1.0"
 }

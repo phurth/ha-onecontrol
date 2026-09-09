@@ -42,9 +42,13 @@ from .const import (
     HVAC_SETPOINT_DEBOUNCE_S,
 )
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.events import HvacZone
 
 _LOGGER = logging.getLogger(__name__)
+
+
+
 
 # Map OneControl heat_mode → HA HVACMode
 _OC_TO_HA_MODE = {
@@ -52,6 +56,7 @@ _OC_TO_HA_MODE = {
     1: HVACMode.HEAT,
     2: HVACMode.COOL,
     3: HVACMode.HEAT_COOL,
+    4: HVACMode.AUTO,  # Schedule mode (APK parity)
 }
 
 # Reverse
@@ -78,6 +83,8 @@ async def async_setup_entry(
         items = event if isinstance(event, list) else [event]
         for item in items:
             if isinstance(item, HvacZone):
+                if not is_valid_device_id(item.device_id):
+                    continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered:
                     discovered.add(key)
@@ -100,7 +107,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
 
     _attr_has_entity_name = True
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL, HVACMode.AUTO]
     _attr_fan_modes = ["auto", "high", "low"]
     _attr_min_temp = 40
     _attr_max_temp = 95

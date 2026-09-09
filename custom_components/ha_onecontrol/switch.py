@@ -22,10 +22,14 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, SWITCH_STATE_GUARD_S
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.events import GeneratorStatus, RelayStatus
 
 _LOGGER = logging.getLogger(__name__)
+
+
+
 
 
 async def async_setup_entry(
@@ -43,6 +47,8 @@ async def async_setup_entry(
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, RelayStatus):
+            if not is_valid_device_id(event.device_id):
+                return
             key = f"{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered:
                 discovered.add(key)
@@ -50,6 +56,8 @@ async def async_setup_entry(
                     [OneControlSwitch(coordinator, address, event.table_id, event.device_id)]
                 )
         elif isinstance(event, GeneratorStatus):
+            if not is_valid_device_id(event.device_id):
+                return
             key = f"{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered_generators:
                 discovered_generators.add(key)

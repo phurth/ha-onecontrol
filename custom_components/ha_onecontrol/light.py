@@ -29,10 +29,14 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.commands import CommandBuilder
 from .protocol.events import DimmableLight, RgbLight
 
 _LOGGER = logging.getLogger(__name__)
+
+
+
 
 
 async def async_setup_entry(
@@ -49,6 +53,8 @@ async def async_setup_entry(
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, DimmableLight):
+            if not is_valid_device_id(event.device_id):
+                return
             key = f"dim_{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered:
                 discovered.add(key)
@@ -56,6 +62,8 @@ async def async_setup_entry(
                     [OneControlDimmableLight(coordinator, address, event.table_id, event.device_id)]
                 )
         elif isinstance(event, RgbLight):
+            if not is_valid_device_id(event.device_id):
+                return
             key = f"rgb_{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered:
                 discovered.add(key)

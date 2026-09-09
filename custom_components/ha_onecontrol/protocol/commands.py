@@ -7,7 +7,7 @@ sequence number (LE order) for correlating ack events (0x02).
 Wire format for all commands:
   [CmdId_LSB][CmdId_MSB][CommandType][...payload...]
 
-Reference: INTERNALS.md § Command Building, MyRvLinkCommandBuilder.kt
+Reference: INTERNALS.md § Command Building
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ class CommandBuilder:
     CMD_ACTION_DIMMABLE = 0x43
     CMD_ACTION_RGB = 0x44
     CMD_ACTION_HVAC = 0x45
+    CMD_ACTION_GENERATOR_PRIME = 0x46
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -173,6 +174,64 @@ class CommandBuilder:
         )
 
     # ------------------------------------------------------------------
+    # H-Bridge / Cover (0x41) — open/close/stop (motor control)
+    # ------------------------------------------------------------------
+
+    # H-Bridge direction constants
+    HBRIDGE_STOP = 0x00
+    HBRIDGE_OPEN = 0x01  # Extend motor (awning out, slide out)
+    HBRIDGE_CLOSE = 0x02  # Retract motor (awning in, slide in)
+
+    # H-Bridge command bytes. The high bit marks a valid H-bridge command;
+    # the low nibble carries the direction.
+    HBRIDGE_STOP_CMD = 0x80
+    HBRIDGE_OPEN_CMD = 0x81
+    HBRIDGE_CLOSE_CMD = 0x82
+
+    # Mapping from direction constants to command bytes.
+    _HBRIDGE_DIRECTION_MAP: dict[int, int] = {
+        HBRIDGE_STOP: HBRIDGE_STOP_CMD,
+        HBRIDGE_OPEN: HBRIDGE_OPEN_CMD,
+        HBRIDGE_CLOSE: HBRIDGE_CLOSE_CMD,
+    }
+
+    def _hbridge_command_byte(self, direction: int) -> int:
+        """Map a logical direction to the raw H-Bridge command byte.
+
+        Accepts both the logical direction constants (0x00-0x06) and
+        the raw command bytes (0x80-0x86) for pass-through.
+        """
+        raw = direction & 0xFF
+        # If it already looks like a command byte (high bit set), use as-is.
+        if raw & 0x80:
+            return raw
+        # Otherwise map from the logical direction table.
+        return self._HBRIDGE_DIRECTION_MAP.get(raw, self.HBRIDGE_STOP_CMD)
+
+    def build_action_hbridge(
+        self, device_table_id: int, device_id: int, direction: int
+    ) -> bytes:
+        """Build an ActionHBridge command (6 bytes).
+
+        ``direction`` — one of the logical HBRIDGE_* constants:
+            0x00=Stop, 0x01=Open/Extend, 0x02=Close/Retract,
+            0x03=ClearLatch, 0x04=HomeReset, 0x05=AutoOpen, 0x06=AutoClose.
+            Also accepts raw command bytes (0x80-0x86) for pass-through.
+
+        Controls H-Bridge motors for covers (awnings, slides).
+        """
+        cid = self._next_id()
+        return (
+            self._id_bytes(cid)
+            + bytes([
+                self.CMD_ACTION_HBRIDGE,
+                device_table_id & 0xFF,
+                device_id & 0xFF,
+                self._hbridge_command_byte(direction),
+            ])
+        )
+
+    # ------------------------------------------------------------------
     # Generator Genie (0x42) — start/stop
     # ------------------------------------------------------------------
 
@@ -221,8 +280,6 @@ class CommandBuilder:
         transition_interval: int = 1000,
     ) -> bytes:
         """Build an ActionRgb command (variable length by mode).
-
-        Reference: Android RgbCommandBuilder.kt
 
         Modes:
           0x00 (Off), 0x7F (Restore) → 6 bytes (header only)
@@ -293,8 +350,6 @@ class CommandBuilder:
         cycle_time2: int = 1055,
     ) -> bytes:
         """Build an ActionDimmable effect command (12 bytes).
-
-        Reference: Android DimmableCommandBuilder.kt (effect path)
 
         ``mode`` — 2=Blink, 3=Swell
         ``duration`` — 0 = infinite, else minutes

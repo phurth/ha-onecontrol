@@ -1,7 +1,7 @@
 """IDS-CAN wire-frame parsing helpers.
 
 These helpers decode the raw CAN adapter frame format seen on IDS-CAN TCP
-bridges (per decompiled ``CanAdapter.OnPhysicalNetworkReceived``).
+bridges.
 
 Frame layout:
 - Byte 0: payload length (DLC, 0..8)
@@ -58,12 +58,12 @@ class IdsCanDecodedPayload:
 
 
 def ids_can_message_type_name(message_type: int) -> str:
-    """Return IDS-CAN message type name from decompiled enum values."""
+    """Return IDS-CAN message type name."""
     return _IDS_CAN_MESSAGE_TYPE_NAMES.get(message_type & 0xFF, "UNKNOWN")
 
 
 def ids_can_request_name(request_code: int) -> str:
-    """Return IDS-CAN REQUEST code name from decompiled REQUEST constants."""
+    """Return IDS-CAN REQUEST code name."""
     return {
         0x00: "PART_NUMBER_READ",
         0x01: "MUTE_DEVICE",
@@ -99,7 +99,7 @@ def ids_can_request_name(request_code: int) -> str:
 
 
 def ids_can_response_name(response_code: int) -> str:
-    """Return IDS-CAN RESPONSE enum name from decompiled RESPONSE values."""
+    """Return IDS-CAN RESPONSE enum name."""
     return {
         0x00: "SUCCESS",
         0x01: "REQUEST_NOT_SUPPORTED",
@@ -128,12 +128,12 @@ def ids_can_response_name(response_code: int) -> str:
 
 
 def decode_ids_can_payload(wire: IdsCanWireFrame) -> IdsCanDecodedPayload | None:
-    """Decode known IDS-CAN message payload formats with decompiled parity."""
+    """Decode known IDS-CAN message payload formats."""
     message_type = wire.message_type & 0xFF
     payload = wire.payload
 
     if message_type == 0x00 and len(payload) == 8:
-        # C# parity: MAC is bytes [2:8], protocol version is byte [1], and
+        # NETWORK frame layout: MAC is bytes [2:8], protocol version is byte [1], and
         # NETWORK_STATUS bitfields are interpreted from byte [0].
         status = payload[0] & 0xFF
         return IdsCanDecodedPayload(
@@ -335,7 +335,7 @@ def compose_ids_can_extended_wire_frame(
     dst = target_address & 0xFF
     mdata = message_data & 0xFF
 
-    # 29-bit CAN id packing (decompiled parity):
+    # 29-bit CAN id packing:
     #   message_type = 0x80 | ((can_id >> 24) & 0x1C) | ((can_id >> 16) & 0x03)
     # Inverse of parse_ids_can_wire_frame for extended IDs:
     # parse does: message_type = 0x80 | ((can_id >> 24) & 0x1C) | ((can_id >> 16) & 0x03)

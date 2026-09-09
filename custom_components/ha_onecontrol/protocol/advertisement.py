@@ -6,9 +6,12 @@ Detects gateway capabilities from Lippert manufacturer-specific data.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 
 from ..const import LIPPERT_MANUFACTURER_ID, X180T_DISCOVERY_SERVICE_UUID
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class PairingMethod(enum.Enum):
@@ -209,24 +212,15 @@ def parse_gateway_advertisement(
     }
     is_x180t = _normalise_uuid(X180T_DISCOVERY_SERVICE_UUID) in advertised_services
 
+    _LOGGER.debug(
+        "Gateway advertisement: manufacturer_data=%s, service_uuids=%s, is_x180t=%s, capabilities=%s",
+        manufacturer_data, service_uuids, is_x180t, capabilities,
+    )
+
     if not is_x180t:
         return capabilities
 
-    if not capabilities.uses_modern_tlv:
-        return GatewayCapabilities(
-            pairing_method=PairingMethod.UNKNOWN,
-            supports_push_to_pair=capabilities.supports_push_to_pair,
-            pairing_enabled=False,
-            is_x180t=True,
-        )
-
-    return GatewayCapabilities(
-        pairing_method=capabilities.pairing_method,
-        supports_push_to_pair=capabilities.supports_push_to_pair,
-        pairing_enabled=capabilities.pairing_enabled,
-        is_x180t=True,
-        ble_capability=capabilities.ble_capability,
-        can_gateway_protocol_version=capabilities.can_gateway_protocol_version,
-        advertised_gateway_version=capabilities.advertised_gateway_version,
-        uses_modern_tlv=capabilities.uses_modern_tlv,
-    )
+    # Mark the gateway family without overriding the pairing method.  A legacy
+    # (non-TLV) advertisement does not encode the method, so it stays UNKNOWN
+    # and the config flow asks the user explicitly.
+    return replace(capabilities, is_x180t=True)
