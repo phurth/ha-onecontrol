@@ -645,7 +645,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise BleakError("Not connected to gateway")
         encoded = cobs_encode(raw_command)
         # Also log at INFO so outgoing command bytes are visible with default logging.
-        _LOGGER.info("TX command (%d bytes raw): %s", len(raw_command), raw_command.hex())
+        _LOGGER.debug("TX command (%d bytes raw): %s", len(raw_command), raw_command.hex())
         _LOGGER.debug("TX command (COBS encoded %d bytes): %s", len(encoded), encoded.hex())
         await self._client.write_gatt_char(DATA_WRITE_CHAR_UUID, encoded, response=False)
 
@@ -4030,7 +4030,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for byte_val in data:
             frame = self._decoder.decode_byte(byte_val)
             if frame is not None:
-                _LOGGER.warning("DATA_READ frame received: %s", frame.hex())
+                _LOGGER.debug("DATA_READ frame received: %s", frame.hex())
                 self._process_frame(frame)
 
     def _process_frame(self, frame: bytes) -> None:
@@ -4263,7 +4263,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             item.level,
                         )
             elif isinstance(event, TankLevel):
-                _LOGGER.info(
+                _LOGGER.debug(
                     "Received single tank event: table=%d device=0x%02x level=%d%%",
                     event.table_id,
                     event.device_id,
@@ -4418,7 +4418,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 key = _device_key(event.table_id, event.device_id)
                 self.tanks[key] = event
-                _LOGGER.info("Stored single tank %s: level=%d%%", key, event.level)
+                _LOGGER.debug("Stored single tank %s: level=%d%%", key, event.level)
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HvacZone):
