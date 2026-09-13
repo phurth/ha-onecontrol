@@ -102,12 +102,17 @@ Models community members have reported working, and how they pair:
 
 | Gateway | Pairing | Notes |
 | - | - | - |
+| **Unity X270D** | Push-to-Pair, no PIN required | The hardware this integration was developed against |
 | **Unity X270L** (27478-N) | Push-to-Pair + sticker PIN | Connect button is on-screen on the touchscreen panel ([#11](https://github.com/phurth/ha-onecontrol/issues/11)) |
 | **Unity X180T** | Push-to-Pair | IDS-CAN over BLE ([#8](https://github.com/phurth/ha-onecontrol/issues/8)) |
 | **Unity X1.5** | Either — ships in both variants | If PIN setup fails, re-add as Push-to-Pair ([#9](https://github.com/phurth/ha-onecontrol/issues/9)) |
 
 This list is not exhaustive — other OneControl gateways are expected to work. If yours does,
 opening an issue to say so helps fill this table in.
+
+Note that close siblings can still differ: the X270D completes Push-to-Pair without a PIN at
+all, while the X270L asks for the sticker PIN after the Connect press. If the flow asks for a
+PIN, enter it; if it does not, nothing is wrong.
 
 ### What will not appear
 
