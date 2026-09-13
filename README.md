@@ -22,12 +22,12 @@ Copy `custom\_components/onecontrol/` to your HA `config/custom\_components/` di
 
 ## Configuration
 
-During setup, the integration discovers OneControl gateways via BLE advertisements. You will be asked to select your **gateway type** — check the physical hardware:
+During setup, the integration discovers OneControl gateways via BLE advertisements. You will be asked to select your **gateway type** — check your RV's control panel:
 
 | Gateway type | How to identify |
 | - | - |
-| **Push-to-Pair** | Has a physical "Connect" button on the RV control panel |
-| **PIN-based** | No Connect button — uses only the 6-digit PIN sticker |
+| **Push-to-Pair** | Has a "Connect" control on the RV panel — a physical button on some models, an on-screen button on touchscreen panels such as the Unity X270L |
+| **PIN-based** | No Connect control — uses only the 6-digit PIN sticker |
 
 > **The Connect-button test isn't always definitive.** Some gateways — notably the **Unity X1.5** — ship in both variants: some units require PIN bonding, while others use a "just works" pairing that the integration handles as **Push-to-Pair**, even though the unit has only a PIN sticker and no Connect button. If you pick **PIN** and setup fails to connect (or repeatedly disconnects), **delete the entry and re-add it as Push-to-Pair** — you can leave the button step and just enter the PIN. On these gateways the PIN is still used, just at a different layer, so Push-to-Pair with your sticker PIN is the correct choice even with no physical button to press.
 
@@ -35,11 +35,19 @@ During setup, the integration discovers OneControl gateways via BLE advertisemen
 
 1. Select **Push-to-Pair** when prompted
 
-2. Press the physical Connect button on your RV control panel
+2. Press the Connect control on your RV panel **while the config flow is waiting on that
+   step** — physical button on some models, on-screen button on touchscreen panels
 
 3. Enter the 6-digit PIN from the gateway sticker
 
 4. Works with both ESPHome Bluetooth Proxy and direct USB adapters
+
+> **The order matters.** If you enter the PIN without having pressed Connect while the flow
+> was waiting, setup appears to succeed — every entity is created — but they all sit
+> **unavailable**, because the gateway never authenticated the session. That symptom (a full
+> set of entities, none of them reporting) means the pairing step was missed, not that the
+> integration failed to find your devices. Delete the config entry and re-add it, timing a
+> fresh Connect press to the prompt.
 
 ### PIN-based gateways
 
@@ -58,6 +66,11 @@ PIN-based gateways can require a BLE passkey exchange during bonding that requir
 ### Direct USB Bluetooth adapter (supported)
 
 The integration registers a BlueZ D-Bus agent that provides the passkey automatically during bonding. No manual steps required beyond entering the PIN in the config flow. This path is confirmed working.
+
+What matters is reaching the host's BlueZ stack over D-Bus, not running on bare metal. A
+containerised Home Assistant works provided the host's D-Bus socket is proxied in — a Core
+install in an Incus/LXC container on Ubuntu, using the host's built-in Intel AX211 adapter
+through a D-Bus socket proxy, is confirmed working with no USB dongle and no Bluetooth proxy.
 
 **Compatible hardware:** the Raspberry Pi's built-in Bluetooth adapter, or any USB Bluetooth dongle recognized by the HA host. To extend range as much as possible, a USB adapter with an antenna is highly recommended.
 
@@ -82,6 +95,27 @@ This approach is experimental and has not yet been field-validated end to end �
 - OTA-flash the production proxy firmware **without erasing flash** after bonding
 
 - On HA 2026.6+, check the proxy's Bluetooth scanner mode: the "Auto" default can leave proxies passive-only when a local adapter is also present. If the gateway isn't discovered or connections fail, set the proxy's Scanning mode to **Active** in the Bluetooth integration options.
+
+## Confirmed gateways
+
+Models community members have reported working, and how they pair:
+
+| Gateway | Pairing | Notes |
+| - | - | - |
+| **Unity X270L** (27478-N) | Push-to-Pair + sticker PIN | Connect button is on-screen on the touchscreen panel ([#11](https://github.com/phurth/ha-onecontrol/issues/11)) |
+| **Unity X180T** | Push-to-Pair | IDS-CAN over BLE ([#8](https://github.com/phurth/ha-onecontrol/issues/8)) |
+| **Unity X1.5** | Either — ships in both variants | If PIN setup fails, re-add as Push-to-Pair ([#9](https://github.com/phurth/ha-onecontrol/issues/9)) |
+
+This list is not exhaustive — other OneControl gateways are expected to work. If yours does,
+opening an issue to say so helps fill this table in.
+
+### What will not appear
+
+Only equipment on the Lippert bus is visible to the gateway, so anything the OneControl panel
+and the official app cannot control will not show up in Home Assistant either. Third-party
+appliances are the usual case — Coleman-Mach thermostats, for example, are wired independently
+and produce no climate entities. If a device is missing here but also absent from the Lippert
+panel, that is the hardware layout rather than an integration fault.
 
 ## Supported Devices
 
