@@ -48,7 +48,11 @@ _PAIRING_METHOD_UNSET = "unset"
 class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OneControl."""
 
-    VERSION = 2
+    # Must match the highest version async_migrate_entry produces.  Home
+    # Assistant refuses to load an entry whose stored version is ahead of this
+    # number, so a migration ladder that outruns it strands upgraded installs
+    # on their second restart.
+    VERSION = 4
 
     def __init__(self) -> None:
         """Initialise flow state."""
