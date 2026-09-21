@@ -431,10 +431,11 @@ def parse_device_lock(data: bytes) -> SystemLockout | DeviceLock | None:
 def parse_tank_status(data: bytes) -> list[TankLevel]:
     """Parse TankSensorStatus (0x0C) — multi-tank batched format.
 
-    INTERNALS.md § Tank Sensors:
-      Format: [0x0C][tableId][deviceId1][level1][deviceId2][level2]...
-      Each tank = 2 bytes. Number of tanks = (len - 2) / 2.
-      Raw gauge values: 0 = 0% (empty), 255 = 100% (full) → converted to 0-100%
+    Format: [0x0C][tableId][deviceId1][level1][deviceId2][level2]...
+    Each tank = 2 bytes. Number of tanks = (len - 2) / 2.
+
+    Each level byte is already a fill percentage (0-100), not a 0-255 gauge
+    reading, so it is passed through and only clamped to the valid range.
     """
     if len(data) < 4:
         return []
@@ -442,9 +443,8 @@ def parse_tank_status(data: bytes) -> list[TankLevel]:
     tanks: list[TankLevel] = []
     idx = 2
     while idx + 1 < len(data):
-        raw_level = data[idx + 1]
-        level_pct = max(0, min(100, int(raw_level * 100 / 255)))
-        _LOGGER.debug("Tank %02x:%02x raw_level=%d -> level_pct=%d", table_id, data[idx], raw_level, level_pct)
+        level_pct = min(100, data[idx + 1])
+        _LOGGER.debug("Tank %02x:%02x level=%d%%", table_id, data[idx], level_pct)
         tanks.append(
             TankLevel(table_id=table_id, device_id=data[idx], level=level_pct)
         )
@@ -454,13 +454,15 @@ def parse_tank_status(data: bytes) -> list[TankLevel]:
 
 def parse_tank_status_v2(data: bytes) -> TankLevel | None:
     """Parse TankSensorStatusV2 (0x1B) — single tank per event.
-    
-    Raw gauge values: 0 = 0% (empty), 255 = 100% (full) → converted to 0-100%
+
+    Format: [0x1B][tableId][deviceId][status...], where the status block is
+    either 1 or 8 bytes.  Its first byte carries the fill percentage (0-100)
+    in bits 0-6; bit 7 is a status flag and is masked off.
     """
     if len(data) < 4:
         return None
-    raw_level = data[3]
-    level_pct = max(0, min(100, int(raw_level * 100 / 255)))
+    level_pct = min(100, data[3] & 0x7F)
+    _LOGGER.debug("Tank v2 %02x:%02x level=%d%%", data[1], data[2], level_pct)
     return TankLevel(table_id=data[1], device_id=data[2], level=level_pct)
 
 
