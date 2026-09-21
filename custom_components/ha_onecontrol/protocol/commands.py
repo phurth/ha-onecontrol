@@ -177,16 +177,25 @@ class CommandBuilder:
     # H-Bridge / Cover (0x41) — open/close/stop (motor control)
     # ------------------------------------------------------------------
 
-    # H-Bridge direction constants
+    # H-Bridge direction constants — the integration's own logical values,
+    # used by the cover platform and coordinator.
     HBRIDGE_STOP = 0x00
     HBRIDGE_OPEN = 0x01  # Extend motor (awning out, slide out)
     HBRIDGE_CLOSE = 0x02  # Retract motor (awning in, slide in)
 
-    # H-Bridge command bytes. The high bit marks a valid H-bridge command;
-    # the low nibble carries the direction.
-    HBRIDGE_STOP_CMD = 0x80
-    HBRIDGE_OPEN_CMD = 0x81
-    HBRIDGE_CLOSE_CMD = 0x82
+    # Wire-level movement codes, carried in the low nibble of the command byte.
+    # These deliberately do NOT match the logical directions above: code 0x01 is
+    # a reserved slot that gateways reject with failure code 14 (invalid
+    # command), so forward and reverse each sit one value higher.
+    _MOVEMENT_STOP = 0x00
+    _MOVEMENT_FORWARD = 0x02
+    _MOVEMENT_REVERSE = 0x03
+
+    # Bit 7 marks the movement command valid; the low nibble carries the code.
+    HBRIDGE_VALID_BIT = 0x80
+    HBRIDGE_STOP_CMD = HBRIDGE_VALID_BIT | _MOVEMENT_STOP  # 0x80
+    HBRIDGE_OPEN_CMD = HBRIDGE_VALID_BIT | _MOVEMENT_FORWARD  # 0x82
+    HBRIDGE_CLOSE_CMD = HBRIDGE_VALID_BIT | _MOVEMENT_REVERSE  # 0x83
 
     # Mapping from direction constants to command bytes.
     _HBRIDGE_DIRECTION_MAP: dict[int, int] = {
@@ -198,8 +207,9 @@ class CommandBuilder:
     def _hbridge_command_byte(self, direction: int) -> int:
         """Map a logical direction to the raw H-Bridge command byte.
 
-        Accepts both the logical direction constants (0x00-0x06) and
-        the raw command bytes (0x80-0x86) for pass-through.
+        Accepts the logical HBRIDGE_* direction constants, and passes through
+        any byte that already has the valid bit set.  Unknown directions fall
+        back to stop rather than guessing a movement.
         """
         raw = direction & 0xFF
         # If it already looks like a command byte (high bit set), use as-is.
@@ -214,9 +224,8 @@ class CommandBuilder:
         """Build an ActionHBridge command (6 bytes).
 
         ``direction`` — one of the logical HBRIDGE_* constants:
-            0x00=Stop, 0x01=Open/Extend, 0x02=Close/Retract,
-            0x03=ClearLatch, 0x04=HomeReset, 0x05=AutoOpen, 0x06=AutoClose.
-            Also accepts raw command bytes (0x80-0x86) for pass-through.
+            0x00=Stop, 0x01=Open/Extend, 0x02=Close/Retract.
+            Raw command bytes (valid bit set) pass through unchanged.
 
         Controls H-Bridge motors for covers (awnings, slides).
         """
