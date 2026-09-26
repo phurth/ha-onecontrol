@@ -52,9 +52,10 @@
     "step": {
       "init": {
         "title": "OneControl Options",
-        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\nOnly enable this if you understand and accept that risk.",
+        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\nThe safety stop is a failsafe that force-stops a cover after it has been moving this long without an explicit stop, in case a stop command is dropped. Only enable cover control if you understand and accept the risk.",
         "data": {
-          "enable_cover_control": "Enable awning/slide (cover) control"
+          "enable_cover_control": "Enable awning/slide (cover) control",
+          "cover_safety_timeout": "Cover safety stop (seconds)"
         }
       }
     }

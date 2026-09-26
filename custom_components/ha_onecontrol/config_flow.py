@@ -23,8 +23,10 @@ from .const import (
     CONF_BLUETOOTH_PIN,
     CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
+    CONF_COVER_SAFETY_TIMEOUT,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
+    DEFAULT_COVER_SAFETY_TIMEOUT,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
     GATEWAY_FAMILY_LEGACY,
@@ -375,23 +377,34 @@ class OneControlOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
+        current = self.config_entry.options
+
+        def _schema() -> vol.Schema:
+            return vol.Schema(
+                {
+                    vol.Required(
+                        CONF_ENABLE_COVER_CONTROL,
+                        default=current.get(CONF_ENABLE_COVER_CONTROL, False),
+                    ): bool,
+                    vol.Required(
+                        CONF_COVER_SAFETY_TIMEOUT,
+                        default=current.get(
+                            CONF_COVER_SAFETY_TIMEOUT,
+                            DEFAULT_COVER_SAFETY_TIMEOUT,
+                        ),
+                    ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=60.0)),
+                }
+            )
+
         if user_input is not None:
             return self.async_create_entry(
                 data={
                     CONF_ENABLE_COVER_CONTROL: user_input[CONF_ENABLE_COVER_CONTROL],
+                    CONF_COVER_SAFETY_TIMEOUT: user_input[CONF_COVER_SAFETY_TIMEOUT],
                 }
             )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_ENABLE_COVER_CONTROL,
-                        default=self.config_entry.options.get(
-                            CONF_ENABLE_COVER_CONTROL, False
-                        ),
-                    ): bool,
-                }
-            ),
+            data_schema=_schema(),
         )

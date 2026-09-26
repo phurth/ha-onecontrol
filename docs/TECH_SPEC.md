@@ -312,11 +312,12 @@ the 0x44 heartbeat path is what has been observed holding the session open here.
 
 Repeating open/close commands would run the motor indefinitely if a STOP frame
 is ever dropped (BLE drop, stuck button, session loss). Each cover repeater
-records a start timestamp and force-sends a STOP once
-`_COVER_SAFETY_TIMEOUT_S` (6.0 s) has elapsed without an explicit STOP, logging
+records a start timestamp and force-sends a STOP once the cover safety timeout
+(6.0 s by default) has elapsed without an explicit STOP, logging
 `CAN BLE: cover safety timeout … — sending STOP` (WARNING). Added
-(2026-09-03) after a runaway awning event. Change only `_COVER_SAFETY_TIMEOUT_S`
-to alter the limit.
+(2026-09-03) after a runaway awning event. The timeout is a per-entry option
+(`cover_safety_timeout`, seconds) tunable from the integration's options flow;
+the default lives at `DEFAULT_COVER_SAFETY_TIMEOUT` in `const.py`.
 
 ## 11. Evolution Notes (Commit History)
 

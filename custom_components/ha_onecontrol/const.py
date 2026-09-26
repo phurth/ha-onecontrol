@@ -154,6 +154,12 @@ CONF_BONDED_SOURCE = "bonded_source"
 CONF_GATEWAY_FAMILY = "gateway_family"
 CONF_ADVERTISED_GATEWAY_VERSION = "advertised_gateway_version"
 CONF_ENABLE_COVER_CONTROL = "enable_cover_control"
+CONF_COVER_SAFETY_TIMEOUT = "cover_safety_timeout"
+
+# Default cover safety timeout (seconds) — how long an OPEN/CLOSE cover command
+# is allowed to repeat before the repeater force-sends a STOP.  Tune via the
+# integration options flow.
+DEFAULT_COVER_SAFETY_TIMEOUT = 6.0
 
 GATEWAY_FAMILY_LEGACY = "legacy"
 GATEWAY_FAMILY_X180T = "x180t_can_ble"

@@ -54,12 +54,14 @@ from .const import (
     CONF_BLUETOOTH_PIN,
     PASSWORD_UNLOCK_CHAR_UUID,
     CONF_BONDED_SOURCE,
+    CONF_COVER_SAFETY_TIMEOUT,
     CONF_GATEWAY_FAMILY,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
     DATA_READ_CHAR_UUID,
     DATA_SERVICE_UUID,
     DATA_WRITE_CHAR_UUID,
+    DEFAULT_COVER_SAFETY_TIMEOUT,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
     GATEWAY_FAMILY_LEGACY,
@@ -201,11 +203,8 @@ _CAN_COMMAND_VERIFY_POLL_S = 0.05
 # How often to resend an OPEN/CLOSE cover COMMAND so the motor keeps running
 # (device expects repeated COMMANDs while the button is conceptually held).
 _COVER_COMMAND_REPEAT_S = 0.2
-# Safety: never let a repeated open/close cover COMMAND run past this many
-# seconds without an explicit STOP. If a STOP is dropped (or a session/button
-# gets stuck), the repeater would otherwise run the motor indefinitely and can
-# damage the awning/slide. Added after a runaway awning event (2026-09-03).
-_COVER_SAFETY_TIMEOUT_S = 6.0
+# Cover safety timeout is a per-entry option (CONF_COVER_SAFETY_TIMEOUT),
+# defaulting to DEFAULT_COVER_SAFETY_TIMEOUT (6.0 s) — see const.py.
 # REMOTE_CONTROL session heartbeat cadence. The X180T motor controller
 # terminates the session with RESPONSE.TIMEOUT (0x0F) after ~1s of
 # inactivity, so we must heartbeat well under that window (observed
@@ -390,6 +389,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             always_update=True,
         )
         self.entry = entry
+        self._cover_safety_timeout_s: float = float(
+            entry.options.get(CONF_COVER_SAFETY_TIMEOUT, DEFAULT_COVER_SAFETY_TIMEOUT)
+        )
         self.address: str = entry.data[CONF_ADDRESS]
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
 
@@ -1011,9 +1013,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.debug("Cover repeater EXIT device=0x%02X gen=%d (current=%d)", device_id, gen, self._cover_gen.get(device_id, 0))
                     return
                 # Safety timeout: never run the motor longer than
-                # _COVER_SAFETY_TIMEOUT_S without an explicit STOP. Prevents a
-                # runaway awning/slide if a STOP is dropped or the button gets stuck.
-                if time.monotonic() - started >= _COVER_SAFETY_TIMEOUT_S:
+                # self._cover_safety_timeout_s without an explicit STOP. Prevents
+                # a runaway awning/slide if a STOP is dropped or the button sticks.
+                if time.monotonic() - started >= self._cover_safety_timeout_s:
                     _LOGGER.warning(
                         "CAN BLE: cover safety timeout device=0x%02X direction=%s — sending STOP",
                         device_id, direction_name,
@@ -1087,7 +1089,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         started = time.monotonic()
         try:
             while True:
-                if time.monotonic() - started >= _COVER_SAFETY_TIMEOUT_S:
+                if time.monotonic() - started >= self._cover_safety_timeout_s:
                     _LOGGER.warning(
                         "H-Bridge: cover safety timeout table=%d device=0x%02X direction=0x%02X — sending STOP",
                         table_id, device_id, direction & 0xFF,
