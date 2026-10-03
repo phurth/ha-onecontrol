@@ -768,6 +768,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
+            # Relays hold a session too; release it so the panel keeps the device.
+            await self._async_close_remote_control_session(
+                device_id, "relay command complete"
+            )
         else:
             frame = compose_ids_can_extended_wire_frame(
                 message_type=0x82,
@@ -1008,6 +1012,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     del self._cover_command_tasks[device_id]
             except Exception:
                 pass
+            # Hand the device back to the physical panel.  Scheduled rather than
+            # awaited: this runs on the cancellation path too, where awaiting
+            # here would be interrupted before the frame went out.
+            self.hass.async_create_background_task(
+                self._async_close_remote_control_session(
+                    device_id, "cover movement finished"
+                ),
+                name=f"ha_onecontrol_rc_close_{device_id:02x}",
+            )
 
     async def _hbridge_cover_repeater(self, table_id: int, device_id: int, direction: int) -> None:
         """Background loop that repeatedly sends H-Bridge ACTION commands.
@@ -3388,7 +3401,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     device_id,
                 )
 
-            # Cancel heartbeat for any previous session with a different device.
+            # Close any previous session on a *different* device before opening
+            # this one.  Cancelling its heartbeat alone would orphan it, leaving
+            # that device owned by us and unusable from the physical panel.
+            previous_target = self._rc_session_target
+            if previous_target is not None and previous_target != device_id:
+                await self._async_close_rc_session_locked(
+                    previous_target, "switching to another device"
+                )
             if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
                 self._rc_heartbeat_task.cancel()
             self._rc_session_open = False
@@ -3660,6 +3680,66 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await asyncio.sleep(0.20)
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("CAN BLE: session preflight query failed: %s", exc)
+
+    async def _async_close_remote_control_session(
+        self, device_id: int | None = None, reason: str = ""
+    ) -> None:
+        """Release a REMOTE_CONTROL session so local controls regain the device.
+
+        A session stays owned by whoever opened it until it is explicitly
+        closed — dropping the heartbeat is not enough.  A device left owned
+        refuses commands from the RV's physical control panel, which is how a
+        finished awning command used to lock the panel out of every
+        slide/awning until the gateway was power-cycled.
+
+        Mirrors the official client's CloseSession: REQUEST 0x45 carrying the
+        two session-id bytes.
+        """
+        async with self._rc_session_lock:
+            await self._async_close_rc_session_locked(device_id, reason)
+
+    async def _async_close_rc_session_locked(
+        self, device_id: int | None = None, reason: str = ""
+    ) -> None:
+        """Release the session.  Caller already holds ``_rc_session_lock``."""
+        target = device_id if device_id is not None else self._rc_session_target
+        if target is None:
+            return
+
+        client = self._client
+        sid_bytes = self._rc_session_sid_bytes
+
+        if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
+            self._rc_heartbeat_task.cancel()
+        self._rc_heartbeat_task = None
+        self._rc_session_open = False
+        self._rc_session_target = None
+
+        if not (client and self._connected and self._can_read_subscribed):
+            # Link already gone — nothing to send; the gateway drops the
+            # session with the connection.
+            return
+
+        frame = compose_ids_can_extended_wire_frame(
+            message_type=0x80,
+            source_address=self._gateway_can_address,
+            target_address=target,
+            message_data=0x45,  # SESSION_CLOSE
+            payload=sid_bytes,
+        )
+        try:
+            await self._write_can_frame(client, frame, label="SESSION_CLOSE")
+            _LOGGER.info(
+                "CAN BLE: released REMOTE_CONTROL session on device 0x%02X (%s)",
+                target,
+                reason or "done",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "CAN BLE: failed to release REMOTE_CONTROL session on device 0x%02X: %s",
+                target,
+                exc,
+            )
 
     async def _rc_session_heartbeat(self, client: BleakClient, device_id: int) -> None:
         """Send SESSION_HEARTBEAT (0x44) to keep the REMOTE_CONTROL session alive.
