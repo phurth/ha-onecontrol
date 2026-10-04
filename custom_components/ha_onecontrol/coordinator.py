@@ -768,10 +768,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
-            # Relays hold a session too; release it so the panel keeps the device.
-            await self._async_close_remote_control_session(
-                device_id, "relay command complete"
-            )
         else:
             frame = compose_ids_can_extended_wire_frame(
                 message_type=0x82,
@@ -3401,14 +3397,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     device_id,
                 )
 
-            # Close any previous session on a *different* device before opening
-            # this one.  Cancelling its heartbeat alone would orphan it, leaving
-            # that device owned by us and unusable from the physical panel.
-            previous_target = self._rc_session_target
-            if previous_target is not None and previous_target != device_id:
-                await self._async_close_rc_session_locked(
-                    previous_target, "switching to another device"
-                )
+            # Cancel heartbeat for any previous session with a different device.
+            # NOTE: deliberately no SESSION_CLOSE here — see the cover repeater.
             if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
                 self._rc_heartbeat_task.cancel()
             self._rc_session_open = False
@@ -3694,6 +3684,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Mirrors the official client's CloseSession: REQUEST 0x45 carrying the
         two session-id bytes.
+
+        Only called when a cover movement ends.  Closing after *relay* commands
+        was tried in 1.0.48 and reverted: the device began terminating sessions
+        with reason 0x0E and relay COMMANDs stopped being confirmed, so lights
+        reverted a few seconds after each change.
         """
         async with self._rc_session_lock:
             await self._async_close_rc_session_locked(device_id, reason)
