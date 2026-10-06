@@ -132,6 +132,16 @@ from .protocol.tea import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _is_insufficient_auth(exc: Exception) -> bool:
+    """True when a GATT error means "this link must be encrypted" (ATT 0x05)."""
+    text = str(exc).lower()
+    return (
+        "insufficient authentication" in text
+        or "error=5" in text
+        or "att error: 0x05" in text
+    )
+
 _MAX_PENDING_GET_DEVICES_CMDIDS = 128
 _STARTUP_BOOTSTRAP_WAIT_SECONDS = 8.0
 # Initial backoff between bootstrap retry attempts (doubles each attempt).
@@ -2169,16 +2179,21 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         await self._pin_agent_ctx.cleanup()
                         self._pin_agent_ctx = None
             else:
-                # Legacy PIN gateways: skip BLE SMP pair() entirely.
-                # These gateways authenticate at the GATT application layer via
-                # TEA key exchange (UNLOCK_STATUS/KEY characteristics). Calling
-                # pair() causes an immediate AuthenticationFailed — the device
-                # does not use SMP bonding at all.
-                if self._pin_agent_ctx:
-                    await self._pin_agent_ctx.cleanup()
-                    self._pin_agent_ctx = None
+                # Legacy PIN gateways authenticate at the GATT application layer
+                # via TEA key exchange (UNLOCK_STATUS/KEY), so no SMP bond is
+                # requested up front — on the gateways this was written against,
+                # calling pair() fails immediately.
+                #
+                # Some units do require an encrypted link and answer those reads
+                # with ATT error 5 (insufficient authentication).  The PIN agent
+                # is therefore left REGISTERED through authentication so BlueZ
+                # can answer a passkey request if the gateway demands a bond;
+                # _authenticate_step1 bonds and retries on error 5.  Tearing the
+                # agent down here left nothing to answer that request, so the
+                # bond could never form and the gateway dropped the link.
                 _LOGGER.info(
-                    "PIN gateway %s — skipping BLE pair(), authenticating via GATT TEA",
+                    "PIN gateway %s — authenticating via GATT TEA "
+                    "(PIN agent kept registered in case a bond is required)",
                     self.address,
                 )
 
@@ -2200,10 +2215,19 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         UNLOCK_STATUS_CHAR_UUID,
                     )
                 if CAN_WRITE_CHAR_UUID not in all_char_uuids:
-                    _LOGGER.warning(
-                        "GATT discovery missing CAN_WRITE (%s)",
-                        CAN_WRITE_CHAR_UUID,
-                    )
+                    # CAN_WRITE belongs to the IDS-CAN service set; a MyRvLink
+                    # gateway legitimately has none.  Only worth a warning when
+                    # UNLOCK_STATUS is missing too (neither protocol present).
+                    if UNLOCK_STATUS_CHAR_UUID in all_char_uuids:
+                        _LOGGER.debug(
+                            "No CAN_WRITE (%s) — MyRvLink gateway, expected",
+                            CAN_WRITE_CHAR_UUID,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "GATT discovery missing CAN_WRITE (%s)",
+                            CAN_WRITE_CHAR_UUID,
+                        )
                 # Check for CAN_WRITE and UNLOCK_STATUS to identify gateway protocol
                 _has_unlock_status = False
                 for svc in svc_list:
@@ -2267,6 +2291,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # ── Enable notifications ──────────────────────────────────────
             await self._enable_notifications(client)
+
+        # The PIN agent is only needed in case authentication required a bond.
+        # Release it here so it covers both transports — the CAN path never
+        # reaches the Step 1 branch, and leaving an agent registered for the
+        # whole session is not something to do by accident.
+        if self._pin_agent_ctx:
+            await self._pin_agent_ctx.cleanup()
+            self._pin_agent_ctx = None
 
         _LOGGER.debug("OneControl %s — notifications enabled, waiting for SEED", self.address)
 
@@ -3775,14 +3807,62 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Step 1: UNLOCK_STATUS challenge → KEY response
     # ------------------------------------------------------------------
 
+    async def _async_bond_with_pin(self, client: BleakClient) -> bool:
+        """Bond with the gateway so the link is encrypted, using the PIN agent.
+
+        Called when a characteristic read is refused with ATT error 5.  The PIN
+        agent registered before connecting answers BlueZ's passkey request.
+        """
+        if not hasattr(client, "pair"):
+            _LOGGER.warning("Cannot bond: pair() unavailable on this client")
+            return False
+        try:
+            paired = await client.pair()
+        except Exception as exc:  # noqa: BLE001
+            if await async_is_locally_bonded(self.address):
+                _LOGGER.info(
+                    "pair() raised (%s) but BlueZ reports a bond — continuing", exc
+                )
+            else:
+                _LOGGER.warning("PIN bonding failed: %s", exc)
+                return False
+        else:
+            if not paired and not await async_is_locally_bonded(self.address):
+                _LOGGER.warning("PIN bonding returned False and BlueZ reports no bond")
+                return False
+
+        self._pin_dbus_succeeded = True
+        # Let the bond settle before re-reading; the gateway rejects reads that
+        # race the encryption change.
+        await asyncio.sleep(1.0)
+        _LOGGER.info("PIN bond established for %s", self.address)
+        return True
+
     async def _authenticate_step1(self, client: BleakClient) -> None:
         """Read UNLOCK_STATUS, compute 4-byte TEA key, write to KEY."""
         _LOGGER.debug("Step 1: reading UNLOCK_STATUS")
         try:
             data = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
         except BleakError as exc:
-            _LOGGER.warning("Step 1: failed to read UNLOCK_STATUS: %s", exc)
-            return
+            if not (self.is_pin_gateway and _is_insufficient_auth(exc)):
+                _LOGGER.warning("Step 1: failed to read UNLOCK_STATUS: %s", exc)
+                return
+            # This gateway wants an encrypted link before handing over the
+            # challenge.  Bond with the PIN and read it again.
+            _LOGGER.info(
+                "Step 1: UNLOCK_STATUS requires an encrypted link — "
+                "bonding with the gateway PIN and retrying"
+            )
+            if not await self._async_bond_with_pin(client):
+                return
+            try:
+                data = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
+            except BleakError as retry_exc:
+                _LOGGER.warning(
+                    "Step 1: UNLOCK_STATUS still unreadable after bonding: %s",
+                    retry_exc,
+                )
+                return
 
         text = data.decode("utf-8", errors="replace")
         if "unlocked" in text.lower():
