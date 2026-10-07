@@ -36,6 +36,7 @@ AGENT_PATH = "/org/homeassistant/onecontrol/pin_agent"
 BLUEZ_SERVICE = "org.bluez"
 AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
 DEVICE_IFACE = "org.bluez.Device1"
+ADAPTER_IFACE = "org.bluez.Adapter1"
 OBJECT_MANAGER_IFACE = "org.freedesktop.DBus.ObjectManager"
 PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
 
@@ -158,8 +159,14 @@ def is_pin_pairing_supported() -> bool:
     return _DBUS_AVAILABLE
 
 
-async def async_is_locally_bonded(device_address: str) -> bool:
+async def async_is_locally_bonded(
+    device_address: str, adapter: str | None = None
+) -> bool:
     """Return True if BlueZ has a local bond (LTK) for *device_address*.
+
+    BlueZ keeps bonds per adapter.  Pass *adapter* (an ``hciN`` name or the
+    adapter's MAC) to ask about that adapter only; without it, a bond on any
+    local adapter counts.
 
     This is used at connection time to decide whether to prefer a local HCI
     adapter over an ESPHome BT proxy.  A local bond means the link key lives
@@ -178,7 +185,10 @@ async def async_is_locally_bonded(device_address: str) -> bool:
     try:
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         try:
-            device_path = await _find_device_path(bus, device_address)
+            if adapter is None:
+                objects = await _managed_objects(bus)
+                return bool(_bonded_adapter_macs_in(objects, device_address))
+            device_path = await _find_device_path(bus, device_address, adapter)
             if not device_path:
                 return False
             return await _is_paired(bus, device_path)
@@ -201,7 +211,6 @@ async def async_get_local_adapter_macs() -> set[str]:
     from dbus_fast import BusType, Message, MessageType  # noqa: F811
     from dbus_fast.aio import MessageBus  # noqa: F811
 
-    ADAPTER_IFACE = "org.bluez.Adapter1"
     macs: set[str] = set()
     try:
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -228,6 +237,32 @@ async def async_get_local_adapter_macs() -> set[str]:
     except Exception as exc:
         _LOGGER.debug("async_get_local_adapter_macs failed: %s", exc)
     return macs
+
+
+async def async_get_bonded_adapter_macs(device_address: str) -> set[str]:
+    """Return the MACs of the local adapters holding a bond for *device_address*.
+
+    With more than one local adapter the bond lives on only one of them, so
+    the caller needs to know which in order to connect through it.
+    Returns an empty set if D-Bus is unavailable or on any error.
+    """
+    if not _DBUS_AVAILABLE:
+        return set()
+
+    from dbus_fast import BusType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            return _bonded_adapter_macs_in(await _managed_objects(bus), device_address)
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        _LOGGER.debug(
+            "async_get_bonded_adapter_macs(%s) failed: %s", device_address, exc
+        )
+        return set()
 
 
 class PinAgentContext:
@@ -284,6 +319,7 @@ class PinAgentContext:
 async def prepare_pin_agent(
     device_address: str,
     pin: str,
+    adapter: str | None = None,
 ) -> PinAgentContext | None:
     """Register a D-Bus PIN agent WITHOUT calling Device1.Pair().
 
@@ -295,6 +331,10 @@ async def prepare_pin_agent(
     Returns None if D-Bus is not available on this platform.
     If the device is already bonded, ctx.already_bonded is True and no
     agent is registered (cleanup() is still safe to call).
+
+    *adapter* (``hciN`` name or adapter MAC) is the adapter the connection
+    will use; the bond check is made against that adapter only, since a bond
+    held by a different adapter does not encrypt this link.
     """
     if not _DBUS_AVAILABLE:
         return None
@@ -312,7 +352,7 @@ async def prepare_pin_agent(
 
     try:
         # If already bonded, no agent registration needed.
-        device_path = await _find_device_path(bus, device_address)
+        device_path = await _find_device_path(bus, device_address, adapter)
         if device_path and await _is_paired(bus, device_path):
             _LOGGER.info(
                 "Device %s already bonded in BlueZ — PIN agent not needed",
@@ -352,7 +392,9 @@ async def prepare_pin_agent(
         return None
 
 
-async def prepare_push_button_agent(device_address: str) -> PinAgentContext | None:
+async def prepare_push_button_agent(
+    device_address: str, adapter: str | None = None
+) -> PinAgentContext | None:
     """Register a Just Works agent WITHOUT calling Device1.Pair().
 
     X180T gateways follow the official app's connect-first flow: connect GATT,
@@ -372,7 +414,7 @@ async def prepare_push_button_agent(device_address: str) -> PinAgentContext | No
         return None
 
     try:
-        device_path = await _find_device_path(bus, device_address)
+        device_path = await _find_device_path(bus, device_address, adapter)
         if device_path and await _is_paired(bus, device_path):
             _LOGGER.info(
                 "Device %s already bonded in BlueZ — Just Works agent not needed",
@@ -413,6 +455,7 @@ async def pair_with_pin(
     device_address: str,
     pin: str,
     timeout: float = 30.0,
+    adapter: str | None = None,
 ) -> bool:
     """Register a temporary D-Bus agent, pair via BlueZ, clean up.
 
@@ -420,6 +463,7 @@ async def pair_with_pin(
         device_address: BLE MAC address (e.g. "AA:BB:CC:DD:EE:FF").
         pin: The 6-digit PIN string from the gateway sticker.
         timeout: Seconds to wait for pairing to complete.
+        adapter: ``hciN`` name or MAC of the adapter to pair on (any if None).
 
     Returns:
         True if pairing succeeded or device was already bonded.
@@ -454,7 +498,7 @@ async def pair_with_pin(
 
     try:
         # ── Find device in BlueZ object tree ──────────────────────────
-        device_path = await _find_device_path(bus, device_address)
+        device_path = await _find_device_path(bus, device_address, adapter)
         if not device_path:
             _LOGGER.warning(
                 "Device %s not found in BlueZ object tree — D-Bus PIN pairing "
@@ -562,6 +606,7 @@ async def pair_with_pin(
 async def pair_push_button(
     device_address: str,
     timeout: float = 30.0,
+    adapter: str | None = None,
 ) -> bool:
     """Register a temporary D-Bus agent for Just Works pairing, pair, clean up.
 
@@ -572,6 +617,9 @@ async def pair_push_button(
 
     This mirrors the Android flow where ``createBond()`` succeeds
     automatically after the user presses the physical Connect button.
+
+    *adapter* (``hciN`` name or adapter MAC) selects the adapter to pair on,
+    which must be the one the connection will use.
 
     Returns True if pairing succeeded or device was already bonded.
     """
@@ -597,7 +645,7 @@ async def pair_push_button(
 
     try:
         # ── Find device in BlueZ object tree ──────────────────────────
-        device_path = await _find_device_path(bus, device_address)
+        device_path = await _find_device_path(bus, device_address, adapter)
         if not device_path:
             _LOGGER.warning(
                 "Device %s not found in BlueZ — cannot D-Bus pair",
@@ -691,11 +739,14 @@ async def pair_push_button(
             bus.disconnect()
 
 
-async def remove_bond(device_address: str) -> bool:
+async def remove_bond(device_address: str, adapter: str | None = None) -> bool:
     """Remove an existing BlueZ bond for the given address.
 
     Useful when a bond is stale (gateway was factory-reset) and needs
     to be re-established with a fresh Pair() call.
+
+    *adapter* (``hciN`` name or adapter MAC) limits the removal to the bond
+    held by that adapter.
 
     Returns True if the bond was removed, False otherwise.
     """
@@ -711,7 +762,7 @@ async def remove_bond(device_address: str) -> bool:
         return False
 
     try:
-        device_path = await _find_device_path(bus, device_address)
+        device_path = await _find_device_path(bus, device_address, adapter)
         if not device_path:
             _LOGGER.debug("Cannot remove bond — device %s not in BlueZ", device_address)
             return False
@@ -745,8 +796,79 @@ async def remove_bond(device_address: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _find_device_path(bus: Any, address: str) -> str | None:
-    """Find the BlueZ D-Bus object path for a device by MAC address."""
+def _unwrap(value: Any) -> Any:
+    """Return the payload of a D-Bus Variant (or the value itself)."""
+    return value.value if hasattr(value, "value") else value
+
+
+def _normalize_mac(value: Any) -> str:
+    return str(value).upper().replace(":", "")
+
+
+def _adapter_path_in(objects: dict, adapter: str) -> str | None:
+    """Find the BlueZ object path of *adapter* (``hciN`` name or MAC)."""
+    wanted = _normalize_mac(adapter)
+    for path_str, interfaces in objects.items():
+        if ADAPTER_IFACE not in interfaces:
+            continue
+        path = str(path_str)
+        if path.rsplit("/", 1)[-1].upper() == wanted:
+            return path
+        addr = _unwrap(interfaces[ADAPTER_IFACE].get("Address"))
+        if addr is not None and _normalize_mac(addr) == wanted:
+            return path
+    return None
+
+
+def _device_path_in(
+    objects: dict, address: str, adapter: str | None = None
+) -> str | None:
+    """Find a device's BlueZ object path in a GetManagedObjects result.
+
+    BlueZ keeps one device object per adapter that has seen the device
+    (``/org/bluez/hci0/dev_…``, ``/org/bluez/hci1/dev_…``).  With *adapter*
+    given, only the object under that adapter is returned — never another
+    adapter's, since its pairing state says nothing about this link.
+    """
+    prefix = ""
+    if adapter:
+        adapter_path = _adapter_path_in(objects, adapter)
+        if adapter_path is None:
+            _LOGGER.debug("BlueZ adapter %s not found", adapter)
+            return None
+        prefix = adapter_path + "/"
+
+    mac_suffix = address.upper().replace(":", "_")
+    for path_str, interfaces in objects.items():
+        path = str(path_str)
+        if (
+            mac_suffix in path
+            and DEVICE_IFACE in interfaces
+            and path.startswith(prefix)
+        ):
+            return path
+    return None
+
+
+def _bonded_adapter_macs_in(objects: dict, address: str) -> set[str]:
+    """Return the MACs of the adapters whose device object for *address* is paired."""
+    mac_suffix = address.upper().replace(":", "_")
+    macs: set[str] = set()
+    for path_str, interfaces in objects.items():
+        path = str(path_str)
+        if mac_suffix not in path or DEVICE_IFACE not in interfaces:
+            continue
+        if not _unwrap(interfaces[DEVICE_IFACE].get("Paired")):
+            continue
+        adapter_ifaces = objects.get(path.rsplit("/", 1)[0], {})
+        addr = _unwrap(adapter_ifaces.get(ADAPTER_IFACE, {}).get("Address"))
+        if addr is not None:
+            macs.add(str(addr).upper())
+    return macs
+
+
+async def _managed_objects(bus: Any) -> dict:
+    """Return BlueZ's object tree, or an empty dict if the query fails."""
     from dbus_fast import Message, MessageType  # noqa: F811
 
     reply = await bus.call(
@@ -760,17 +882,23 @@ async def _find_device_path(bus: Any, address: str) -> str | None:
 
     if reply.message_type == MessageType.ERROR:
         _LOGGER.warning("Failed to query BlueZ managed objects: %s", reply.body)
-        return None
+        return {}
 
-    mac_suffix = address.upper().replace(":", "_")
-    objects: dict = reply.body[0] if reply.body else {}
+    return reply.body[0] if reply.body else {}
 
-    for path_str, interfaces in objects.items():
-        if mac_suffix in str(path_str) and DEVICE_IFACE in interfaces:
-            _LOGGER.debug("BlueZ device found at: %s", path_str)
-            return str(path_str)
 
-    return None
+async def _find_device_path(
+    bus: Any, address: str, adapter: str | None = None
+) -> str | None:
+    """Find the BlueZ D-Bus object path for a device by MAC address.
+
+    *adapter* (``hciN`` name or adapter MAC) restricts the lookup to the
+    device object under that adapter.
+    """
+    path = _device_path_in(await _managed_objects(bus), address, adapter)
+    if path:
+        _LOGGER.debug("BlueZ device found at: %s", path)
+    return path
 
 
 async def _is_paired(bus: Any, device_path: str) -> bool:

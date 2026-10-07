@@ -35,6 +35,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .helpers import is_valid_device_id
 from .ble_agent import (
     PinAgentContext,
+    async_get_bonded_adapter_macs,
     async_get_local_adapter_macs,
     async_is_locally_bonded,
     is_pin_pairing_supported,
@@ -140,6 +141,40 @@ def _is_insufficient_auth(exc: Exception) -> bool:
         "insufficient authentication" in text
         or "error=5" in text
         or "att error: 0x05" in text
+    )
+
+
+def _normalize_source(source: str) -> str:
+    return source.upper().replace(":", "")
+
+
+def _pick_local_candidate(
+    candidates: list[Any],
+    local_macs: set[str],
+    bonded_macs: set[str],
+    preferred_source: str | None = None,
+) -> Any | None:
+    """Choose which local HCI adapter's scanner candidate to connect through.
+
+    BlueZ keeps bonds per adapter, so with several local adapters in range the
+    one already holding the bond wins.  Next comes *preferred_source* (the
+    adapter that last authenticated): gateways that never bond would otherwise
+    hop adapters as RSSI fluctuates, and every hop rewrites the stored source
+    and reloads the entry.  Only then does the strongest signal decide.
+    """
+    local = {_normalize_source(m) for m in local_macs}
+    bonded = {_normalize_source(m) for m in bonded_macs}
+    preferred = _normalize_source(preferred_source or "")
+    pool = [c for c in candidates if _normalize_source(c.scanner.source) in local]
+    if not pool:
+        return None
+    return max(
+        pool,
+        key=lambda c: (
+            _normalize_source(c.scanner.source) in bonded,
+            _normalize_source(c.scanner.source) == preferred,
+            getattr(c.advertisement, "rssi", None) or -127,
+        ),
     )
 
 _MAX_PENDING_GET_DEVICES_CMDIDS = 128
@@ -386,6 +421,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # attempt.  Persisted to config entry options after successful step-1 auth
         # so subsequent connects are pinned to the same adapter (bond affinity).
         self._current_connect_source: str | None = None
+        # Local BlueZ adapter (MAC or hciN) carrying the current connection, or
+        # None when routed through a proxy.  Bond checks, pairing and bond
+        # removal are scoped to it — BlueZ keeps bonds per adapter.
+        self._connect_adapter: str | None = None
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -1670,7 +1709,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "X180T" if self.is_x180t_gateway else "PIN",
                 self.address,
             )
-            removed = await remove_bond(self.address)
+            removed = await remove_bond(self.address, self._connect_adapter)
             if removed:
                 _LOGGER.info(
                     "Stale bond removed for %s — attempting fresh PIN pairing",
@@ -1760,6 +1799,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # CONF_BONDED_SOURCE currently stores.
         device = None
         self._current_connect_source = None
+        self._connect_adapter = None
         bonded_source: str | None = self.entry.options.get(CONF_BONDED_SOURCE)
 
         try:
@@ -1771,13 +1811,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Check whether BlueZ holds a local bond for this device.  If so,
         # prefer a local HCI adapter scanner over any proxy — the LTK is only
-        # usable via the local radio.
-        locally_bonded = await async_is_locally_bonded(self.address)
+        # usable via the local radio, and only via the adapter that holds it.
+        bonded_macs = await async_get_bonded_adapter_macs(self.address)
+        locally_bonded = bool(bonded_macs)
         local_macs = await async_get_local_adapter_macs()
         candidate_sources = [c.scanner.source for c in candidates]
         _LOGGER.debug(
-            "Bond check %s: locally_bonded=%s local_macs=%s candidate_sources=%s",
-            self.address, locally_bonded, local_macs, candidate_sources,
+            "Bond check %s: locally_bonded=%s bonded_macs=%s local_macs=%s "
+            "candidate_sources=%s",
+            self.address, locally_bonded, bonded_macs, local_macs, candidate_sources,
         )
 
         # ── PIN gateways must always use a local HCI adapter ────────────────
@@ -1786,11 +1828,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # cannot perform SMP key exchange over it.  Force local HCI regardless
         # of adapter scores, bond state, or CONF_BONDED_SOURCE.
         if self.is_pin_gateway and candidates:
-            _pin_local = next(
-                (c for c in candidates
-                 if c.scanner.source.upper().replace(":", "") in
-                    {m.replace(":", "") for m in local_macs}),
-                None,
+            _pin_local = _pick_local_candidate(
+                candidates, local_macs, bonded_macs, bonded_source
             )
             if _pin_local is not None:
                 device = _pin_local.ble_device
@@ -1808,11 +1847,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
         if device is None and locally_bonded and candidates:
-            local_candidate = next(
-                (c for c in candidates
-                 if c.scanner.source.upper().replace(":", "") in
-                    {m.replace(":", "") for m in local_macs}),
-                None,
+            local_candidate = _pick_local_candidate(
+                candidates, local_macs, bonded_macs, bonded_source
             )
             if local_candidate is not None:
                 device = local_candidate.ble_device
@@ -1866,11 +1902,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 matched = local_preferred or (addr_candidates[0] if addr_candidates else None)
                 self._current_connect_source = matched.scanner.source if matched else None
+                # HA records the scanner that owns the device it handed back;
+                # trust that over the guess above when it is available.
+                details = getattr(device, "details", None)
+                if isinstance(details, dict) and isinstance(details.get("source"), str):
+                    self._current_connect_source = details["source"]
 
         if device is None:
             raise BleakError(
                 f"OneControl device {self.address} not found by HA Bluetooth"
             )
+
+        # Scope every BlueZ bond check / pairing call below to the adapter this
+        # connection uses.  With two local adapters BlueZ has a device object
+        # under each, and the other adapter's pairing state is irrelevant here.
+        if self._current_connect_source and _normalize_source(
+            self._current_connect_source
+        ) in {_normalize_source(m) for m in local_macs}:
+            self._connect_adapter = self._current_connect_source
 
         # ── D-Bus setup BEFORE Bleak connect ──────────────────────────
         self._push_button_dbus_ok = False
@@ -1881,7 +1930,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # We do NOT call Device1.Pair() here — that is done post-connect,
             # matching the Android flow: connectGatt() → createBond() in
             # onConnectionStateChange.
-            ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+            ctx = await prepare_pin_agent(
+                self.address, self._bluetooth_pin, self._connect_adapter
+            )
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._pin_dbus_succeeded = True
@@ -1898,7 +1949,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "X180T gateway %s (pairing_method=PIN) — registering PIN agent",
                     self.address,
                 )
-                ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+                ctx = await prepare_pin_agent(
+                    self.address, self._bluetooth_pin, self._connect_adapter
+                )
                 self._pin_agent_ctx = ctx
                 if ctx and ctx.already_bonded:
                     self._pin_dbus_succeeded = True
@@ -1913,7 +1966,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address,
                     self._pairing_method,
                 )
-                ctx = await prepare_push_button_agent(self.address)
+                ctx = await prepare_push_button_agent(
+                    self.address, self._connect_adapter
+                )
                 self._pin_agent_ctx = ctx
                 if ctx and ctx.already_bonded:
                     self._push_button_dbus_ok = True
@@ -1934,7 +1989,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "with %s before connect",
                 self.address,
             )
-            dbus_ok = await pair_push_button(self.address, timeout=30.0)
+            dbus_ok = await pair_push_button(
+                self.address, timeout=30.0, adapter=self._connect_adapter
+            )
             if dbus_ok:
                 self._push_button_dbus_ok = True
                 _LOGGER.info(
@@ -2004,9 +2061,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.address, adapter, getattr(ble_device, "rssi", "?"),
         )
 
+        self._connect_adapter = adapter
         self._push_button_dbus_ok = False
         if self.is_pin_gateway:
-            ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+            ctx = await prepare_pin_agent(
+                self.address, self._bluetooth_pin, self._connect_adapter
+            )
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._pin_dbus_succeeded = True
@@ -2022,7 +2082,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "X180T gateway %s (pairing_method=PIN) — registering PIN agent for direct connect",
                     self.address,
                 )
-                ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+                ctx = await prepare_pin_agent(
+                    self.address, self._bluetooth_pin, self._connect_adapter
+                )
                 self._pin_agent_ctx = ctx
                 if ctx and ctx.already_bonded:
                     self._pin_dbus_succeeded = True
@@ -2032,7 +2094,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self.address, adapter,
                     )
             else:
-                ctx = await prepare_push_button_agent(self.address)
+                ctx = await prepare_push_button_agent(
+                    self.address, self._connect_adapter
+                )
                 self._pin_agent_ctx = ctx
                 if ctx and ctx.already_bonded:
                     self._push_button_dbus_ok = True
@@ -2047,7 +2111,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "with %s before direct connect",
                 self.address,
             )
-            dbus_ok = await pair_push_button(self.address, timeout=30.0)
+            dbus_ok = await pair_push_button(
+                self.address, timeout=30.0, adapter=self._connect_adapter
+            )
             if dbus_ok:
                 self._push_button_dbus_ok = True
 
@@ -2106,7 +2172,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         _LOGGER.info("BLE pair() result: %s", paired)
                         if not paired:
                             # Check if BlueZ reports bonded despite pair() returning False
-                            if await async_is_locally_bonded(self.address):
+                            if await async_is_locally_bonded(
+                                self.address, self._connect_adapter
+                            ):
                                 _LOGGER.info(
                                     "BLE pair() returned %s but BlueZ reports bonded — proceeding",
                                     paired,
@@ -2119,7 +2187,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                     await asyncio.sleep(1.0)
                                     paired = await client.pair()
                                     _LOGGER.info("BLE pair() retry result: %s", paired)
-                                    if not paired and await async_is_locally_bonded(self.address):
+                                    if not paired and await async_is_locally_bonded(
+                                        self.address, self._connect_adapter
+                                    ):
                                         _LOGGER.info("BLE pair() retry failed but BlueZ reports bonded — proceeding")
                                         paired = True
                                 if not paired:
@@ -3819,7 +3889,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             paired = await client.pair()
         except Exception as exc:  # noqa: BLE001
-            if await async_is_locally_bonded(self.address):
+            if await async_is_locally_bonded(self.address, self._connect_adapter):
                 _LOGGER.info(
                     "pair() raised (%s) but BlueZ reports a bond — continuing", exc
                 )
@@ -3827,7 +3897,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("PIN bonding failed: %s", exc)
                 return False
         else:
-            if not paired and not await async_is_locally_bonded(self.address):
+            if not paired and not await async_is_locally_bonded(
+                self.address, self._connect_adapter
+            ):
                 _LOGGER.warning("PIN bonding returned False and BlueZ reports no bond")
                 return False
 
@@ -3925,7 +3997,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         _LOGGER.info("Removing stale bond for PIN gateway %s", self.address)
-        removed = await remove_bond(self.address)
+        removed = await remove_bond(self.address, self._connect_adapter)
         if removed:
             self._pin_already_bonded = False
             _LOGGER.info("Bond removed — will re-pair on next connection")
