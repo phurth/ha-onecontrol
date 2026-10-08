@@ -154,6 +154,28 @@ CONF_BONDED_SOURCE = "bonded_source"
 CONF_GATEWAY_FAMILY = "gateway_family"
 CONF_ADVERTISED_GATEWAY_VERSION = "advertised_gateway_version"
 CONF_ENABLE_COVER_CONTROL = "enable_cover_control"
+# Fallback cover travel time (seconds): how long one open/close press runs the
+# motor when a cover has no per-cover override.  This is what a user tunes per
+# coach.  The key name is historical (it started as the safety bound); its
+# meaning is now "travel time" — the actual failsafe bound is derived, below.
+CONF_COVER_SAFETY_TIMEOUT = "cover_safety_timeout"
+# Per-cover travel-time overrides, optionally per-direction, keyed by the
+# "tt:dd" cover key (e.g. {"0c:06": {"extend": 30.0, "retract": 28.0}}).
+# Only presented and applied while cover control is enabled.
+CONF_COVER_TRAVEL = "cover_travel"
+
+# Default cover travel time (seconds) when neither a per-cover nor a
+# per-direction override is set.  Preserves the pre-option behaviour.
+DEFAULT_COVER_SAFETY_TIMEOUT = 6.0
+
+# Derived cover safety ceiling — the failsafe bound on the repeater.  The
+# ceiling is travel + clamp(0.2 * travel, COVER_CEILING_MIN_PAD_S,
+# COVER_CEILING_MAX_PAD_S), hard-capped at COVER_CEILING_CAP_S.  It is derived,
+# never entered by hand, and is enforced OUTSIDE the repeater loop via
+# asyncio.timeout so a wedged loop still force-stops the motor.
+COVER_CEILING_MIN_PAD_S = 2.0
+COVER_CEILING_MAX_PAD_S = 5.0
+COVER_CEILING_CAP_S = 90.0
 
 GATEWAY_FAMILY_LEGACY = "legacy"
 GATEWAY_FAMILY_X180T = "x180t_can_ble"
