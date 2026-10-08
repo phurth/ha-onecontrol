@@ -472,6 +472,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_metadata_crc: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        # Terminal teardown flag.  Set once in async_disconnect (unload / stale
+        # supersession); prevents this instance from ever reconnecting again, so
+        # an unloaded coordinator can't keep running as a "zombie" alongside its
+        # replacement on the shared adapter.
+        self._closed: bool = False
         self._reconnect_generation: int = 0
         self._consecutive_failures: int = 0
         self._last_lockout_clear: float = 0.0
@@ -484,6 +489,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # during the PIN-auth window on reconnect (prevents session open with no CAN_READ).
         self._can_read_subscribed: bool = False
         self._can_device_types: dict[int, int] = {}  # source_address → IDS-CAN device_type
+        # NETWORK (mt=0x00) frames are broadcast by EVERY node on the IDS-CAN
+        # bus, each carrying its own protocol version and in-motion-lockout
+        # bits.  Track them per source so gateway-level state is a stable
+        # aggregate instead of whatever frame arrived last.
+        self._can_protocol_by_source: dict[int, int] = {}  # source_address → protocol version
+        self._can_lockout_by_source: dict[int, int] = {}  # source_address → lockout level
         self._invalid_can_sources: set[int] = set()  # source_address values we know are invalid/ignored
         # Commands queued while CAN BLE gateway is between connections.
         # Tuple: (frame_bytes, enqueue_monotonic, device_id)
@@ -1646,13 +1657,31 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_connect(self) -> None:
         """Establish BLE connection and authenticate."""
+        if self._closed:
+            return
         async with self._connect_lock:
-            if self._connected:
+            if self._closed or self._connected:
                 return
             await self._do_connect()
+            if self._closed and self._client:
+                # Unloaded while this connect was in flight — don't keep the
+                # link the ladder just established.
+                client, self._client = self._client, None
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def async_disconnect(self) -> None:
-        """Disconnect from the gateway."""
+        """Disconnect from the gateway and permanently close this coordinator.
+
+        This is a terminal teardown — it is only called when the config entry is
+        unloaded or when a stale coordinator is superseded during setup.  Set
+        ``_closed`` first so that the ``client.disconnect()`` below (which fires
+        ``_on_disconnect``) and any in-flight connect ladder cannot re-arm a
+        reconnect on this dead instance.
+        """
+        self._closed = True
         self._stop_heartbeat()
         self._cancel_startup_bootstrap()
         self._cancel_reconnect()
@@ -1671,6 +1700,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         max_attempts = 3
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
+            if self._closed:
+                return
             try:
                 await self._try_connect(attempt)
                 return
@@ -1696,13 +1727,32 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         assert last_exc is not None
 
+        if self._closed:
+            return
+
         # Stale bond detection: if BlueZ reported "already bonded" at any point
         # this session but all connection attempts still failed, the bond is stale
         # (e.g. created by a prior push_button session or after a gateway reset).
         # _pin_already_bonded is a sticky flag — unlike _pin_dbus_succeeded it is
         # NOT cleared by _on_disconnect, so it survives across the retry loop.
         # We remove the stale bond and attempt one fresh PIN pairing.
-        if (self.is_pin_gateway or self.is_x180t_gateway) and self._pin_already_bonded:
+        #
+        # A bond that has authenticated before is left alone: failed connects
+        # are then far more likely a weak link than bad keys, and deleting it
+        # forces a full passkey pairing on every later attempt.
+        if (
+            (self.is_pin_gateway or self.is_x180t_gateway)
+            and self._pin_already_bonded
+            and await self._async_has_proven_bond()
+        ):
+            _LOGGER.warning(
+                "%s gateway %s: all connection attempts failed; keeping the BlueZ "
+                "bond because it has authenticated before.  If the gateway was "
+                "reset or replaced, delete and re-add it to pair again",
+                "X180T" if self.is_x180t_gateway else "PIN",
+                self.address,
+            )
+        elif (self.is_pin_gateway or self.is_x180t_gateway) and self._pin_already_bonded:
             _LOGGER.warning(
                 "%s gateway %s: BlueZ bond present but all connection attempts failed "
                 "— removing stale bond and retrying with fresh pairing",
@@ -1746,6 +1796,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not hci_adapters:
             hci_adapters = ["hci0"]
         for adapter in hci_adapters:
+            if self._closed:
+                return
             _LOGGER.info(
                 "Direct BLE connect to %s via %s", self.address, adapter,
             )
@@ -2877,17 +2929,43 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mt = wire.message_type
         src = wire.source_address
 
-        if mt == 0x00 and decoded is not None:  # NETWORK — synthesize gateway_info + lockout
+        if mt == 0x00 and decoded is not None:  # NETWORK — per-node status heartbeat
+            # Every node on the IDS-CAN bus broadcasts a NETWORK frame carrying
+            # its OWN protocol version and lockout bits (the frame's source is
+            # an endpoint device, not the gateway).  Overwriting gateway-level
+            # state from each frame made the Protocol Version sensor flap
+            # between every node's value many times a second.  Instead, record
+            # per source and aggregate:
+            #   * lockout  = MAX across nodes — the coach is in lockout if ANY
+            #     node reports it.
+            #   * protocol = MAX observed on the bus — a stable value; the coach
+            #     gateway is the highest-versioned node in practice.
+            # Only push a coordinator update when an aggregate actually changes,
+            # so unchanged heartbeats don't churn HA state / the recorder.
             proto = int(decoded.fields.get("protocol_version", 0))
             lockout = int(decoded.fields.get("in_motion_lockout_level", 0))
-            self.system_lockout_level = lockout
+            self._can_protocol_by_source[src] = proto
+            self._can_lockout_by_source[src] = lockout
+
+            agg_proto = max(self._can_protocol_by_source.values())
+            agg_lockout = max(self._can_lockout_by_source.values())
+            device_count = max(
+                int(decoded.fields.get("device_count", 0)),
+                len(self._can_device_types),
+            )
+
+            changed = (
+                self.system_lockout_level != agg_lockout
+                or self.gateway_info is None
+                or self.gateway_info.protocol_version != agg_proto
+                or self.gateway_info.device_count != device_count
+            )
+
+            self.system_lockout_level = agg_lockout
             self.gateway_info = GatewayInformation(
-                protocol_version=proto,
+                protocol_version=agg_proto,
                 table_id=0,
-                device_count=max(
-                    int(decoded.fields.get("device_count", 0)),
-                    len(self._can_device_types),
-                ),
+                device_count=device_count,
             )
             _LOGGER.debug(
                 "CAN BLE: gateway info updated — %d sources discovered, %d invalid Function 0x0000 sources, reported device_count=%s",
@@ -2896,7 +2974,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.gateway_info.device_count,
             )
             self._last_event_time = time.monotonic()
-            self.async_set_updated_data(self._build_data())
+            if changed:
+                self.async_set_updated_data(self._build_data())
             return
 
         if mt == 0x02 and decoded is not None:  # DEVICE_ID
@@ -3987,6 +4066,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except BleakError as exc:
             _LOGGER.warning("Failed to subscribe SEED: %s", exc)
 
+    async def _async_has_proven_bond(self) -> bool:
+        """True when BlueZ holds a bond on the adapter that last authenticated.
+
+        CONF_BONDED_SOURCE is only written after a successful authentication,
+        so a bond on that adapter is one that has worked.  A bond that never
+        authenticated (wrong pairing type, leftover from another setup) does not
+        qualify and is still removed by the stale-bond handling.
+        """
+        stored: str | None = self.entry.options.get(CONF_BONDED_SOURCE)
+        if not stored:
+            return False
+        bonded_macs = await async_get_bonded_adapter_macs(self.address)
+        return _normalize_source(stored) in {
+            _normalize_source(m) for m in bonded_macs
+        }
+
     async def _remove_stale_bond(self) -> None:
         """Remove a stale bond and reset for re-pairing.
 
@@ -3994,6 +4089,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         suggesting the bond keys are out of sync.
         """
         if not self.is_pin_gateway:
+            return
+
+        if await self._async_has_proven_bond():
+            _LOGGER.info(
+                "Keeping bond for PIN gateway %s — it has authenticated before",
+                self.address,
+            )
             return
 
         _LOGGER.info("Removing stale bond for PIN gateway %s", self.address)
@@ -4884,7 +4986,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # broadcast cycle after each reconnect and defeated data_healthy()'s 30s
         # staleness window (which depends on _can_ble_confirmed staying True
         # between cycles), causing entities to flicker "unavailable" — the
-        # "stale connection" symptom.
+        # "stale connection" symptom.  The per-source protocol versions are
+        # kept for the same reason.  Per-source lockout levels are dropped: a
+        # node that left the bus while reporting lockout would otherwise pin the
+        # aggregate high for good, and live nodes re-report within a cycle.
+        self._can_lockout_by_source.clear()
         # Tear down any open REMOTE_CONTROL session — will be re-opened on next connect.
         self._can_read_subscribed = False
         self._can_local_host_claimed = False
@@ -4914,8 +5020,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.async_set_updated_data(self._build_data())
 
-        # Schedule automatic reconnection with exponential backoff
-        self._schedule_reconnect()
+        # Schedule automatic reconnection with exponential backoff — unless this
+        # coordinator has been torn down (terminal close).  Without this guard the
+        # client.disconnect() inside async_disconnect would re-arm a reconnect and
+        # the unloaded instance would keep running as a zombie.
+        if not self._closed:
+            self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
         """Schedule a reconnect attempt with exponential backoff.
@@ -4925,6 +5035,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         prevents multiple concurrent reconnect coroutines from racing each other
         into BlueZ's "InProgress" error state.
         """
+        if self._closed:
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
 
@@ -4960,6 +5072,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Wait then attempt reconnection."""
         try:
             await asyncio.sleep(delay)
+            if self._closed:
+                return
             if generation != self._reconnect_generation:
                 _LOGGER.debug(
                     "Skipping stale reconnect task (gen=%d current=%d instance=%s)",
@@ -4987,6 +5101,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.address, generation, self._instance_tag,
             )
             await self.async_connect()
+            if self._closed:
+                return
             # Reset backoff only when the connection is actually usable
             # (authenticated, or bonded for PIN gateways).  If async_connect
             # returned without raising but we're not authenticated, we consider

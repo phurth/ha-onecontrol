@@ -6,7 +6,8 @@ import logging
 import re
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
 from .const import (
@@ -17,6 +18,7 @@ from .const import (
     GATEWAY_FAMILY_X180T,
     DOMAIN,
 )
+from .ble_agent import async_get_bonded_adapter_macs, remove_bond
 from .coordinator import OneControlCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -191,6 +193,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Reload when options change so toggling cover control takes effect.
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
+    # Home Assistant does not unload entries on shutdown.  Close the coordinator
+    # explicitly, otherwise the Bluetooth stack going down looks like a dropped
+    # link and the reconnect ladder keeps running against it, delaying the stop.
+    async def _async_close_on_stop(event: Event) -> None:
+        await coordinator.async_disconnect()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_close_on_stop)
+    )
+
     # Connect in a background task so bootstrap completion isn't blocked.  Tie it
     # to the entry (not the global loop) so Home Assistant cancels it on unload —
     # otherwise an in-flight connect ladder could outlive the entry and keep
@@ -221,3 +233,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_disconnect()
 
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop the gateway's BlueZ bond when its entry is deleted.
+
+    A bond that has authenticated before is never removed automatically, so
+    deleting and re-adding the gateway is how a user forces a fresh pairing
+    (after a gateway reset or replacement).
+    """
+    address = entry.data.get(CONF_ADDRESS)
+    if not address:
+        return
+    for adapter_mac in await async_get_bonded_adapter_macs(address):
+        await remove_bond(address, adapter_mac)
