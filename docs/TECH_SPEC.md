@@ -308,16 +308,27 @@ a `SESSION_HEARTBEAT` (0x44) every 500 ms. (The official app instead lets the
 session lapse and re-opens it with a fresh seed/key — `TendCoreSession` — but
 the 0x44 heartbeat path is what has been observed holding the session open here.)
 
-### Safety timeout
+### Travel time + derived safety ceiling
 
 Repeating open/close commands would run the motor indefinitely if a STOP frame
-is ever dropped (BLE drop, stuck button, session loss). Each cover repeater
-records a start timestamp and force-sends a STOP once the cover safety timeout
-(6.0 s by default) has elapsed without an explicit STOP, logging
-`CAN BLE: cover safety timeout … — sending STOP` (WARNING). Added
-(2026-09-03) after a runaway awning event. The timeout is a per-entry option
-(`cover_safety_timeout`, seconds) tunable from the integration's options flow;
-the default lives at `DEFAULT_COVER_SAFETY_TIMEOUT` in `const.py`.
+is ever dropped (BLE drop, stuck button, session loss). Two distinct notions
+are therefore kept separate:
+
+- **Travel time** — how long one open/close press runs the motor.  The fallback
+  is the per-entry option `cover_safety_timeout` (default 6.0 s, clamped 1–60 s),
+  with optional per-cover, per-direction overrides under `cover_travel`
+  (`{"0c:06": {"extend": 30.0, "retract": 28.0}}`).  Both are read and clamped
+  at the point of use in the coordinator, not only in the form schema.
+- **Safety ceiling** — the failsafe bound, *derived* from the travel time and
+  never entered by hand: `ceiling = travel + clamp(0.2 × travel, 2 s, 5 s)`,
+  hard-capped at 90 s.  It is enforced OUTSIDE the repeater loop via
+  `asyncio.timeout(ceiling)`, with a `finally` that force-sends STOP, so a
+  wedged loop, a generation bump that never lands, or a reconnect-spin still
+  stops the motor.  Logging is `CAN BLE: cover safety ceiling … exceeded —
+  force-stopping` (WARNING).
+
+Added (2026-09-03) after a runaway awning event; reshaped (2026-10-04) to split
+travel time from the derived ceiling per multi-cover review feedback.
 
 ## 11. Evolution Notes (Commit History)
 

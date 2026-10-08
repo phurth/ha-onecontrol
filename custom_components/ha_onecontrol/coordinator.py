@@ -18,6 +18,7 @@ import asyncio
 from datetime import timedelta
 import hashlib
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, replace
@@ -55,6 +56,7 @@ from .const import (
     PASSWORD_UNLOCK_CHAR_UUID,
     CONF_BONDED_SOURCE,
     CONF_COVER_SAFETY_TIMEOUT,
+    CONF_COVER_TRAVEL,
     CONF_GATEWAY_FAMILY,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
@@ -63,6 +65,9 @@ from .const import (
     DATA_WRITE_CHAR_UUID,
     DEFAULT_COVER_SAFETY_TIMEOUT,
     DEFAULT_GATEWAY_PIN,
+    COVER_CEILING_MIN_PAD_S,
+    COVER_CEILING_MAX_PAD_S,
+    COVER_CEILING_CAP_S,
     DOMAIN,
     GATEWAY_FAMILY_LEGACY,
     GATEWAY_FAMILY_X180T,
@@ -203,8 +208,9 @@ _CAN_COMMAND_VERIFY_POLL_S = 0.05
 # How often to resend an OPEN/CLOSE cover COMMAND so the motor keeps running
 # (device expects repeated COMMANDs while the button is conceptually held).
 _COVER_COMMAND_REPEAT_S = 0.2
-# Cover safety timeout is a per-entry option (CONF_COVER_SAFETY_TIMEOUT),
-# defaulting to DEFAULT_COVER_SAFETY_TIMEOUT (6.0 s) — see const.py.
+# Cover travel time is a per-entry option (CONF_COVER_SAFETY_TIMEOUT, with
+# per-cover overrides under CONF_COVER_TRAVEL) and the safety ceiling is derived
+# from it — see const.py and the cover-travel helpers on the coordinator.
 # REMOTE_CONTROL session heartbeat cadence. The X180T motor controller
 # terminates the session with RESPONSE.TIMEOUT (0x0F) after ~1s of
 # inactivity, so we must heartbeat well under that window (observed
@@ -389,8 +395,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             always_update=True,
         )
         self.entry = entry
-        self._cover_safety_timeout_s: float = float(
+        # Fallback cover travel time (seconds).  Clamped at the point of use so
+        # a malformed or out-of-range stored value can neither fail setup of the
+        # whole integration nor let the motor run unbounded — the form schema is
+        # not the only line of defence.
+        self._cover_travel_fallback_s: float = self._clamp_travel_time(
             entry.options.get(CONF_COVER_SAFETY_TIMEOUT, DEFAULT_COVER_SAFETY_TIMEOUT)
+        )
+        # Per-cover travel-time overrides: {"tt:dd": {"extend": float, "retract": float}}.
+        self._cover_travel_overrides: dict[str, dict[str, float]] = self._parse_cover_travel_overrides(
+            entry.options.get(CONF_COVER_TRAVEL)
         )
         self.address: str = entry.data[CONF_ADDRESS]
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
@@ -526,10 +540,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # CAN-only link keepalive task. Periodic lightweight discovery requests
         # keep the gateway link active during idle periods.
         self._can_keepalive_task: asyncio.Task | None = None
-        # Per-device background tasks that repeatedly send OPEN/CLOSE commands
-        # until a STOP command is issued by the user.
-        self._cover_command_tasks: dict[int, asyncio.Task] = {}
-        self._cover_gen: dict[int, int] = {}  # generation per device, bumped on new command
+        # Per-cover background tasks that repeatedly send OPEN/CLOSE commands
+        # until a STOP command is issued by the user.  Keyed by the "tt:dd"
+        # cover key (matches self.covers) so per-cover config and task tracking
+        # share one identity — device_id alone is ambiguous on multi-table
+        # gateways.
+        self._cover_command_tasks: dict[str, asyncio.Task] = {}
+        self._cover_gen: dict[str, int] = {}  # generation per cover key, bumped on new command
 
         # ── Data freshness tracking ──────────────────────────────────
         self._last_event_time: float = 0.0  # monotonic timestamp
@@ -546,7 +563,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.dimmable_lights: dict[str, DimmableLight] = {}
         self.rgb_lights: dict[str, RgbLight] = {}
         self.covers: dict[str, CoverStatus] = {}
-        self._stale_cover_directions: dict[int, int] = {}  # device_id -> direction for reconnect-restart
         self.hvac_zones: dict[str, HvacZone] = {}
         self.tanks: dict[str, TankLevel] = {}
         self.device_online: dict[str, DeviceOnline] = {}
@@ -696,6 +712,87 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._event_callbacks.remove(cb)
 
         return _unsub
+
+    # ------------------------------------------------------------------
+    # Cover travel time + derived safety ceiling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clamp_travel_time(value: object) -> float:
+        """Coerce *value* to a travel time and clamp it to [1, 60] seconds.
+
+        Tolerates malformed stored values (falls back to the default) so a bad
+        option can never fail setup or run the motor unbounded.
+        """
+        try:
+            travel = float(value)
+        except (TypeError, ValueError):
+            travel = DEFAULT_COVER_SAFETY_TIMEOUT
+        if not math.isfinite(travel):
+            travel = DEFAULT_COVER_SAFETY_TIMEOUT
+        return max(1.0, min(60.0, travel))
+
+    @staticmethod
+    def _parse_cover_travel_overrides(raw: object) -> dict[str, dict[str, float]]:
+        """Normalise a raw ``cover_travel`` option into {"tt:dd": {"extend": s, "retract": s}}.
+
+        Tolerates malformed shapes: non-dicts, non-numeric values, and unknown
+        keys are dropped.  Callers clamp each value at the point of use.
+        """
+        out: dict[str, dict[str, float]] = {}
+        if not isinstance(raw, dict):
+            return out
+        for cover_key, value in raw.items():
+            if not isinstance(cover_key, str):
+                continue
+            entry: dict[str, float] = {}
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                # Single value applies to both directions.
+                try:
+                    travel = float(value)
+                except (TypeError, ValueError):
+                    continue
+                entry = {"extend": travel, "retract": travel}
+            elif isinstance(value, dict):
+                for direction in ("extend", "retract"):
+                    if direction in value:
+                        try:
+                            entry[direction] = float(value[direction])
+                        except (TypeError, ValueError):
+                            continue
+            if entry:
+                out[cover_key] = entry
+        return out
+
+    def _cover_travel_time_s(self, cover_key: str, direction: int) -> float:
+        """Resolve the travel time for one cover/direction.
+
+        Order: per-cover per-direction override → per-cover single value → the
+        global fallback option.  ``direction`` is the HA logical direction
+        (0x01 open/extend, 0x02 close/retract).  Clamped at the point of use.
+        """
+        override = self._cover_travel_overrides.get(cover_key)
+        if override:
+            name = "extend" if direction & 0xFF == 0x01 else "retract"
+            if name in override:
+                return self._clamp_travel_time(override[name])
+        return self._cover_travel_fallback_s
+
+    @staticmethod
+    def _cover_safety_ceiling_s(travel: float) -> float:
+        """Derive the failsafe ceiling for a given travel time.
+
+        ``ceiling = travel + clamp(0.2 * travel, 2s, 5s)``, hard-capped at 90s.
+        A flat percentage trips spuriously on short nudges (0.6s for a 3s awning)
+        and overruns long slides (9s for a 45s slide); the clamp keeps the pad
+        sane at both ends.
+        """
+        pad = max(
+            COVER_CEILING_MIN_PAD_S,
+            min(COVER_CEILING_MAX_PAD_S, 0.2 * travel),
+        )
+        return min(travel + pad, COVER_CEILING_CAP_S)
+
 
     # ------------------------------------------------------------------
     # Command sending (COBS-encoded writes to DATA_WRITE)
@@ -856,11 +953,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         If the gateway is currently disconnected (normal for some IDS-CAN BLE gateways),
         the command is queued and sent at the start of the next connection window.
         """
+        # CAN gateways are single-bus: every cover lives on table 0.
+        cover_key = _device_key(0, device_id)
+
         # If STOP requested, cancel any ongoing repeating task and send one STOP
         if direction & 0xFF == 0x00:
-            # Cancel any repeating open/close for this device
-            self._stale_cover_directions.pop(device_id, None)
-            self._cancel_cover_task(device_id)
+            self._cancel_cover_task(cover_key)
             if self._client and self._connected and self._can_read_subscribed:
                 # Stop also requires an active REMOTE_CONTROL session before the
                 # motor controller accepts the frame.
@@ -916,7 +1014,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # panel button. A single COMMAND frame energizes the H-bridge for ~1s
         # before the controller de-energizes it, so we repeat the direction
         # COMMAND every _COVER_COMMAND_REPEAT_S while the cover is
-        # opening/closing; STOP cancels the repeater. The REMOTE_CONTROL session
+        # opening/closing; STOP bumps the generation. The REMOTE_CONTROL session
         # (kept alive by _rc_session_heartbeat) must be active for COMMAND
         # frames to be accepted at all.
         if direction & 0xFF in (0x01, 0x02):
@@ -924,11 +1022,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             #   0x01 (open)  -> 0x01 FORWARD/EXTEND
             #   0x02 (close) -> 0x02 REVERSE/RETRACT
             can_direction = _CAN_HBRIDGE_DIRECTION_BYTE.get(direction & 0xFF, direction & 0xFF)
-            self._stale_cover_directions[device_id] = can_direction
 
-            # Bump generation so any existing repeater for this device exits.
-            gen = self._cover_gen.get(device_id, 0) + 1
-            self._cover_gen[device_id] = gen
+            # Bump generation so any existing repeater for this cover exits.
+            gen = self._cover_gen.get(cover_key, 0) + 1
+            self._cover_gen[cover_key] = gen
 
             if not (self._client and self._connected and self._can_read_subscribed):
                 frame = compose_ids_can_extended_wire_frame(
@@ -962,21 +1059,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
 
-            # Hold-to-run (momentary H-bridge): the awning/slide motor only runs
-            # while the direction COMMAND is actively held, exactly like the
-            # physical panel button. A single COMMAND frame energizes the
-            # H-bridge for ~1s before the controller's watchdog de-energizes it,
-            # so we repeat the direction COMMAND every _COVER_COMMAND_REPEAT_S
-            # until STOP bumps the generation. The REMOTE_CONTROL session
-            # heartbeat (_rc_session_heartbeat) keeps the session alive.
+            # Hold-to-run (momentary H-bridge): repeat the direction COMMAND every
+            # _COVER_COMMAND_REPEAT_S for one travel-time window; STOP bumps the
+            # generation to take over. The REMOTE_CONTROL session heartbeat
+            # (_rc_session_heartbeat) keeps the session alive throughout.
             task = self.hass.async_create_background_task(
-                self._cover_command_repeater(device_id, can_direction, gen),
+                self._cover_command_repeater(cover_key, device_id, can_direction, gen),
                 name=f"ha_onecontrol_cover_{device_id:02x}",
             )
-            self._cover_command_tasks[device_id] = task
+            self._cover_command_tasks[cover_key] = task
             _LOGGER.info(
-                "CAN BLE: STARTED cover repeater device=0x%02X direction=0x%02X gen=%d",
-                device_id, can_direction, gen,
+                "CAN BLE: STARTED cover repeater key=%s device=0x%02X direction=0x%02X gen=%d",
+                cover_key, device_id, can_direction, gen,
             )
             return
         else:
@@ -998,76 +1092,118 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._cancel_reconnect()
             self.hass.async_create_task(self.async_connect())
 
-    async def _cover_command_repeater(self, device_id: int, direction: int, gen: int) -> None:
-        """Send repeated cover COMMAND frames until gen mismatch or stopped.
+    async def _can_cover_stop(self, device_id: int, label: str) -> bool:
+        """Send a single CAN STOP frame; return True if written.
+
+        Used by the repeaters (travel-complete, safety-ceiling, and the failsafe
+        ``finally``).  The user-STOP path in ``async_can_cover`` keeps its own
+        session-ensure logic and does not go through here.
+        """
+        if not (self._client and self._connected and self._can_read_subscribed):
+            _LOGGER.debug("CAN BLE: cover STOP (%s) skipped — not connected", label)
+            return False
+        frame = compose_ids_can_extended_wire_frame(
+            message_type=0x82,
+            source_address=self._gateway_can_address,
+            target_address=device_id,
+            message_data=0x00,
+            payload=b"",
+        )
+        try:
+            await self._write_can_frame(self._client, frame, label=f"cover STOP ({label})")
+            return True
+        except Exception as exc:
+            _LOGGER.warning("CAN BLE: cover STOP (%s) failed: %s", label, exc)
+            return False
+
+    async def _cover_command_repeater(self, cover_key: str, device_id: int, direction: int, gen: int) -> None:
+        """Repeat a cover COMMAND frame for one travel-time window.
 
         ``direction`` is the IDS-CAN COMMAND_MODE byte (0x01 FORWARD/EXTEND or
         0x02 REVERSE/RETRACT) — already remapped from HA logical direction.
+
+        Normal operation: repeat the COMMAND every _COVER_COMMAND_REPEAT_S until
+        the travel time elapses (send STOP) or a newer command bumps the
+        generation (exit — the new command owns the motor).  The whole loop runs
+        inside ``asyncio.timeout(ceiling)``, so the failsafe bound is enforced by
+        the event loop's own timer rather than the same clock the loop checks —
+        a wedged loop or a reconnect-spin still force-stops the motor.
         """
         direction_name = {0x01: "FORWARD/EXTEND", 0x02: "REVERSE/RETRACT"}.get(direction & 0xFF, "UNKNOWN")
+        travel = self._cover_travel_time_s(cover_key, direction & 0xFF)
+        ceiling = self._cover_safety_ceiling_s(travel)
         started = time.monotonic()
+        handed_off = False  # a newer command now owns the motor
+        stop_sent = False
         try:
-            while True:
-                # Exit if a newer command bumped the generation
-                if self._cover_gen.get(device_id, 0) != gen:
-                    _LOGGER.debug("Cover repeater EXIT device=0x%02X gen=%d (current=%d)", device_id, gen, self._cover_gen.get(device_id, 0))
-                    return
-                # Safety timeout: never run the motor longer than
-                # self._cover_safety_timeout_s without an explicit STOP. Prevents
-                # a runaway awning/slide if a STOP is dropped or the button sticks.
-                if time.monotonic() - started >= self._cover_safety_timeout_s:
-                    _LOGGER.warning(
-                        "CAN BLE: cover safety timeout device=0x%02X direction=%s — sending STOP",
-                        device_id, direction_name,
-                    )
-                    if self._client and self._connected and self._can_read_subscribed:
-                        stop_frame = compose_ids_can_extended_wire_frame(
-                            message_type=0x82,
-                            source_address=self._gateway_can_address,
-                            target_address=device_id,
-                            message_data=0x00,
-                            payload=b"",
+            async with asyncio.timeout(ceiling):
+                while True:
+                    # Exit if a newer command bumped the generation.
+                    if self._cover_gen.get(cover_key, 0) != gen:
+                        _LOGGER.debug("Cover repeater EXIT key=%s gen=%d (current=%d)", cover_key, gen, self._cover_gen.get(cover_key, 0))
+                        handed_off = True
+                        return
+                    # Normal end of travel: send STOP and stop repeating.
+                    if time.monotonic() - started >= travel:
+                        _LOGGER.info(
+                            "CAN BLE: cover travel complete key=%s direction=%s — sending STOP",
+                            cover_key, direction_name,
                         )
-                        try:
-                            await self._write_can_frame(self._client, stop_frame, label="cover STOP")
-                        except Exception as exc:
-                            _LOGGER.warning("CAN BLE: cover safety STOP failed: %s", exc)
-                    return
-                if not (self._client and self._connected and self._can_read_subscribed):
-                    _LOGGER.debug("Cover repeater WAITING for reconnect (device=0x%02X)", device_id)
-                    await asyncio.sleep(0.5)
-                    continue
-
-                # Fast path: session already open for this device — skip expensive setup
-                if not (self._rc_session_open and self._rc_session_target == device_id):
-                    # Re-establish session after disconnect (quick version)
-                    session_ok = await self._ensure_remote_control_session(self._client, device_id)
-                    if not session_ok:
+                        await self._can_cover_stop(device_id, label="travel-complete")
+                        stop_sent = True
+                        return
+                    if not (self._client and self._connected and self._can_read_subscribed):
+                        _LOGGER.debug("Cover repeater WAITING for reconnect (key=%s)", cover_key)
                         await asyncio.sleep(0.5)
                         continue
 
-                frame = compose_ids_can_extended_wire_frame(
-                    message_type=0x82,
-                    source_address=self._gateway_can_address,
-                    target_address=device_id,
-                    message_data=direction & 0xFF,
-                    payload=b"",
-                )
-                _LOGGER.debug(
-                    "CAN BLE: cover repeater TX device=0x%02X direction=%s",
-                    device_id,
-                    direction_name,
-                )
-                try:
-                    await self._write_can_frame(self._client, frame, label="cover COMMAND")
-                except Exception as exc:
-                    _LOGGER.warning("CAN BLE: cover repeater write failed: %s", exc)
-                await asyncio.sleep(_COVER_COMMAND_REPEAT_S)
+                    # Fast path: session already open for this device — skip expensive setup
+                    if not (self._rc_session_open and self._rc_session_target == device_id):
+                        # Re-establish session after disconnect (quick version)
+                        session_ok = await self._ensure_remote_control_session(self._client, device_id)
+                        if not session_ok:
+                            await asyncio.sleep(0.5)
+                            continue
+
+                    frame = compose_ids_can_extended_wire_frame(
+                        message_type=0x82,
+                        source_address=self._gateway_can_address,
+                        target_address=device_id,
+                        message_data=direction & 0xFF,
+                        payload=b"",
+                    )
+                    _LOGGER.debug(
+                        "CAN BLE: cover repeater TX device=0x%02X direction=%s",
+                        device_id,
+                        direction_name,
+                    )
+                    try:
+                        await self._write_can_frame(self._client, frame, label="cover COMMAND")
+                    except Exception as exc:
+                        _LOGGER.warning("CAN BLE: cover repeater write failed: %s", exc)
+                    await asyncio.sleep(_COVER_COMMAND_REPEAT_S)
+        except TimeoutError:
+            # The derived safety ceiling fired — the loop failed to stop normally.
+            _LOGGER.warning(
+                "CAN BLE: cover safety ceiling (%.1fs) exceeded key=%s direction=%s — force-stopping",
+                ceiling, cover_key, direction_name,
+            )
+            await self._can_cover_stop(device_id, label="safety-ceiling")
+            stop_sent = True
         finally:
-            # Ensure task is removed from tracking map when it finishes
+            # Failsafe: on any other abnormal exit (an unhandled exception), and
+            # provided a newer command did not take over and we were not
+            # cancelled (the user-STOP path already sent its own frame), force a
+            # final STOP.  Idempotent, so it never fights a real command.
+            if not handed_off and not stop_sent and not asyncio.current_task().cancelling():
+                try:
+                    await self._can_cover_stop(device_id, label="repeater-finally")
+                except Exception as exc:
+                    _LOGGER.debug("CAN BLE: final STOP failed for key=%s: %s", cover_key, exc)
+            # Ensure task is removed from tracking map when it finishes.
             try:
-                if device_id in self._cover_command_tasks and self._cover_command_tasks[device_id] is asyncio.current_task():
-                    del self._cover_command_tasks[device_id]
+                if cover_key in self._cover_command_tasks and self._cover_command_tasks[cover_key] is asyncio.current_task():
+                    del self._cover_command_tasks[cover_key]
             except Exception:
                 pass
             # Hand the device back to the physical panel.  Scheduled rather than
@@ -1080,54 +1216,80 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 name=f"ha_onecontrol_rc_close_{device_id:02x}",
             )
 
-    async def _hbridge_cover_repeater(self, table_id: int, device_id: int, direction: int) -> None:
+    async def _hbridge_cover_repeater(self, cover_key: str, table_id: int, device_id: int, direction: int) -> None:
         """Background loop that repeatedly sends H-Bridge ACTION commands.
 
         Used for non-CAN BLE gateways where H-Bridge ACTION must be resent
-        while the virtual "button" is held.
+        while the virtual "button" is held.  Mirrors the CAN repeater: one
+        travel-time window, with a derived safety ceiling enforced outside the
+        loop via ``asyncio.timeout`` and a failsafe STOP in ``finally``.
         """
+        travel = self._cover_travel_time_s(cover_key, direction & 0xFF)
+        ceiling = self._cover_safety_ceiling_s(travel)
         started = time.monotonic()
+        stop_sent = False
         try:
-            while True:
-                if time.monotonic() - started >= self._cover_safety_timeout_s:
-                    _LOGGER.warning(
-                        "H-Bridge: cover safety timeout table=%d device=0x%02X direction=0x%02X — sending STOP",
-                        table_id, device_id, direction & 0xFF,
-                    )
+            async with asyncio.timeout(ceiling):
+                while True:
+                    if time.monotonic() - started >= travel:
+                        _LOGGER.info(
+                            "H-Bridge: cover travel complete key=%s direction=0x%02X — sending STOP",
+                            cover_key, direction & 0xFF,
+                        )
+                        if self._client and self._connected:
+                            stop_cmd = self._cmd.build_action_hbridge(table_id, device_id, 0x00)
+                            try:
+                                await self.async_send_command(stop_cmd)
+                            except Exception as exc:
+                                _LOGGER.warning("H-Bridge: cover STOP failed: %s", exc)
+                        stop_sent = True
+                        return
+                    if not (self._client and self._connected):
+                        _LOGGER.debug("H-Bridge repeater waiting for reconnect (device=0x%02X)", device_id)
+                        await asyncio.sleep(0.5)
+                        continue
+                    cmd = self._cmd.build_action_hbridge(table_id, device_id, direction & 0xFF)
+                    _LOGGER.debug("H-Bridge repeater tx table=%d device=0x%02X direction=0x%02X cmd=%s", table_id, device_id, direction & 0xFF, cmd.hex())
+                    try:
+                        await self.async_send_command(cmd)
+                    except Exception as exc:
+                        _LOGGER.warning("H-Bridge repeater failed to send cmd: %s", exc)
+                    await asyncio.sleep(_COVER_COMMAND_REPEAT_S)
+        except TimeoutError:
+            _LOGGER.warning(
+                "H-Bridge: cover safety ceiling (%.1fs) exceeded key=%s direction=0x%02X — force-stopping",
+                ceiling, cover_key, direction & 0xFF,
+            )
+            if self._client and self._connected:
+                stop_cmd = self._cmd.build_action_hbridge(table_id, device_id, 0x00)
+                try:
+                    await self.async_send_command(stop_cmd)
+                except Exception as exc:
+                    _LOGGER.warning("H-Bridge: cover safety STOP failed: %s", exc)
+            stop_sent = True
+        finally:
+            if not stop_sent and not asyncio.current_task().cancelling():
+                try:
                     if self._client and self._connected:
                         stop_cmd = self._cmd.build_action_hbridge(table_id, device_id, 0x00)
-                        try:
-                            await self.async_send_command(stop_cmd)
-                        except Exception as exc:
-                            _LOGGER.warning("H-Bridge: cover safety STOP failed: %s", exc)
-                    return
-                if not (self._client and self._connected):
-                    _LOGGER.debug("H-Bridge repeater waiting for reconnect (device=0x%02X)", device_id)
-                    await asyncio.sleep(0.5)
-                    continue
-                cmd = self._cmd.build_action_hbridge(table_id, device_id, direction & 0xFF)
-                _LOGGER.debug("H-Bridge repeater tx table=%d device=0x%02X direction=0x%02X cmd=%s", table_id, device_id, direction & 0xFF, cmd.hex())
-                try:
-                    await self.async_send_command(cmd)
+                        await self.async_send_command(stop_cmd)
                 except Exception as exc:
-                    _LOGGER.warning("H-Bridge repeater failed to send cmd: %s", exc)
-                await asyncio.sleep(_COVER_COMMAND_REPEAT_S)
-        finally:
+                    _LOGGER.debug("H-Bridge: final STOP failed for key=%s: %s", cover_key, exc)
             try:
-                if device_id in self._cover_command_tasks and self._cover_command_tasks[device_id] is asyncio.current_task():
-                    del self._cover_command_tasks[device_id]
+                if cover_key in self._cover_command_tasks and self._cover_command_tasks[cover_key] is asyncio.current_task():
+                    del self._cover_command_tasks[cover_key]
             except Exception:
                 pass
 
-    def _cancel_cover_task(self, device_id: int) -> None:
-        """Cancel and remove any repeating cover task for *device_id*."""
-        task = self._cover_command_tasks.pop(device_id, None)
+    def _cancel_cover_task(self, cover_key: str) -> None:
+        """Cancel and remove any repeating cover task for *cover_key*."""
+        task = self._cover_command_tasks.pop(cover_key, None)
         if task is not None and not task.done():
             try:
                 task.cancel()
-                _LOGGER.debug("Cancelled cover repeater task for device=0x%02X", device_id)
+                _LOGGER.debug("Cancelled cover repeater task for key=%s", cover_key)
             except Exception:
-                _LOGGER.debug("Failed to cancel cover repeater task for device=0x%02X", device_id)
+                _LOGGER.debug("Failed to cancel cover repeater task for key=%s", cover_key)
 
     async def async_switch(
         self, table_id: int, device_id: int, state: bool
@@ -1151,11 +1313,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.async_can_cover(device_id, direction)
             return
 
+        cover_key = _device_key(table_id, device_id)
+
         # Non-CAN H-Bridge path: implement repeating OPEN/CLOSE until STOP
         # so the HA button behaves like a held button.
         if direction & 0xFF == 0x00:
             # STOP: cancel any repeating hbridge task and send one STOP
-            self._cancel_cover_task(device_id)
+            self._cancel_cover_task(cover_key)
             cmd = self._cmd.build_action_hbridge(table_id, device_id, 0x00)
             _LOGGER.info(
                 "H-Bridge STOP table=%d device=0x%02X cmd=%s",
@@ -1171,15 +1335,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if direction & 0xFF in (0x01, 0x02):
             # Start repeating H-Bridge commands while connected
-            self._cancel_cover_task(device_id)
+            self._cancel_cover_task(cover_key)
             if not (self._client and self._connected):
                 _LOGGER.info("H-Bridge gateway disconnected — ignoring cover command table=%d device=0x%02X", table_id, device_id)
                 return
             task = self.hass.async_create_background_task(
-                self._hbridge_cover_repeater(table_id, device_id, direction & 0xFF),
+                self._hbridge_cover_repeater(cover_key, table_id, device_id, direction & 0xFF),
                 name=f"ha_onecontrol_hbridge_cover_{device_id:02x}",
             )
-            self._cover_command_tasks[device_id] = task
+            self._cover_command_tasks[cover_key] = task
             _LOGGER.info("H-Bridge: started repeating cover %s for device=0x%02X", "OPEN" if direction & 0xFF == 0x01 else "CLOSE", device_id)
             return
 

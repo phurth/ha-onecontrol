@@ -52,10 +52,18 @@
     "step": {
       "init": {
         "title": "OneControl Options",
-        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\nThe safety stop is a failsafe that force-stops a cover after it has been moving this long without an explicit stop, in case a stop command is dropped. Only enable cover control if you understand and accept the risk.",
+        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\n**Travel time** is how long one open/close press runs the motor. Set a fallback here and, if needed, a per-cover override on the next step. A failsafe safety stop is derived from the travel time and applied automatically, so a dropped stop command cannot leave a motor running indefinitely.\n\nOnly enable cover control if you understand and accept the risk.",
         "data": {
           "enable_cover_control": "Enable awning/slide (cover) control",
-          "cover_safety_timeout": "Cover safety stop (seconds)"
+          "cover_safety_timeout": "Cover travel time, fallback (seconds)"
+        }
+      },
+      "travel": {
+        "title": "Per-Cover Travel Times",
+        "description": "Optional. Set how long each cover runs per press in each direction. Leave a field blank to use the fallback travel time from the previous step. Covers appear here once the gateway has discovered them.",
+        "data": {
+          "extend_": "Extend time (seconds)",
+          "retract_": "Retract time (seconds)"
         }
       }
     }
