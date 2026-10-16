@@ -23,8 +23,11 @@ from .const import (
     CONF_BLUETOOTH_PIN,
     CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
+    CONF_COVER_SAFETY_TIMEOUT,
+    CONF_COVER_TRAVEL,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
+    DEFAULT_COVER_SAFETY_TIMEOUT,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
     GATEWAY_FAMILY_LEGACY,
@@ -366,32 +369,156 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
 class OneControlOptionsFlow(OptionsFlow):
     """Handle options for an existing OneControl entry.
 
-    The only option today is whether to enable cover (awning/slide) motor
-    control.  It is off by default: the H-bridge motors have no limit switches
-    or supervision, so the option is gated behind a safety disclaimer.
+    Cover (awning/slide) motor control is opt-in and off by default.  When
+    enabled, two travel-time notions are kept distinct:
+
+    * the **fallback travel time** (``cover_safety_timeout``) — how long one
+      open/close press runs the motor when a cover has no override, and
+    * **per-cover overrides** (``cover_travel``) — optional, per-direction,
+      keyed by the "tt:dd" cover key.
+
+    The actual failsafe ceiling is derived from the travel time (see the
+    coordinator) and never entered by hand.
     """
+
+    def _coordinator(self) -> Any:
+        """Return the live coordinator for this entry, if one exists."""
+        entries = self.hass.data.get(DOMAIN, {}) if self.hass else {}
+        return entries.get(self.config_entry.entry_id)
+
+    def _discovered_covers(self) -> list[tuple[str, str, int, int]]:
+        """Return discovered covers as (key, friendly name, table, device).
+
+        Covers are only enumerable while the gateway is connected, so this may
+        be empty mid-setup; the travel step is simply skipped in that case.
+        """
+        coordinator = self._coordinator()
+        if coordinator is None:
+            return []
+        out: list[tuple[str, str, int, int]] = []
+        for key in sorted(coordinator.covers):
+            try:
+                table_s, device_s = key.split(":")
+                table_id, device_id = int(table_s, 16), int(device_s, 16)
+            except ValueError:
+                continue
+            name = coordinator.device_name(table_id, device_id)
+            out.append((key, name, table_id, device_id))
+        return out
+
+    @staticmethod
+    def _travel_field(value: Any) -> float | None:
+        """Coerce a travel-time form field; blank/None means "use the fallback"."""
+        if value is None or value == "":
+            return None
+        try:
+            return max(1.0, min(60.0, float(value)))
+        except (TypeError, ValueError):
+            raise vol.Invalid("must be a number of seconds between 1 and 60")
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the options."""
-        if user_input is not None:
-            return self.async_create_entry(
-                data={
-                    CONF_ENABLE_COVER_CONTROL: user_input[CONF_ENABLE_COVER_CONTROL],
-                }
-            )
+        """Manage the options: cover-control toggle + fallback travel time."""
+        current = self.config_entry.options
 
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
+        def _schema() -> vol.Schema:
+            return vol.Schema(
                 {
                     vol.Required(
                         CONF_ENABLE_COVER_CONTROL,
-                        default=self.config_entry.options.get(
-                            CONF_ENABLE_COVER_CONTROL, False
-                        ),
+                        default=current.get(CONF_ENABLE_COVER_CONTROL, False),
                     ): bool,
+                    vol.Required(
+                        CONF_COVER_SAFETY_TIMEOUT,
+                        default=current.get(
+                            CONF_COVER_SAFETY_TIMEOUT,
+                            DEFAULT_COVER_SAFETY_TIMEOUT,
+                        ),
+                    ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=60.0)),
                 }
-            ),
+            )
+
+        if user_input is not None:
+            self._enable_cover_control = bool(user_input[CONF_ENABLE_COVER_CONTROL])
+            self._fallback_travel = float(user_input[CONF_COVER_SAFETY_TIMEOUT])
+            # Preserve any previously stored per-cover overrides even when cover
+            # control is being toggled off (they only take effect when enabled),
+            # and when no covers are currently discoverable (offline gateway).
+            existing = self.config_entry.options.get(CONF_COVER_TRAVEL)
+            kept: dict[str, dict[str, float]] = {}
+            if isinstance(existing, dict):
+                kept = {k: dict(v) for k, v in existing.items() if isinstance(v, dict)}
+            if self._enable_cover_control and self._discovered_covers():
+                self._kept_overrides = kept
+                return await self.async_step_travel()
+            return self._create_options(kept)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_schema(),
         )
+
+    async def async_step_travel(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect optional per-cover, per-direction travel-time overrides."""
+        covers = self._discovered_covers()
+        current_overrides: dict[str, Any] = (
+            self.config_entry.options.get(CONF_COVER_TRAVEL) or {}
+        )
+
+        if user_input is not None:
+            merged: dict[str, dict[str, float]] = {}
+            for cover_key, _name, _table, _device in covers:
+                entry: dict[str, float] = {}
+                ext = self._travel_field(user_input.get(f"extend_{cover_key}"))
+                ret = self._travel_field(user_input.get(f"retract_{cover_key}"))
+                if ext is not None:
+                    entry["extend"] = ext
+                if ret is not None:
+                    entry["retract"] = ret
+                if entry:
+                    merged[cover_key] = entry
+            # Carry overrides for covers not currently discovered so a temporary
+            # disconnect does not wipe them.
+            kept = getattr(self, "_kept_overrides", {})
+            for key, val in kept.items():
+                if key not in merged:
+                    merged[key] = dict(val)
+            return self._create_options(merged)
+
+        fields: dict[Any, Any] = {}
+        for cover_key, _name, _table, _device in covers:
+            prev = current_overrides.get(cover_key) or {}
+            fields[vol.Optional(
+                f"extend_{cover_key}",
+                default=prev.get("extend"),
+            )] = self._travel_field
+            fields[vol.Optional(
+                f"retract_{cover_key}",
+                default=prev.get("retract"),
+            )] = self._travel_field
+
+        return self.async_show_form(
+            step_id="travel",
+            data_schema=vol.Schema(fields),
+        )
+
+    def _create_options(self, cover_travel: dict[str, dict[str, float]]) -> ConfigFlowResult:
+        """Build and persist the options entry.
+
+        Merges onto the existing options so unrelated keys (e.g. the bonded
+        BLE source the coordinator persists there) survive a save of this form.
+        """
+        options = {
+            **self.config_entry.options,
+            CONF_ENABLE_COVER_CONTROL: self._enable_cover_control,
+            CONF_COVER_SAFETY_TIMEOUT: self._fallback_travel,
+        }
+        if cover_travel:
+            options[CONF_COVER_TRAVEL] = cover_travel
+        else:
+            options.pop(CONF_COVER_TRAVEL, None)
+        return self.async_create_entry(data=options)
+
