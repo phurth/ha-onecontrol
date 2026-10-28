@@ -3350,14 +3350,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 table_id=0,
                 device_count=device_count,
             )
-            _LOGGER.debug(
-                "CAN BLE: gateway info updated — %d sources discovered, %d invalid Function 0x0000 sources, reported device_count=%s",
-                len(self._can_device_types),
-                len(self._invalid_can_sources),
-                self.gateway_info.device_count,
-            )
             self._last_event_time = time.monotonic()
             if changed:
+                _LOGGER.debug(
+                    "CAN BLE: gateway info updated — %d sources discovered, %d invalid Function 0x0000 sources, reported device_count=%s",
+                    len(self._can_device_types),
+                    len(self._invalid_can_sources),
+                    self.gateway_info.device_count,
+                )
                 self.async_set_updated_data(self._build_data())
             return
 
@@ -3383,10 +3383,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.device_names[_device_key(0, src)] = label
             # If gateway info is present, keep the authoritative device count from the gateway
             if self.gateway_info is not None:
+                device_count = max(self.gateway_info.device_count, len(self._can_device_types))
+                if device_count == self.gateway_info.device_count:
+                    return
                 self.gateway_info = GatewayInformation(
                     protocol_version=self.gateway_info.protocol_version,
                     table_id=0,
-                    device_count=max(self.gateway_info.device_count, len(self._can_device_types)),
+                    device_count=device_count,
                 )
                 _LOGGER.debug(
                     "CAN BLE: gateway device count refreshed — discovered=%d sources, invalid Function 0x0000 sources=%d, effective device_count=%d",

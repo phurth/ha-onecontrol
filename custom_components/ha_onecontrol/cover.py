@@ -98,16 +98,6 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
         | CoverEntityFeature.STOP
     )
 
-    @property
-    def supported_features(self) -> int:
-        """Return supported features for this cover entity."""
-        _LOGGER.debug(
-            "Cover supported_features for %s = %s",
-            self._key,
-            int(self._attr_supported_features),
-        )
-        return int(self._attr_supported_features)
-
     def __init__(
         self,
         coordinator: OneControlCoordinator,
@@ -138,9 +128,7 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
     def available(self) -> bool:
         # Cover controls should remain available once the device has been
         # discovered, and while the gateway link is connected.
-        available = self._key in self.coordinator.covers or self.coordinator.connected
-        _LOGGER.debug("Cover available for %s = %s", self._key, available)
-        return available
+        return self._key in self.coordinator.covers or self.coordinator.connected
 
     @property
     def is_closed(self) -> bool | None:

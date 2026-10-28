@@ -390,9 +390,7 @@ class OneControlTankSensor(_OneControlSensorBase):
     @property
     def native_value(self) -> int | None:
         tank = self.coordinator.tanks.get(self._key)
-        value = tank.level if tank else None
-        _LOGGER.debug("Tank sensor %s native_value=%s", self._key, value)
-        return value
+        return tank.level if tank else None
 
     async def async_will_remove_from_hass(self) -> None:
         self._unsub()
