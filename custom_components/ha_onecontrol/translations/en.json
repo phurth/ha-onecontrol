@@ -52,9 +52,19 @@
     "step": {
       "init": {
         "title": "OneControl Options",
-        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\nOnly enable this if you understand and accept that risk.",
+        "description": "Motor control of awnings and slides is **disabled by default**.\\n\\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\\n\\n**Travel time** is how long one open/close press runs the motor. Set a fallback here and, if this coach has more than one cover, tick the box to set a per-cover value for each. A failsafe safety stop is derived from the travel time and applied automatically, so a dropped stop command cannot leave a motor running indefinitely.\\n\\nOnly enable cover control if you understand and accept the risk.",
         "data": {
-          "enable_cover_control": "Enable awning/slide (cover) control"
+          "enable_cover_control": "Enable awning/slide (cover) control",
+          "cover_safety_timeout": "Cover travel time, fallback (seconds)",
+          "configure_cover_travel": "Set a travel time for each cover"
+        }
+      },
+      "travel": {
+        "title": "Per-Cover Travel Times",
+        "description": "Travel time for **{name}** (cover {index} of {total}). Leave a field blank to use the fallback travel time. These pages are only offered while the gateway has discovered the covers; stored values are kept for covers that are offline.",
+        "data": {
+          "extend": "Extend time (seconds)",
+          "retract": "Retract time (seconds)"
         }
       }
     }

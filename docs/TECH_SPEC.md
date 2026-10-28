@@ -308,15 +308,132 @@ a `SESSION_HEARTBEAT` (0x44) every 500 ms. (The official app instead lets the
 session lapse and re-opens it with a fresh seed/key — `TendCoreSession` — but
 the 0x44 heartbeat path is what has been observed holding the session open here.)
 
-### Safety timeout
+### Travel time + derived safety ceiling
 
 Repeating open/close commands would run the motor indefinitely if a STOP frame
-is ever dropped (BLE drop, stuck button, session loss). Each cover repeater
-records a start timestamp and force-sends a STOP once
-`_COVER_SAFETY_TIMEOUT_S` (6.0 s) has elapsed without an explicit STOP, logging
-`CAN BLE: cover safety timeout … — sending STOP` (WARNING). Added
-(2026-09-03) after a runaway awning event. Change only `_COVER_SAFETY_TIMEOUT_S`
-to alter the limit.
+is ever dropped (BLE drop, stuck button, session loss). Two distinct notions
+are therefore kept separate:
+
+- **Travel time** — how long one open/close press runs the motor.  The fallback
+  is the per-entry option `cover_safety_timeout` (default 6.0 s, clamped 1–60 s),
+  with optional per-cover, per-direction overrides under `cover_travel`
+  (`{"0c:06": {"extend": 30.0, "retract": 28.0}}`).  Both are read and clamped
+  at the point of use in the coordinator, not only in the form schema.
+- **Safety ceiling** — the failsafe bound, *derived* from the travel time and
+  never entered by hand: `ceiling = travel + clamp(0.2 × travel, 2 s, 5 s)`,
+  hard-capped at 90 s.  It is enforced OUTSIDE the repeater loop via
+  `asyncio.timeout(ceiling)`, with a `finally` that force-sends STOP, so a
+  wedged loop, a generation bump that never lands, or a reconnect-spin still
+  stops the motor.  Logging is `CAN BLE: cover safety ceiling … exceeded —
+  force-stopping` (WARNING).
+
+### When the travel clock starts
+
+Travel time is measured from the **first COMMAND actually written**, not from
+the button press.  Opening the REMOTE_CONTROL session costs anything from under
+a second to ~3.5 s on the X180T, and charging that to the travel window made a
+5 s setting run ~3.6 s on one press and barely move on the next.  Each repeater
+therefore runs in two phases, both bounded from outside their loop:
+
+1. **Start** (`COVER_START_TIMEOUT_S`, 10 s) — wait for the link, ensure the
+   session, write the first COMMAND.  If the motor cannot be started inside
+   that bound, a bounded STOP is sent and the repeater exits.
+2. **Travel** — resend every `_COVER_COMMAND_REPEAT_S` until the travel time
+   has elapsed since that first COMMAND.  The derived ceiling is armed here, at
+   the first COMMAND, so it bounds the *movement* rather than press-to-stop.
+
+### Failsafe STOP is itself bounded
+
+Every STOP on a failsafe path (start-timeout, travel-complete, ceiling,
+`finally`) goes through a bounded send (`COVER_STOP_TIMEOUT_S`, 2 s).  Those
+paths run precisely when something already failed — possibly a hung BLE write —
+and an unbounded await there would stall the same way, preventing the session
+release and task teardown in `finally` from running at all.
+
+A user STOP also bumps the generation counter, so a repeater that outlives its
+cancellation exits instead of resending a direction behind the STOP.
+
+Added (2026-09-03) after a runaway awning event; reshaped (2026-10-04) to split
+travel time from the derived ceiling per multi-cover review feedback; travel
+clock and bounded failsafe (2026-10-25) after multi-cover rig testing.
+
+### Releasing sessions: the panel must get the device back
+
+A REMOTE_CONTROL session belongs to whoever opened it until it is explicitly
+closed (request `0x45`), and the device keeps it even when the BLE link drops —
+dropping the heartbeat is not enough, and neither is losing the connection.  A
+session left open makes the coach's physical panel refuse that device until the
+gateway is power-cycled, while Home Assistant keeps working, which makes it look
+like a control has simply died.
+
+Every COMMAND needs a session, so every COMMAND path must give it back.  The
+cover repeater closes its own session in `finally` (see above).  Everything else
+is released by a **janitor**, not on the command path:
+
+- `_rc_session_dirty` records each device with an open, unreleased session and
+  the monotonic time of the last COMMAND written in it.  It survives a
+  disconnect on purpose — the debt outlives the link.
+- `_note_rc_session_command()` refreshes that timestamp from every COMMAND site
+  (relay, relay retry, queued replay, cover command).  It runs **before** the
+  frame is written, not after: a stamp taken afterwards leaves the previous
+  command's grace period in place for the duration of the write, so a janitor
+  tick landing inside that write can close the session out from under it.  A
+  fresh COMMAND also clears the previous confirmation, which is why the
+  confirmation is recorded after the write.
+- `_rc_session_janitor()` ticks every `RC_SESSION_JANITOR_INTERVAL_S` (0.5 s) and
+  `_async_reap_idle_rc_sessions()` closes a device once it has nothing left to
+  hold the session for and no cover movement is using it.  What counts as "left"
+  depends on the feedback: a COMMAND the device confirmed from DEVICE_STATUS is
+  released after `RC_SESSION_CONFIRMED_RELEASE_S` (0.75 s — the device has
+  already applied it), an unconfirmed one after `RC_SESSION_IDLE_RELEASE_S`
+  (2 s).  Both are measured from the write, and a fresh COMMAND clears the
+  previous confirmation.  "A cover movement holds this session" is decided on
+  the device half of the `"tt:dd"` cover key, the same identity
+  `_cover_command_tasks` and `covers` use.
+
+  The window is deliberately sized by what the COMMAND needs, not by how long
+  confirmation may take.  Holding the session is what locks the coach's physical
+  panel out, so a session kept for the length of the relay verification window
+  (`_CAN_COMMAND_VERIFY_TIMEOUT_S` / `..._V1_S`, 3 s and 5 s) made the panel
+  ignore presses for seconds after every Home Assistant toggle — the first cut
+  of this fix did exactly that, and users read it as a 3–5 s lag.  Confirmation
+  itself does not need the session: DEVICE_STATUS broadcast frames arrive
+  regardless of who holds it.
+- A device with a COMMAND still waiting for its feedback is not reaped either.
+  `_rc_session_awaiting_confirmation` counts the commands claiming a device
+  (`_claim_rc_session()` / `_release_rc_session_claim()`) and the janitor skips
+  anything with a claim.  It is taken **before** `_ensure_remote_control_session`
+  and dropped when the verification window — first attempt and retry — is over.
+  The unconfirmed grace (2 s) is shorter than the V1 relay verify window (5 s),
+  so without this the release could race the confirmation the session exists
+  for.  It is a count rather than a flag because a second toggle can start
+  inside the first one's window; a flag would let the first one finishing
+  release the claim the second still needs.  Releasing a device clears any
+  claim it still holds.
+- The janitor decides and closes under one lock.  On a V1 gateway the seed/key
+  handshake holds `_rc_session_lock` for about a second, so a janitor that
+  decided to reap before taking the lock could get it after a re-toggle had
+  already claimed the device and written its COMMAND — and send `0x45` right
+  behind that write.  `_async_reap_idle_rc_sessions()` therefore checks its skip
+  conditions before the lock (cheap rejection) **and again while holding it**,
+  then calls `_async_close_rc_session_locked()`.
+- The janitor also starts with the CAN keepalive, so sessions owed from before a
+  reconnect are closed on the next connect, and `async_disconnect()` releases
+  everything still owed before the link goes.  That teardown sweep is bounded
+  **once** (`RC_SESSION_RELEASE_TIMEOUT_S`) for all of it — a per-device bound
+  lets several owed sessions hold up an unload by a multiple of the timeout —
+  and anything not released keeps its debt for the next janitor pass.
+
+**Do not close a session on the command path.**  v1.0.48 did exactly that after
+relay commands and had to be reverted: the device began terminating sessions
+with reason `0x0E`, relay COMMANDs were never confirmed from DEVICE_STATUS, and
+switch state reverted a few seconds later.  Closing *after* the command has been
+confirmed, from outside the command path, avoids that.
+
+A close that fails keeps its debt and is re-stamped, so the next janitor pass
+retries after another grace period instead of spinning on a failing write.
+Closing a device that a previous command left behind does not touch the live
+session's heartbeat.
 
 ## 11. Evolution Notes (Commit History)
 

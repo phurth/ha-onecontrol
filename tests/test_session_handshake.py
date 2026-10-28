@@ -23,6 +23,13 @@ def _coordinator(**attrs: object) -> OneControlCoordinator:
         _rc_session_target=None,
         _rc_session_sid_bytes=b"\x00\x04",
         _rc_heartbeat_task=None,
+        # Release bookkeeping added with the session janitor: a successful
+        # handshake records the device and starts the janitor, which this
+        # harness short-circuits with an already-running fake task.
+        _rc_session_dirty={},
+        _rc_session_confirmed=set(),
+        _rc_session_awaiting_confirmation={},
+        _rc_janitor_task=SimpleNamespace(done=lambda: False),
     )
     defaults.update(attrs)
     for name, value in defaults.items():
