@@ -29,6 +29,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
@@ -38,6 +39,11 @@ if TYPE_CHECKING:
     from .coordinator import OneControlCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# Address reported while a function-based entity's device is not in the
+# gateway's current table.  Device 0 is the "no device" sentinel, so this
+# matches no state held by the coordinator.
+_NO_ADDRESS: tuple[int, int] = (0, 0)
 
 
 def legacy_unique_id(
@@ -56,6 +62,11 @@ class OneControlDeviceEntity:
     stored by ``CoordinatorEntity.__init__``).  ``_table_id``, ``_device_id``
     and ``_key`` are then properties that always reflect the device's *current*
     address.
+
+    A function-based entity whose device is no longer in the gateway's table
+    has no address: it is unavailable and refuses commands.  Classes that
+    define their own ``available`` must include ``_oc_resolved`` in it, and
+    command methods must call :meth:`_oc_require_address` first.
     """
 
     _oc_ident: str | None = None
@@ -86,11 +97,31 @@ class OneControlDeviceEntity:
     # ── Current address ───────────────────────────────────────────────
 
     def _oc_address(self) -> tuple[int, int]:
-        if self._oc_ident is not None:
-            current = self.coordinator.identity_address(self._oc_ident)
-            if current is not None:
-                return current
-        return self._oc_origin
+        if self._oc_ident is None:
+            # Address-based entity: the address it was created with is its identity.
+            return self._oc_origin
+        current = self.coordinator.identity_address(self._oc_ident)
+        # Never fall back to the original address here: after a table rebuild
+        # that row may belong to a different device.
+        return current if current is not None else _NO_ADDRESS
+
+    @property
+    def _oc_resolved(self) -> bool:
+        """Return True while this entity's device has a current address."""
+        if self._oc_ident is None:
+            return True
+        return self.coordinator.identity_address(self._oc_ident) is not None
+
+    @property
+    def available(self) -> bool:
+        return self._oc_resolved and super().available
+
+    def _oc_require_address(self) -> None:
+        """Raise instead of sending a command to a device that has no address."""
+        if not self._oc_resolved:
+            raise HomeAssistantError(
+                "This device is not in the gateway's current device table"
+            )
 
     @property
     def _table_id(self) -> int:
@@ -166,6 +197,10 @@ class DeviceEntityAdder:
         self._async_add_entities = async_add_entities
         self._domain = domain
         self._seen: set[tuple[str, str]] = set()
+        # Identity each handled address had when it was handled (None = keyed
+        # by address).  A different identity later means the gateway gave the
+        # row to another device, which still needs its own entity.
+        self._seen_ident: dict[tuple[str, str], str | None] = {}
 
     @callback
     def build(
@@ -183,21 +218,25 @@ class DeviceEntityAdder:
             return []
         coordinator = self._coordinator
         address_token = (slot, f"{table_id:02x}:{device_id:02x}")
-        if address_token in self._seen:
+        if address_token in self._seen and self._seen_ident[
+            address_token
+        ] == coordinator.entity_identity(table_id, device_id):
             return []
         if not coordinator.device_entity_ready(table_id, device_id):
             return []
 
         ident = coordinator.entity_identity(table_id, device_id)
+        if ident is None and address_token in self._seen:
+            return []
+        self._seen.add(address_token)
+        self._seen_ident[address_token] = ident
         if ident is not None:
             ident_token = (slot, ident)
             if ident_token in self._seen:
                 # Same logical device at a new address.  The existing entity
                 # follows it; just remember the address.
-                self._seen.add(address_token)
                 return []
             self._seen.add(ident_token)
-        self._seen.add(address_token)
 
         entities = [
             cls(coordinator, self._address, table_id, device_id) for cls in classes

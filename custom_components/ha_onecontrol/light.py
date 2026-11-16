@@ -120,7 +120,7 @@ class OneControlDimmableLight(OneControlDeviceEntity, CoordinatorEntity[OneContr
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.dimmable_lights
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.dimmable_lights
 
     @property
     def is_on(self) -> bool | None:
@@ -147,6 +147,7 @@ class OneControlDimmableLight(OneControlDeviceEntity, CoordinatorEntity[OneContr
         return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         brightness = kwargs.get(ATTR_BRIGHTNESS)
         if brightness is None:
             # Restore last active brightness — mirrors Android lastKnownDimmableBrightness.
@@ -191,6 +192,7 @@ class OneControlDimmableLight(OneControlDeviceEntity, CoordinatorEntity[OneContr
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         light = self.coordinator.dimmable_lights.get(self._key)
         if light:
             self.coordinator.dimmable_lights[self._key] = DimmableLight(
@@ -263,7 +265,7 @@ class OneControlRgbLight(OneControlDeviceEntity, CoordinatorEntity[OneControlCoo
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.rgb_lights
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.rgb_lights
 
     @property
     def is_on(self) -> bool | None:
@@ -293,6 +295,7 @@ class OneControlRgbLight(OneControlDeviceEntity, CoordinatorEntity[OneControlCoo
         return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         light = self.coordinator.rgb_lights.get(self._key)
 
         # Resolve RGB color — mirrors Android lastKnownRgbColor fallback:
@@ -340,6 +343,7 @@ class OneControlRgbLight(OneControlDeviceEntity, CoordinatorEntity[OneControlCoo
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         light = self.coordinator.rgb_lights.get(self._key)
         if light:
             self.coordinator.rgb_lights[self._key] = RgbLight(

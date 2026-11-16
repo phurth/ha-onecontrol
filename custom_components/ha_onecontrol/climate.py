@@ -133,7 +133,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._zone is not None
+        return self._oc_resolved and self.coordinator.data_healthy and self._zone is not None
 
     @property
     def _zone(self) -> HvacZone | None:
@@ -250,6 +250,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         return attrs
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return
@@ -274,6 +275,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         )
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return
@@ -298,6 +300,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         )
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return
@@ -353,6 +356,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         )
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return

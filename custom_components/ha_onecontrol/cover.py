@@ -104,7 +104,9 @@ class OneControlCover(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordi
     def available(self) -> bool:
         # Cover controls should remain available once the device has been
         # discovered, and while the gateway link is connected.
-        return self._key in self.coordinator.covers or self.coordinator.connected
+        return self._oc_resolved and (
+            self._key in self.coordinator.covers or self.coordinator.connected
+        )
 
     @property
     def is_closed(self) -> bool | None:
@@ -155,16 +157,19 @@ class OneControlCover(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordi
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover (extend motor)."""
+        self._oc_require_address()
         _LOGGER.info("Cover open requested key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         await self.coordinator.async_cover(self._table_id, self._device_id, 0x01)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close the cover (retract motor)."""
+        self._oc_require_address()
         _LOGGER.debug("Cover close key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         await self.coordinator.async_cover(self._table_id, self._device_id, 0x02)
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Stop the cover motor."""
+        self._oc_require_address()
         _LOGGER.debug("Cover stop key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         await self.coordinator.async_cover(self._table_id, self._device_id, 0x00)
 

@@ -95,7 +95,7 @@ class OneControlSwitch(OneControlDeviceEntity, CoordinatorEntity[OneControlCoord
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.relays
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.relays
 
     @property
     def is_on(self) -> bool | None:
@@ -122,6 +122,7 @@ class OneControlSwitch(OneControlDeviceEntity, CoordinatorEntity[OneControlCoord
         return 20.0 if self.coordinator.is_can_ble_gateway else SWITCH_STATE_GUARD_S
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         _LOGGER.debug("Switch turn_on key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         self._optimistic_is_on = True
         self._optimistic_until = time.monotonic() + self._guard_window()
@@ -138,6 +139,7 @@ class OneControlSwitch(OneControlDeviceEntity, CoordinatorEntity[OneControlCoord
         await self.coordinator.async_switch(self._table_id, self._device_id, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         _LOGGER.debug("Switch turn_off key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         self._optimistic_is_on = False
         self._optimistic_until = time.monotonic() + self._guard_window()
@@ -221,7 +223,7 @@ class OneControlGeneratorSwitch(OneControlDeviceEntity, CoordinatorEntity[OneCon
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.generators
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.generators
 
     @property
     def is_on(self) -> bool | None:
@@ -231,9 +233,11 @@ class OneControlGeneratorSwitch(OneControlDeviceEntity, CoordinatorEntity[OneCon
         return gen.state in (1, 2, 3)  # Priming, Starting, or Running
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         await self.coordinator.async_set_generator(self._table_id, self._device_id, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         await self.coordinator.async_set_generator(self._table_id, self._device_id, False)
 
     async def async_will_remove_from_hass(self) -> None:

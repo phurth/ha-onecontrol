@@ -648,6 +648,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._identity_mode: str | None = None
         self._identity_wait_started: dict[int, float] = {}
         self._identity_wait_warned: set[int] = set()
+        self._identity_entities_exist: bool | None = None
+        # "tt:dd" → token last committed for that row; outlives invalidation
+        # so a rebuilt table can be compared with its previous contents.
+        self._identity_last_by_key: dict[str, str] = {}
         # (platform domain, unique_id) of loaded entities that use an
         # address-based unique ID; their registry entries must not be re-keyed.
         self.live_legacy_unique_ids: set[tuple[str, str]] = set()
@@ -808,8 +812,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._identity_mode = "legacy"
             return True
         if table_id == 0:
-            # No table: nothing to wait for.  entity_identity() returns None,
-            # so the entity is keyed by address.
+            # IDS-CAN convention: no device table, so there is no metadata to
+            # wait for and the entity is keyed by address.  Settle on
+            # address-based IDs for the session, as the CAN BLE branch does —
+            # unless this install already has function-based entities, which
+            # address-based ones would duplicate.
+            if self._identity_mode is None and not self._has_identity_entities():
+                self._identity_mode = "legacy"
             return True
 
         current = self._current_table_id()
@@ -851,12 +860,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     def _has_identity_entities(self) -> bool:
-        """Return True if the registry already holds function-based entities."""
-        registry = er.async_get(self.hass)
-        return any(
-            _IDENTITY_UNIQUE_ID_RE.search(entity.unique_id or "")
-            for entity in er.async_entries_for_config_entry(registry, self.entry.entry_id)
-        )
+        """Return True if the registry already holds function-based entities.
+
+        Scanned once per session: this is asked for every status event while
+        metadata is overdue, and the answer cannot turn from True to False
+        while the integration is loaded.  (A False answer is only ever used to
+        settle on address-based IDs, after which it is not asked again.)
+        """
+        if self._identity_entities_exist is None:
+            registry = er.async_get(self.hass)
+            self._identity_entities_exist = any(
+                _IDENTITY_UNIQUE_ID_RE.search(entity.unique_id or "")
+                for entity in er.async_entries_for_config_entry(
+                    registry, self.entry.entry_id
+                )
+            )
+        return self._identity_entities_exist
 
     def entity_identity(self, table_id: int, device_id: int) -> str | None:
         """Return the identity token for a device, or None to use its address."""
@@ -867,7 +886,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._identity_by_key.get(_device_key(table_id, device_id))
 
     def identity_address(self, ident: str) -> tuple[int, int] | None:
-        """Return the current (table_id, device_id) for an identity token."""
+        """Return the current (table_id, device_id) for an identity token.
+
+        None means the device is not in the gateway's current table (it was
+        removed, or its function changed); its entity is then unavailable.
+        """
         return self._identity_address.get(ident)
 
     def _drop_identity_table(self, table_id: int) -> None:
@@ -899,13 +922,43 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._identity_by_key[_device_key(table_id, device_id)] = token
         self._identity_tables.add(table_id)
 
+        # A row that now holds a different device (or none) still has the
+        # previous occupant's state cached under its address.  Drop it, or the
+        # new occupant would show that state and platforms sweeping the caches
+        # would create an entity of the previous occupant's type for it.
+        prefix = f"{table_id:02x}:"
+        for key in [k for k in self._identity_last_by_key if k.startswith(prefix)]:
+            if self._identity_by_key.get(key) != self._identity_last_by_key[key]:
+                del self._identity_last_by_key[key]
+                self._forget_device_state(key)
+        for key, token in self._identity_by_key.items():
+            if key.startswith(prefix):
+                self._identity_last_by_key[key] = token
+
+    def _forget_device_state(self, key: str) -> None:
+        """Drop everything cached for the device address *key* ("tt:dd")."""
+        for store in (
+            self.relays, self.dimmable_lights, self.rgb_lights, self.covers,
+            self.hvac_zones, self.tanks, self.device_online, self.device_locks,
+            self.generators, self.hour_meters, self.levelers, self.tank_alerts,
+            self.observed_hvac_capability, self._last_dtc_codes,
+        ):
+            store.pop(key, None)
+
     def _repoint_identities(self, table_id: int) -> None:
-        """Point every identity token found in *table_id* at its address there."""
+        """Point every identity token found in *table_id* at its address there.
+
+        Tokens that are no longer in the table lose their address.  Their old
+        row may belong to a different device now, so their entities must not
+        keep reading or commanding it.
+        """
         prefix = f"{table_id:02x}:"
         moved = 0
+        present: set[str] = set()
         for key, token in self._identity_by_key.items():
             if not key.startswith(prefix):
                 continue
+            present.add(token)
             address = (table_id, int(key[3:], 16))
             previous = self._identity_address.get(token)
             if previous == address:
@@ -917,6 +970,19 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Device %s moved %02X:%02X → %02X:%02X",
                     self.device_names.get(key, token),
                     previous[0], previous[1], address[0], address[1],
+                )
+        is_current = table_id == self._current_table_id()
+        for token, address in list(self._identity_address.items()):
+            if token in present:
+                continue
+            # Gone from this table — or, when this is the gateway's current
+            # table, still pointing into a table that is no longer in use.
+            if address[0] == table_id or is_current:
+                del self._identity_address[token]
+                _LOGGER.info(
+                    "Device %s is no longer in table %d (was %02X:%02X); "
+                    "its entities are unavailable",
+                    token, table_id, address[0], address[1],
                 )
         if moved:
             _LOGGER.warning(

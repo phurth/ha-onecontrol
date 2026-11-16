@@ -104,8 +104,16 @@ class FakeCoordinatorEntity:
     def __class_getitem__(cls, item: object) -> type:
         return cls
 
+    @property
+    def available(self) -> bool:
+        return True
+
     def async_write_ha_state(self) -> None:
         pass
+
+
+class FakeHomeAssistantError(Exception):
+    pass
 
 
 class _FakeEntity:
@@ -163,6 +171,7 @@ def platforms():
         setattr(module, attr, value)
 
     patch("homeassistant.helpers.update_coordinator", "CoordinatorEntity", FakeCoordinatorEntity)
+    patch("homeassistant.exceptions", "HomeAssistantError", FakeHomeAssistantError)
     for component, cls in (
         ("switch", "SwitchEntity"),
         ("light", "LightEntity"),
@@ -214,6 +223,10 @@ def make_coordinator() -> OneControlCoordinator:
     c._identity_mode = None
     c._identity_wait_started = {}
     c._identity_wait_warned = set()
+    c._identity_entities_exist = None
+    c._identity_last_by_key = {}
+    c.device_online, c.device_locks = {}, {}
+    c.observed_hvac_capability, c._last_dtc_codes = {}, {}
     c.hass = None
     c.entry = SimpleNamespace(entry_id="e1")
     c.live_legacy_unique_ids = set()
@@ -297,6 +310,16 @@ class Rig:
             c.device_names[f"{table_id:02x}:{device_id:02x}"] = name
         c._metadata_loaded_tables.add(table_id)
         c._commit_identity_table(table_id)
+
+    def invalidate_metadata(self, table_id: int) -> None:
+        """Mimic the "Metadata CRC changed … invalidating table" path."""
+        c = self.coordinator
+        prefix = f"{table_id:02x}:"
+        for key in [k for k in c._metadata_raw if k.startswith(prefix)]:
+            del c._metadata_raw[key]
+            c.device_names.pop(key, None)
+        c._drop_identity_table(table_id)
+        c._metadata_loaded_tables.discard(table_id)
 
     def boot(self, table_id: int, layout: dict) -> None:
         self.gateway(table_id)
@@ -480,6 +503,117 @@ def test_slow_metadata_never_duplicates_function_based_entities(platforms, monke
 def test_can_ble_gateways_keep_address_ids_without_delay(platforms) -> None:
     rig = Rig(platforms)
     rig.coordinator._can_ble_confirmed = True
+    rig._emit(rig.coordinator.relays, RelayStatus(table_id=0, device_id=0x86))
+    assert rig.coordinator.identity_mode == "legacy"
+    assert (("switch", PLATFORM_DOMAIN, f"{MAC}_switch_86")) in rig.registry.entries
+
+
+def test_removed_device_never_drives_the_device_that_took_its_row(platforms) -> None:
+    """Same table_id, rebuilt metadata: the pump is gone and its row is reused."""
+    rig = Rig(platforms)
+    rig.boot(0xDC, TABLE_DC)
+    pump = rig.entity("switch.water_pump")
+    awning = rig.entity("switch.awning_light")
+    fresh = rig.entity("sensor.fresh_tank_level")
+    assert (pump._device_id, awning._device_id) == (0x09, 0x0A)
+    before = dict(rig.registry.entries)
+
+    # Water Pump is removed; every later device moves up one row, so the
+    # Awning Light now sits where the pump was.
+    devices = [d for d in DEVICES if d[3] != "Water Pump"]
+    rebuilt = {0x01 + i: dev for i, dev in enumerate(devices)}
+    rig.invalidate_metadata(0xDC)
+    rig.commit_metadata(0xDC, rebuilt)
+    rig.status(0xDC, rebuilt)
+
+    assert rig.registry.entries == before, "nothing created or re-keyed"
+    assert (awning._table_id, awning._device_id) == (0xDC, 0x09)
+    assert awning.available
+    assert fresh.available
+
+    assert rig.coordinator.identity_address("fn0005_00") is None
+    assert not pump.available
+    assert pump._key not in rig.coordinator.relays
+    with pytest.raises(FakeHomeAssistantError):
+        asyncio.run(pump.async_turn_on())
+    with pytest.raises(FakeHomeAssistantError):
+        asyncio.run(pump.async_turn_off())
+    assert rig.coordinator.sent == []
+
+    # The pump comes back on a different row: the same entity resumes there.
+    rig.invalidate_metadata(0xDC)
+    restored = dict(rebuilt)
+    restored[0x20] = (5, 0, "relay", "Water Pump")
+    rig.commit_metadata(0xDC, restored)
+    rig.status(0xDC, restored)
+    assert rig.registry.entries == before
+    assert pump.available and (pump._table_id, pump._device_id) == (0xDC, 0x20)
+    asyncio.run(pump.async_turn_on())
+    assert rig.coordinator.sent == [("switch", 0xDC, 0x20, True)]
+
+
+def test_new_device_on_a_reused_row_gets_its_own_entity(platforms) -> None:
+    rig = Rig(platforms)
+    rig.boot(0xDC, TABLE_DC)
+    pump = rig.entity("switch.water_pump")
+    before = set(rig.all_entity_ids())
+
+    # The pump's function changes: to the integration it is a new device.
+    rebuilt = dict(TABLE_DC)
+    rebuilt[0x09] = (6, 0, "relay", "Gas Water Heater")
+    rig.invalidate_metadata(0xDC)
+    rig.commit_metadata(0xDC, rebuilt)
+    rig.status(0xDC, rebuilt)
+
+    assert rig.all_entity_ids() - before == {"switch.gas_water_heater"}
+    heater = rig.entity("switch.gas_water_heater")
+    assert heater._attr_unique_id == f"{MAC}_switch_fn0006_00"
+    assert (heater._table_id, heater._device_id) == (0xDC, 0x09)
+    assert not pump.available
+
+
+def test_device_missing_from_the_new_table_is_unavailable(platforms) -> None:
+    rig = Rig(platforms)
+    rig.boot(0xDB, TABLE_DB)
+    pump = rig.entity("switch.water_pump")
+
+    devices = [d for d in DEVICES if d[3] != "Water Pump"]
+    table_dc = {0x01 + i: dev for i, dev in enumerate(devices)}
+    rig.gateway(0xDC)
+    rig.commit_metadata(0xDC, table_dc)
+    rig.status(0xDC, table_dc)
+
+    assert not pump.available
+    with pytest.raises(FakeHomeAssistantError):
+        asyncio.run(pump.async_turn_on())
+    assert rig.coordinator.sent == []
+
+
+def test_registry_is_scanned_once_while_metadata_is_overdue(platforms, monkeypatch) -> None:
+    registry = FakeRegistry()
+    Rig(platforms, registry).boot(0xDC, TABLE_DC)
+
+    second = Rig(platforms, registry)
+    scans = [0]
+    scan = coordinator_module.er.async_entries_for_config_entry
+
+    def counting(reg: object, entry_id: str) -> list:
+        scans[0] += 1
+        return scan(reg, entry_id)
+
+    monkeypatch.setattr(coordinator_module.er, "async_entries_for_config_entry", counting)
+    clock = [1000.0]
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: clock[0])
+    second.gateway(0xDC)
+    second.status(0xDC, TABLE_DC)
+    clock[0] += 3600
+    for _ in range(5):
+        second.status(0xDC, TABLE_DC)
+    assert scans[0] == 1
+
+
+def test_table_zero_device_settles_on_address_ids(platforms) -> None:
+    rig = Rig(platforms)
     rig._emit(rig.coordinator.relays, RelayStatus(table_id=0, device_id=0x86))
     assert rig.coordinator.identity_mode == "legacy"
     assert (("switch", PLATFORM_DOMAIN, f"{MAC}_switch_86")) in rig.registry.entries
