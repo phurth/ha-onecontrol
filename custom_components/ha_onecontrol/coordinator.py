@@ -652,6 +652,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # "tt:dd" → token last committed for that row; outlives invalidation
         # so a rebuilt table can be compared with its previous contents.
         self._identity_last_by_key: dict[str, str] = {}
+        # token → last address it resolved to; kept across suspension so a
+        # renumbering can still be reported once the table is rebuilt.
+        self._identity_last_address: dict[str, tuple[int, int]] = {}
         # (platform domain, unique_id) of loaded entities that use an
         # address-based unique ID; their registry entries must not be re-keyed.
         self.live_legacy_unique_ids: set[tuple[str, str]] = set()
@@ -900,6 +903,26 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for key in [k for k in self._identity_by_key if k.startswith(prefix)]:
             del self._identity_by_key[key]
 
+    def _suspend_identity_table(self, table_id: int) -> None:
+        """Take a table's devices out of service until its metadata is rebuilt.
+
+        Called when the gateway reports new metadata for a table we had
+        loaded.  Until the new metadata is committed, any row may already hold
+        a different device, so no entity may read or command through its old
+        address: the tokens lose their addresses (entities become unavailable
+        and refuse commands) and HVAC retries queued for the table's rows are
+        cancelled.  _repoint_identities restores the addresses on commit.
+        """
+        self._drop_identity_table(table_id)
+        for token, address in list(self._identity_address.items()):
+            if address[0] == table_id:
+                del self._identity_address[token]
+        prefix = f"{table_id:02x}:"
+        for key in [k for k in self._pending_hvac if k.startswith(prefix)]:
+            del self._pending_hvac[key]
+        for key in [k for k in self._hvac_retry_handles if k.startswith(prefix)]:
+            self._hvac_retry_handles.pop(key).cancel()
+
     def _rebuild_identity_table(self, table_id: int) -> None:
         """Derive identity tokens for a table from its committed metadata.
 
@@ -942,8 +965,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.hvac_zones, self.tanks, self.device_online, self.device_locks,
             self.generators, self.hour_meters, self.levelers, self.tank_alerts,
             self.observed_hvac_capability, self._last_dtc_codes,
+            self._pending_hvac, self._hvac_zone_states,
+            self._last_known_dimmable_brightness, self._last_known_rgb_color,
         ):
             store.pop(key, None)
+        retry = self._hvac_retry_handles.pop(key, None)
+        if retry is not None:
+            # Would otherwise fire at this address, i.e. at its new occupant.
+            retry.cancel()
 
     def _repoint_identities(self, table_id: int) -> None:
         """Point every identity token found in *table_id* at its address there.
@@ -960,8 +989,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             present.add(token)
             address = (table_id, int(key[3:], 16))
-            previous = self._identity_address.get(token)
-            if previous == address:
+            previous = self._identity_last_address.get(token)
+            self._identity_last_address[token] = address
+            if self._identity_address.get(token) == address:
                 continue
             self._identity_address[token] = address
             if previous is not None and previous[1] != address[1]:
@@ -5583,7 +5613,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if k.startswith(prefix):
                         del self._metadata_raw[k]
                         self.device_names.pop(k, None)
-                self._drop_identity_table(event.table_id)
+                self._suspend_identity_table(event.table_id)
                 self._metadata_requested_tables.discard(event.table_id)
                 self._metadata_loaded_tables.discard(event.table_id)
                 self._metadata_rejected_tables.discard(event.table_id)

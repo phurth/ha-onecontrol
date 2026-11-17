@@ -225,6 +225,9 @@ def make_coordinator() -> OneControlCoordinator:
     c._identity_wait_warned = set()
     c._identity_entities_exist = None
     c._identity_last_by_key = {}
+    c._identity_last_address = {}
+    c._pending_hvac, c._hvac_zone_states, c._hvac_retry_handles = {}, {}, {}
+    c._last_known_dimmable_brightness, c._last_known_rgb_color = {}, {}
     c.device_online, c.device_locks = {}, {}
     c.observed_hvac_capability, c._last_dtc_codes = {}, {}
     c.hass = None
@@ -318,7 +321,7 @@ class Rig:
         for key in [k for k in c._metadata_raw if k.startswith(prefix)]:
             del c._metadata_raw[key]
             c.device_names.pop(key, None)
-        c._drop_identity_table(table_id)
+        c._suspend_identity_table(table_id)
         c._metadata_loaded_tables.discard(table_id)
 
     def boot(self, table_id: int, layout: dict) -> None:
@@ -550,6 +553,78 @@ def test_removed_device_never_drives_the_device_that_took_its_row(platforms) -> 
     assert pump.available and (pump._table_id, pump._device_id) == (0xDC, 0x20)
     asyncio.run(pump.async_turn_on())
     assert rig.coordinator.sent == [("switch", 0xDC, 0x20, True)]
+
+
+class _Handle:
+    cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def test_devices_are_out_of_service_while_metadata_is_refetched(platforms) -> None:
+    """Between "Metadata CRC changed" and the next commit, rows are not trusted."""
+    rig = Rig(platforms)
+    rig.boot(0xDC, TABLE_DC)
+    c = rig.coordinator
+    before = dict(rig.registry.entries)
+    devices = [
+        rig.entity(eid) for eid in
+        ("switch.water_pump", "light.porch_light", "climate.main_climate_zone",
+         "cover.bedroom_slide", "sensor.fresh_tank_level")
+    ]
+    assert all(d.available for d in devices)
+    retry = _Handle()
+    c._pending_hvac["dc:06"] = object()
+    c._hvac_retry_handles["dc:06"] = retry
+
+    rig.invalidate_metadata(0xDC)
+
+    assert not any(d.available for d in devices)
+    for call in (
+        rig.entity("switch.water_pump").async_turn_on(),
+        rig.entity("light.porch_light").async_turn_off(),
+        rig.entity("cover.bedroom_slide").async_open_cover(),
+    ):
+        with pytest.raises(FakeHomeAssistantError):
+            asyncio.run(call)
+    assert c.sent == []
+    assert retry.cancelled and not c._pending_hvac and not c._hvac_retry_handles
+    # Status frames keep arriving in the window; they must not create anything.
+    rig.status(0xDC, TABLE_DC)
+    assert rig.registry.entries == before
+
+    rig.commit_metadata(0xDC, TABLE_DC)
+    assert all(d.available for d in devices)
+    assert rig.registry.entries == before
+    assert rig.entity("switch.water_pump")._device_id == 0x09
+
+
+def test_row_state_is_forgotten_when_its_occupant_changes(platforms) -> None:
+    rig = Rig(platforms)
+    rig.boot(0xDC, TABLE_DC)
+    c = rig.coordinator
+    stores = (
+        c._hvac_zone_states, c._last_known_dimmable_brightness,
+        c._last_known_rgb_color, c._pending_hvac,
+    )
+    for store in stores:
+        store["dc:09"] = store["dc:08"] = object()
+
+    rebuilt = dict(TABLE_DC)
+    rebuilt[0x09] = (6, 0, "relay", "Gas Water Heater")
+    rig.invalidate_metadata(0xDC)
+    # Queued after the invalidation, before the new metadata arrives.
+    retry_changed, retry_kept = _Handle(), _Handle()
+    c._hvac_retry_handles.update({"dc:09": retry_changed, "dc:08": retry_kept})
+    for store in stores:
+        store["dc:09"] = store["dc:08"] = object()
+    rig.commit_metadata(0xDC, rebuilt)
+
+    assert retry_changed.cancelled and "dc:09" not in c._hvac_retry_handles
+    assert not retry_kept.cancelled and "dc:08" in c._hvac_retry_handles
+    for store in stores:
+        assert "dc:09" not in store and "dc:08" in store
 
 
 def test_new_device_on_a_reused_row_gets_its_own_entity(platforms) -> None:
