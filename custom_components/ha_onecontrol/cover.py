@@ -28,8 +28,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
-from .helpers import is_valid_device_id
+from .coordinator import MetadataCommitted, OneControlCoordinator
+from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.events import CoverStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,46 +44,26 @@ async def async_setup_entry(
     coordinator: OneControlCoordinator = hass.data[DOMAIN][entry.entry_id]
     address = entry.data[CONF_ADDRESS]
 
-    discovered: set[str] = set()
+    adder = DeviceEntityAdder(hass, coordinator, address, async_add_entities, "cover")
+
+    @callback
+    def _sweep() -> None:
+        """Create entities for covers already known to the coordinator."""
+        for cov in list(coordinator.covers.values()):
+            adder.offer("cover", cov.table_id, cov.device_id, OneControlCover)
 
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, CoverStatus):
-            if not is_valid_device_id(event.device_id):
-                return
-            key = f"{event.table_id:02x}:{event.device_id:02x}"
-            if key not in discovered:
-                discovered.add(key)
-                _add_cover(
-                    coordinator, address, event.table_id, event.device_id,
-                    async_add_entities,
-                )
+            adder.offer("cover", event.table_id, event.device_id, OneControlCover)
+        elif isinstance(event, MetadataCommitted):
+            _sweep()
 
     coordinator.register_event_callback(_on_event)
-
-    for key, cov in coordinator.covers.items():
-        if key not in discovered:
-            discovered.add(key)
-            _add_cover(
-                coordinator, address, cov.table_id, cov.device_id,
-                async_add_entities,
-            )
+    _sweep()
 
 
-def _add_cover(
-    coordinator: OneControlCoordinator,
-    address: str,
-    table_id: int,
-    device_id: int,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Create the cover entity."""
-    async_add_entities(
-        [OneControlCover(coordinator, address, table_id, device_id)]
-    )
-
-
-class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
+class OneControlCover(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], CoverEntity):
     """Cover entity with open/close/stop control.
 
     Shows opening / closing / stopped state from the H-Bridge status event.
@@ -106,11 +86,7 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_cover_{table_id:02x}_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "cover", legacy_with_table=True)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -128,7 +104,9 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
     def available(self) -> bool:
         # Cover controls should remain available once the device has been
         # discovered, and while the gateway link is connected.
-        return self._key in self.coordinator.covers or self.coordinator.connected
+        return self._oc_resolved and (
+            self._key in self.coordinator.covers or self.coordinator.connected
+        )
 
     @property
     def is_closed(self) -> bool | None:
@@ -179,16 +157,19 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover (extend motor)."""
+        self._oc_require_address()
         _LOGGER.info("Cover open requested key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         await self.coordinator.async_cover(self._table_id, self._device_id, 0x01)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close the cover (retract motor)."""
+        self._oc_require_address()
         _LOGGER.debug("Cover close key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         await self.coordinator.async_cover(self._table_id, self._device_id, 0x02)
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Stop the cover motor."""
+        self._oc_require_address()
         _LOGGER.debug("Cover stop key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         await self.coordinator.async_cover(self._table_id, self._device_id, 0x00)
 

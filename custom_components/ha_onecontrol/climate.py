@@ -41,8 +41,8 @@ from .const import (
     HVAC_PRESET_NONE,
     HVAC_SETPOINT_DEBOUNCE_S,
 )
-from .coordinator import OneControlCoordinator
-from .helpers import is_valid_device_id
+from .coordinator import MetadataCommitted, OneControlCoordinator
+from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.events import HvacZone
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,33 +76,29 @@ async def async_setup_entry(
     coordinator: OneControlCoordinator = hass.data[DOMAIN][entry.entry_id]
     address = entry.data[CONF_ADDRESS]
 
-    discovered: set[str] = set()
+    adder = DeviceEntityAdder(hass, coordinator, address, async_add_entities, "climate")
+
+    @callback
+    def _sweep() -> None:
+        """Create entities for zones already known to the coordinator."""
+        for zone in list(coordinator.hvac_zones.values()):
+            adder.offer("zone", zone.table_id, zone.device_id, OneControlClimate)
 
     @callback
     def _on_event(event: Any) -> None:
+        if isinstance(event, MetadataCommitted):
+            _sweep()
+            return
         items = event if isinstance(event, list) else [event]
         for item in items:
             if isinstance(item, HvacZone):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered:
-                    discovered.add(key)
-                    async_add_entities(
-                        [OneControlClimate(coordinator, address, item.table_id, item.device_id)]
-                    )
+                adder.offer("zone", item.table_id, item.device_id, OneControlClimate)
 
     coordinator.register_event_callback(_on_event)
-
-    for key, zone in coordinator.hvac_zones.items():
-        if key not in discovered:
-            discovered.add(key)
-            async_add_entities(
-                [OneControlClimate(coordinator, address, zone.table_id, zone.device_id)]
-            )
+    _sweep()
 
 
-class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity):
+class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], ClimateEntity):
     """A OneControl HVAC zone."""
 
     _attr_has_entity_name = True
@@ -120,11 +116,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_climate_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "climate")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -141,7 +133,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._zone is not None
+        return self._oc_resolved and self.coordinator.data_healthy and self._zone is not None
 
     @property
     def _zone(self) -> HvacZone | None:
@@ -258,6 +250,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         return attrs
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return
@@ -282,6 +275,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         )
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return
@@ -306,6 +300,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         )
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return
@@ -361,6 +356,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         )
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
+        self._oc_require_address()
         zone = self._zone
         if zone is None:
             return

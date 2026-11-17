@@ -42,8 +42,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
-from .helpers import is_valid_device_id
+from .coordinator import MetadataCommitted, OneControlCoordinator
+from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.events import CoverStatus, GeneratorStatus, HourMeter, LevelerStatus, TankAlert, TankLevel
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,108 +69,62 @@ async def async_setup_entry(
         OneControlProtocolVersionSensor(coordinator, address),
     ]
 
-    discovered_tanks: set[str] = set()
-    discovered_generators: set[str] = set()
-    discovered_hour_meters: set[str] = set()
-    discovered_covers: set[str] = set()
-    discovered_levelers: set[str] = set()
-    discovered_tank_alerts: set[str] = set()
+    adder = DeviceEntityAdder(hass, coordinator, address, async_add_entities, "sensor")
+    _generator_sensors = (
+        OneControlGeneratorSensor,
+        OneControlGeneratorBatterySensor,
+        OneControlGeneratorTemperatureSensor,
+    )
+
+    @callback
+    def _build(item: Any) -> list[SensorEntity]:
+        """Return the sensors due for one status item."""
+        if isinstance(item, TankLevel):
+            return adder.build("tank", item.table_id, item.device_id, OneControlTankSensor)
+        if isinstance(item, GeneratorStatus):
+            return adder.build("generator", item.table_id, item.device_id, *_generator_sensors)
+        if isinstance(item, HourMeter):
+            return adder.build("hour_meter", item.table_id, item.device_id, OneControlHourMeterSensor)
+        if isinstance(item, CoverStatus):
+            return adder.build("cover", item.table_id, item.device_id, OneControlCoverStateSensor)
+        if isinstance(item, LevelerStatus):
+            return adder.build("leveler", item.table_id, item.device_id, OneControlLevelerPositionSensor)
+        if isinstance(item, TankAlert):
+            return adder.build("tank_alert", item.table_id, item.device_id, OneControlTankAlertSensor)
+        return []
+
+    @callback
+    def _sweep() -> list[SensorEntity]:
+        """Return sensors for devices already known to the coordinator."""
+        new: list[SensorEntity] = []
+        for status_dict in (
+            coordinator.tanks,
+            coordinator.generators,
+            coordinator.hour_meters,
+            coordinator.covers,
+            coordinator.levelers,
+            coordinator.tank_alerts,
+        ):
+            for item in list(status_dict.values()):
+                new.extend(_build(item))
+        return new
 
     @callback
     def _on_event(event: Any) -> None:
         """Dynamically add sensor entities as new devices appear."""
-        new: list[SensorEntity] = []
-
-        items = event if isinstance(event, list) else [event]
-        for item in items:
-            if isinstance(item, TankLevel):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered_tanks:
-                    discovered_tanks.add(key)
-                    _LOGGER.info("Discovered new tank sensor: %s (level=%d%%)", key, item.level)
-                    new.append(OneControlTankSensor(coordinator, address, item.table_id, item.device_id))
-
-            elif isinstance(item, GeneratorStatus):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered_generators:
-                    discovered_generators.add(key)
-                    new.extend([
-                        OneControlGeneratorSensor(coordinator, address, item.table_id, item.device_id),
-                        OneControlGeneratorBatterySensor(coordinator, address, item.table_id, item.device_id),
-                        OneControlGeneratorTemperatureSensor(coordinator, address, item.table_id, item.device_id),
-                    ])
-
-            elif isinstance(item, HourMeter):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered_hour_meters:
-                    discovered_hour_meters.add(key)
-                    new.append(OneControlHourMeterSensor(coordinator, address, item.table_id, item.device_id))
-
-            elif isinstance(item, CoverStatus):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered_covers:
-                    discovered_covers.add(key)
-                    new.append(OneControlCoverStateSensor(coordinator, address, item.table_id, item.device_id))
-
-            elif isinstance(item, LevelerStatus):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered_levelers:
-                    discovered_levelers.add(key)
-                    new.append(OneControlLevelerPositionSensor(coordinator, address, item.table_id, item.device_id))
-
-            elif isinstance(item, TankAlert):
-                if not is_valid_device_id(item.device_id):
-                    continue
-                key = f"{item.table_id:02x}:{item.device_id:02x}"
-                if key not in discovered_tank_alerts:
-                    discovered_tank_alerts.add(key)
-                    new.append(OneControlTankAlertSensor(coordinator, address, item.table_id, item.device_id))
-
+        if isinstance(event, MetadataCommitted):
+            new = _sweep()
+        else:
+            new = []
+            for item in event if isinstance(event, list) else [event]:
+                new.extend(_build(item))
         if new:
             async_add_entities(new)
 
     coordinator.register_event_callback(_on_event)
 
     # Pre-discover from coordinator state
-    _LOGGER.info("Pre-discovering tanks from coordinator: %d entries", len(coordinator.tanks))
-    for key, tank in coordinator.tanks.items():
-        if key not in discovered_tanks:
-            discovered_tanks.add(key)
-            entities.append(OneControlTankSensor(coordinator, address, tank.table_id, tank.device_id))
-    for key, gen in coordinator.generators.items():
-        if key not in discovered_generators:
-            discovered_generators.add(key)
-            entities.extend([
-                OneControlGeneratorSensor(coordinator, address, gen.table_id, gen.device_id),
-                OneControlGeneratorBatterySensor(coordinator, address, gen.table_id, gen.device_id),
-                OneControlGeneratorTemperatureSensor(coordinator, address, gen.table_id, gen.device_id),
-            ])
-    for key, hm in coordinator.hour_meters.items():
-        if key not in discovered_hour_meters:
-            discovered_hour_meters.add(key)
-            entities.append(OneControlHourMeterSensor(coordinator, address, hm.table_id, hm.device_id))
-    for key, cov in coordinator.covers.items():
-        if key not in discovered_covers:
-            discovered_covers.add(key)
-            entities.append(OneControlCoverStateSensor(coordinator, address, cov.table_id, cov.device_id))
-    for key, lev in coordinator.levelers.items():
-        if key not in discovered_levelers:
-            discovered_levelers.add(key)
-            entities.append(OneControlLevelerPositionSensor(coordinator, address, lev.table_id, lev.device_id))
-    for key, alert in coordinator.tank_alerts.items():
-        if key not in discovered_tank_alerts:
-            discovered_tank_alerts.add(key)
-            entities.append(OneControlTankAlertSensor(coordinator, address, alert.table_id, alert.device_id))
+    entities.extend(_sweep())
     async_add_entities(entities)
 
 
@@ -361,7 +315,7 @@ class OneControlProtocolVersionSensor(_OneControlSensorBase):
 # ── Tank Sensors ──────────────────────────────────────────────────────────
 
 
-class OneControlTankSensor(_OneControlSensorBase):
+class OneControlTankSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Tank level sensor — created dynamically as tanks are discovered."""
 
     _attr_native_unit_of_measurement = "%"
@@ -376,10 +330,7 @@ class OneControlTankSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_tank_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "tank")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -411,7 +362,7 @@ class OneControlTankSensor(_OneControlSensorBase):
 # ── Generator / Hour Meter ────────────────────────────────────────────────
 
 
-class OneControlGeneratorSensor(_OneControlSensorBase):
+class OneControlGeneratorSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Generator running/stopped sensor — event 0x0A."""
 
     _attr_icon = "mdi:engine"
@@ -424,10 +375,7 @@ class OneControlGeneratorSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_generator_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "generator")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -455,7 +403,7 @@ class OneControlGeneratorSensor(_OneControlSensorBase):
             self.async_write_ha_state()
 
 
-class OneControlGeneratorBatterySensor(_OneControlSensorBase):
+class OneControlGeneratorBatterySensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Generator battery voltage sensor — event 0x0A."""
 
     _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
@@ -471,10 +419,7 @@ class OneControlGeneratorBatterySensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_gen_battery_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "gen_battery")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -502,7 +447,7 @@ class OneControlGeneratorBatterySensor(_OneControlSensorBase):
             self.async_write_ha_state()
 
 
-class OneControlGeneratorTemperatureSensor(_OneControlSensorBase):
+class OneControlGeneratorTemperatureSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Generator temperature sensor — event 0x0A.
 
     Returns None (unavailable) when the generator reports 0x8000 (not supported)
@@ -522,10 +467,7 @@ class OneControlGeneratorTemperatureSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_gen_temp_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "gen_temp")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -553,7 +495,7 @@ class OneControlGeneratorTemperatureSensor(_OneControlSensorBase):
             self.async_write_ha_state()
 
 
-class OneControlHourMeterSensor(_OneControlSensorBase):
+class OneControlHourMeterSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Hour meter sensor — event 0x0F."""
 
     _attr_native_unit_of_measurement = UnitOfTime.HOURS
@@ -569,10 +511,7 @@ class OneControlHourMeterSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_hourmeter_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "hourmeter")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -612,7 +551,7 @@ class OneControlHourMeterSensor(_OneControlSensorBase):
 # ── Cover State Sensors (state-only, no control — INTERNALS.md safety) ───
 
 
-class OneControlCoverStateSensor(_OneControlSensorBase):
+class OneControlCoverStateSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Cover/Slide/Awning state as a sensor.
 
     Per INTERNALS.md safety decision covers are state-only:
@@ -630,10 +569,7 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_cover_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "cover")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -677,7 +613,7 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
 # ── Leveler Sensors ───────────────────────────────────────────────────────
 
 
-class OneControlLevelerPositionSensor(_OneControlSensorBase):
+class OneControlLevelerPositionSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Leveler position sensor — created dynamically as levelers are discovered."""
 
     _attr_icon = "mdi:format-horizontal-align-center"
@@ -690,10 +626,7 @@ class OneControlLevelerPositionSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_leveler_position_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "leveler_position")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -736,7 +669,7 @@ class OneControlLevelerPositionSensor(_OneControlSensorBase):
 # ── Tank Alert Sensors ────────────────────────────────────────────────────
 
 
-class OneControlTankAlertSensor(_OneControlSensorBase):
+class OneControlTankAlertSensor(OneControlDeviceEntity, _OneControlSensorBase):
     """Tank alert sensor — alert type and status."""
 
     _attr_icon = "mdi:water-alert"
@@ -749,10 +682,7 @@ class OneControlTankAlertSensor(_OneControlSensorBase):
         device_id: int,
     ) -> None:
         super().__init__(coordinator, address)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_tank_alert_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "tank_alert")
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property

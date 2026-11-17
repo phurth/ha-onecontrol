@@ -143,6 +143,11 @@ The first experimental release classified X180T and routed it to CAN-BLE, but fi
 
 - Canonical device join key: `(table_id, device_id)` encoded as `tt:dd`
 - all per-device runtime maps and metadata binding use this key
+- `(table_id, device_id)` is an *address*, not an identity: `table_id` changes whenever the gateway rebuilds its device table and `device_id` is only the row number, so a device can move rows after a rebuild
+- entity unique IDs are therefore built from the device's `function_name` / `function_instance` (`fn0030_00`), taken from a fully committed metadata table; devices sharing both are numbered in `device_id` order (`_2`, `_3`)
+- entities resolve their current address through the coordinator (`identity_address`) on every use, so they follow the device across renumberings; platforms defer entity creation until the table's metadata is committed (`MetadataCommitted`)
+- a function-based entity whose device is no longer in the current table has no address: it is unavailable and refuses commands (it never falls back to the address it was created with), and state cached for a row is dropped when the row changes occupant; while a table's metadata is being refetched after a CRC change, all of its tokens are without an address
+- gateways without metadata (IDS-CAN BLE, or metadata never delivered on a fresh install) keep address-based unique IDs; existing address-based registry entries are re-keyed in place the first time their device is identified (`entity.py`)
 
 ### 5.4 BLE adapter source pinning
 
@@ -461,7 +466,7 @@ Recent trajectory includes:
 
 ## 13. Extension Guidelines
 
-1. Keep `(table_id, device_id)` as the single device identity primitive.
+1. Keep `(table_id, device_id)` as the single device *address* primitive for runtime maps and commands; never build entity unique IDs from it (see §5.3).
 2. Track command ids explicitly for multi-command concurrency safety.
 3. Stage multi-part payloads and commit only on validated terminal frames.
 4. Add observability counters before introducing new protocol surfaces.

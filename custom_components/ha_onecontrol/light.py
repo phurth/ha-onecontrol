@@ -28,8 +28,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
-from .helpers import is_valid_device_id
+from .coordinator import MetadataCommitted, OneControlCoordinator
+from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.commands import CommandBuilder
 from .protocol.events import DimmableLight, RgbLight
 
@@ -48,46 +48,28 @@ async def async_setup_entry(
     coordinator: OneControlCoordinator = hass.data[DOMAIN][entry.entry_id]
     address = entry.data[CONF_ADDRESS]
 
-    discovered: set[str] = set()
+    adder = DeviceEntityAdder(hass, coordinator, address, async_add_entities, "light")
+
+    @callback
+    def _sweep() -> None:
+        """Create entities for devices already known to the coordinator."""
+        for light in list(coordinator.dimmable_lights.values()):
+            adder.offer("dim", light.table_id, light.device_id, OneControlDimmableLight)
+        for light in list(coordinator.rgb_lights.values()):
+            adder.offer("rgb", light.table_id, light.device_id, OneControlRgbLight)
 
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, DimmableLight):
-            if not is_valid_device_id(event.device_id):
-                return
-            key = f"dim_{event.table_id:02x}:{event.device_id:02x}"
-            if key not in discovered:
-                discovered.add(key)
-                async_add_entities(
-                    [OneControlDimmableLight(coordinator, address, event.table_id, event.device_id)]
-                )
+            adder.offer("dim", event.table_id, event.device_id, OneControlDimmableLight)
         elif isinstance(event, RgbLight):
-            if not is_valid_device_id(event.device_id):
-                return
-            key = f"rgb_{event.table_id:02x}:{event.device_id:02x}"
-            if key not in discovered:
-                discovered.add(key)
-                async_add_entities(
-                    [OneControlRgbLight(coordinator, address, event.table_id, event.device_id)]
-                )
+            adder.offer("rgb", event.table_id, event.device_id, OneControlRgbLight)
+        elif isinstance(event, MetadataCommitted):
+            _sweep()
 
     coordinator.register_event_callback(_on_event)
+    _sweep()
 
-    for key, light in coordinator.dimmable_lights.items():
-        disc_key = f"dim_{key}"
-        if disc_key not in discovered:
-            discovered.add(disc_key)
-            async_add_entities(
-                [OneControlDimmableLight(coordinator, address, light.table_id, light.device_id)]
-            )
-
-    for key, light in coordinator.rgb_lights.items():
-        disc_key = f"rgb_{key}"
-        if disc_key not in discovered:
-            discovered.add(disc_key)
-            async_add_entities(
-                [OneControlRgbLight(coordinator, address, light.table_id, light.device_id)]
-            )
 
 
 # ── Dimmable Effect Presets ──────────────────────────────────────────────────
@@ -105,7 +87,7 @@ _DIMMABLE_EFFECTS: dict[str, tuple[int, int, int]] = {
 }
 
 
-class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
+class OneControlDimmableLight(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], LightEntity):
     """A OneControl dimmable light."""
 
     _attr_has_entity_name = True
@@ -122,11 +104,7 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_light_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "light")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -142,7 +120,7 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.dimmable_lights
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.dimmable_lights
 
     @property
     def is_on(self) -> bool | None:
@@ -169,6 +147,7 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
         return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         brightness = kwargs.get(ATTR_BRIGHTNESS)
         if brightness is None:
             # Restore last active brightness — mirrors Android lastKnownDimmableBrightness.
@@ -213,6 +192,7 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         light = self.coordinator.dimmable_lights.get(self._key)
         if light:
             self.coordinator.dimmable_lights[self._key] = DimmableLight(
@@ -252,7 +232,7 @@ _RGB_EFFECTS = {
 _EFFECT_NAME_TO_MODE = {k: v for k, v in _RGB_EFFECTS.items()}
 
 
-class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
+class OneControlRgbLight(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], LightEntity):
     """A OneControl RGB light."""
 
     _attr_has_entity_name = True
@@ -269,11 +249,7 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_rgb_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "rgb")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -289,7 +265,7 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.rgb_lights
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.rgb_lights
 
     @property
     def is_on(self) -> bool | None:
@@ -319,6 +295,7 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         light = self.coordinator.rgb_lights.get(self._key)
 
         # Resolve RGB color — mirrors Android lastKnownRgbColor fallback:
@@ -366,6 +343,7 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         light = self.coordinator.rgb_lights.get(self._key)
         if light:
             self.coordinator.rgb_lights[self._key] = RgbLight(

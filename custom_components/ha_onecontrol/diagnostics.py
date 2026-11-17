@@ -194,6 +194,14 @@ async def async_get_config_entry_diagnostics(
             "generators": generators,
         },
         "metadata": metadata,
+        "identity": {
+            "mode": coordinator.identity_mode,
+            "tables": sorted(f"{t:02x}" for t in coordinator._identity_tables),
+            "addresses": {
+                token: f"{addr[0]:02x}:{addr[1]:02x}"
+                for token, addr in sorted(coordinator._identity_address.items())
+            },
+        },
         "device_count": {
             "relays": len(relays),
             "dimmable_lights": len(dimmables),

@@ -21,8 +21,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, SWITCH_STATE_GUARD_S
-from .coordinator import OneControlCoordinator
-from .helpers import is_valid_device_id
+from .coordinator import MetadataCommitted, OneControlCoordinator
+from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.events import GeneratorStatus, RelayStatus
 
@@ -41,49 +41,30 @@ async def async_setup_entry(
     coordinator: OneControlCoordinator = hass.data[DOMAIN][entry.entry_id]
     address = entry.data[CONF_ADDRESS]
 
-    discovered: set[str] = set()
-    discovered_generators: set[str] = set()
+    adder = DeviceEntityAdder(hass, coordinator, address, async_add_entities, "switch")
+
+    @callback
+    def _sweep() -> None:
+        """Create entities for devices already known to the coordinator."""
+        for relay in list(coordinator.relays.values()):
+            adder.offer("relay", relay.table_id, relay.device_id, OneControlSwitch)
+        for gen in list(coordinator.generators.values()):
+            adder.offer("generator", gen.table_id, gen.device_id, OneControlGeneratorSwitch)
 
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, RelayStatus):
-            if not is_valid_device_id(event.device_id):
-                return
-            key = f"{event.table_id:02x}:{event.device_id:02x}"
-            if key not in discovered:
-                discovered.add(key)
-                async_add_entities(
-                    [OneControlSwitch(coordinator, address, event.table_id, event.device_id)]
-                )
+            adder.offer("relay", event.table_id, event.device_id, OneControlSwitch)
         elif isinstance(event, GeneratorStatus):
-            if not is_valid_device_id(event.device_id):
-                return
-            key = f"{event.table_id:02x}:{event.device_id:02x}"
-            if key not in discovered_generators:
-                discovered_generators.add(key)
-                async_add_entities(
-                    [OneControlGeneratorSwitch(coordinator, address, event.table_id, event.device_id)]
-                )
+            adder.offer("generator", event.table_id, event.device_id, OneControlGeneratorSwitch)
+        elif isinstance(event, MetadataCommitted):
+            _sweep()
 
     coordinator.register_event_callback(_on_event)
-
-    # Also create entities for any relays already discovered
-    for key, relay in coordinator.relays.items():
-        if key not in discovered:
-            discovered.add(key)
-            async_add_entities(
-                [OneControlSwitch(coordinator, address, relay.table_id, relay.device_id)]
-            )
-
-    for key, gen in coordinator.generators.items():
-        if key not in discovered_generators:
-            discovered_generators.add(key)
-            async_add_entities(
-                [OneControlGeneratorSwitch(coordinator, address, gen.table_id, gen.device_id)]
-            )
+    _sweep()
 
 
-class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
+class OneControlSwitch(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], SwitchEntity):
     """A OneControl relay switch."""
 
     _attr_has_entity_name = True
@@ -96,11 +77,7 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_switch_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "switch")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -118,7 +95,7 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.relays
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.relays
 
     @property
     def is_on(self) -> bool | None:
@@ -145,6 +122,7 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         return 20.0 if self.coordinator.is_can_ble_gateway else SWITCH_STATE_GUARD_S
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         _LOGGER.debug("Switch turn_on key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         self._optimistic_is_on = True
         self._optimistic_until = time.monotonic() + self._guard_window()
@@ -161,6 +139,7 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         await self.coordinator.async_switch(self._table_id, self._device_id, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         _LOGGER.debug("Switch turn_off key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         self._optimistic_is_on = False
         self._optimistic_until = time.monotonic() + self._guard_window()
@@ -206,7 +185,7 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
             self.async_write_ha_state()
 
 
-class OneControlGeneratorSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
+class OneControlGeneratorSwitch(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], SwitchEntity):
     """Generator start/stop switch — event 0x0A, command 0x42.
 
     is_on is True when state is Priming, Starting, or Running (state in 1..3),
@@ -228,11 +207,7 @@ class OneControlGeneratorSwitch(CoordinatorEntity[OneControlCoordinator], Switch
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_gen_switch_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "gen_switch")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -248,7 +223,7 @@ class OneControlGeneratorSwitch(CoordinatorEntity[OneControlCoordinator], Switch
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.generators
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.generators
 
     @property
     def is_on(self) -> bool | None:
@@ -258,9 +233,11 @@ class OneControlGeneratorSwitch(CoordinatorEntity[OneControlCoordinator], Switch
         return gen.state in (1, 2, 3)  # Priming, Starting, or Running
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         await self.coordinator.async_set_generator(self._table_id, self._device_id, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._oc_require_address()
         await self.coordinator.async_set_generator(self._table_id, self._device_id, False)
 
     async def async_will_remove_from_hass(self) -> None:

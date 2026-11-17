@@ -20,6 +20,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -31,6 +32,7 @@ from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .helpers import is_valid_device_id
@@ -207,6 +209,13 @@ _STALLED_DISCONNECT_TIMEOUT_S = 10.0
 # (always-off) devices.  Lets the initial BLE event burst settle first.
 _METADATA_SEED_DELAY_S = 2.0
 
+# How long entity creation waits for a table's metadata before falling back to
+# address-based unique IDs (see entity.py).  Metadata normally lands within a
+# few seconds of connecting; retries after a rejection are spaced 10 s apart.
+_IDENTITY_GRACE_S = 60.0
+# Matches the identity part of a function-based unique ID ("…_fn0030_00").
+_IDENTITY_UNIQUE_ID_RE = re.compile(r"_fn[0-9a-f]{4}_[0-9a-f]{2}(?:_\d+)?$")
+
 # IDS-CAN relay command verification/retry tuning.
 # V1 gateways can emit delayed DEVICE_STATUS updates after a command even when
 # the action actually succeeded, so use a longer confirmation window there.
@@ -287,6 +296,17 @@ def _device_key(table_id: int, device_id: int) -> str:
 
 
 
+
+
+@dataclass(frozen=True)
+class MetadataCommitted:
+    """Dispatched to event callbacks when a table's metadata has been committed.
+
+    Entity platforms use it to create entities that were waiting for a stable
+    identity (see entity.py).
+    """
+
+    table_id: int
 
 
 @dataclass
@@ -616,6 +636,29 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.device_names: dict[str, str] = {}
         self._metadata_raw: dict[str, DeviceMetadata] = {}
 
+        # Logical device identity (see entity.py).  Derived from committed
+        # metadata; survives disconnects just like _metadata_raw.
+        #   _identity_tables   tables whose metadata was committed in full
+        #   _identity_by_key   "tt:dd" → identity token ("fn0030_00")
+        #   _identity_address  identity token → current (table_id, device_id)
+        #   _identity_mode     None (undecided) | "identity" | "legacy"
+        self._identity_tables: set[int] = set()
+        self._identity_by_key: dict[str, str] = {}
+        self._identity_address: dict[str, tuple[int, int]] = {}
+        self._identity_mode: str | None = None
+        self._identity_wait_started: dict[int, float] = {}
+        self._identity_wait_warned: set[int] = set()
+        self._identity_entities_exist: bool | None = None
+        # "tt:dd" → token last committed for that row; outlives invalidation
+        # so a rebuilt table can be compared with its previous contents.
+        self._identity_last_by_key: dict[str, str] = {}
+        # token → last address it resolved to; kept across suspension so a
+        # renumbering can still be reported once the table is rebuilt.
+        self._identity_last_address: dict[str, tuple[int, int]] = {}
+        # (platform domain, unique_id) of loaded entities that use an
+        # address-based unique ID; their registry entries must not be re-keyed.
+        self.live_legacy_unique_ids: set[tuple[str, str]] = set()
+
         # Last non-zero brightness per dimmable device (persists across off/on cycles).
         # Only updated when brightness > 0 (last known brightness restore).
         self._last_known_dimmable_brightness: dict[str, int] = {}
@@ -740,6 +783,258 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return friendly name or fallback like 'Device 0B:05'."""
         key = _device_key(table_id, device_id)
         return self.device_names.get(key, f"Device {key.upper()}")
+
+    # ------------------------------------------------------------------
+    # Logical device identity (see entity.py)
+    # ------------------------------------------------------------------
+
+    @property
+    def identity_mode(self) -> str | None:
+        """How per-device entities are keyed: "identity", "legacy" or None (undecided)."""
+        return self._identity_mode
+
+    def _current_table_id(self) -> int | None:
+        return self.gateway_info.table_id if self.gateway_info is not None else None
+
+    def device_entity_ready(self, table_id: int, device_id: int) -> bool:
+        """Return True once an entity for this device may be created.
+
+        Entities are held back until the gateway's current table has complete
+        metadata, so their unique IDs can be built from the device's function
+        instead of its address.  A gateway that never delivers metadata falls
+        back to address-based unique IDs for the rest of the session — unless
+        this install already has function-based entities, in which case
+        creating address-based ones would duplicate them.
+        """
+        if self._identity_mode == "legacy":
+            return True
+        if self._can_ble_confirmed:
+            # IDS-CAN BLE gateways have no MyRvLink metadata; names come from
+            # DEVICE_ID broadcasts and the source address is the identity.
+            if self._identity_mode is None:
+                self._identity_mode = "legacy"
+            return True
+        if table_id == 0:
+            # IDS-CAN convention: no device table, so there is no metadata to
+            # wait for and the entity is keyed by address.  Settle on
+            # address-based IDs for the session, as the CAN BLE branch does —
+            # unless this install already has function-based entities, which
+            # address-based ones would duplicate.
+            if self._identity_mode is None and not self._has_identity_entities():
+                self._identity_mode = "legacy"
+            return True
+
+        current = self._current_table_id()
+        if table_id == current and table_id in self._identity_tables:
+            if self._identity_mode is None:
+                self._identity_mode = "identity"
+                _LOGGER.info(
+                    "Per-device entities are keyed by device function (table %d)",
+                    table_id,
+                )
+            return True
+
+        if self._identity_mode == "identity":
+            # Keep waiting for this table's metadata.  Creating entities by
+            # address here is exactly what produces duplicates after the
+            # gateway renumbers its devices.
+            return False
+
+        now = time.monotonic()
+        started = self._identity_wait_started.setdefault(table_id, now)
+        if now - started < _IDENTITY_GRACE_S:
+            return False
+        if self._has_identity_entities():
+            if table_id not in self._identity_wait_warned:
+                self._identity_wait_warned.add(table_id)
+                _LOGGER.warning(
+                    "Still waiting for device metadata for table %d; entities stay "
+                    "unavailable until the gateway delivers it",
+                    table_id,
+                )
+            return False
+        self._identity_mode = "legacy"
+        _LOGGER.warning(
+            "No complete device metadata for table %d after %.0fs — "
+            "falling back to address-based entity unique IDs for this session",
+            table_id,
+            _IDENTITY_GRACE_S,
+        )
+        return True
+
+    def _has_identity_entities(self) -> bool:
+        """Return True if the registry already holds function-based entities.
+
+        Scanned once per session: this is asked for every status event while
+        metadata is overdue, and the answer cannot turn from True to False
+        while the integration is loaded.  (A False answer is only ever used to
+        settle on address-based IDs, after which it is not asked again.)
+        """
+        if self._identity_entities_exist is None:
+            registry = er.async_get(self.hass)
+            self._identity_entities_exist = any(
+                _IDENTITY_UNIQUE_ID_RE.search(entity.unique_id or "")
+                for entity in er.async_entries_for_config_entry(
+                    registry, self.entry.entry_id
+                )
+            )
+        return self._identity_entities_exist
+
+    def entity_identity(self, table_id: int, device_id: int) -> str | None:
+        """Return the identity token for a device, or None to use its address."""
+        if self._identity_mode != "identity":
+            return None
+        if table_id != self._current_table_id() or table_id not in self._identity_tables:
+            return None
+        return self._identity_by_key.get(_device_key(table_id, device_id))
+
+    def identity_address(self, ident: str) -> tuple[int, int] | None:
+        """Return the current (table_id, device_id) for an identity token.
+
+        None means the device is not in the gateway's current table (it was
+        removed, or its function changed); its entity is then unavailable.
+        """
+        return self._identity_address.get(ident)
+
+    def _drop_identity_table(self, table_id: int) -> None:
+        """Forget the identity tokens of a table whose metadata was invalidated."""
+        self._identity_tables.discard(table_id)
+        prefix = f"{table_id:02x}:"
+        for key in [k for k in self._identity_by_key if k.startswith(prefix)]:
+            del self._identity_by_key[key]
+
+    def _suspend_identity_table(self, table_id: int) -> None:
+        """Take a table's devices out of service until its metadata is rebuilt.
+
+        Called when the gateway reports new metadata for a table we had
+        loaded.  Until the new metadata is committed, any row may already hold
+        a different device, so no entity may read or command through its old
+        address: the tokens lose their addresses (entities become unavailable
+        and refuse commands) and HVAC retries queued for the table's rows are
+        cancelled.  _repoint_identities restores the addresses on commit.
+        """
+        self._drop_identity_table(table_id)
+        for token, address in list(self._identity_address.items()):
+            if address[0] == table_id:
+                del self._identity_address[token]
+        prefix = f"{table_id:02x}:"
+        for key in [k for k in self._pending_hvac if k.startswith(prefix)]:
+            del self._pending_hvac[key]
+        for key in [k for k in self._hvac_retry_handles if k.startswith(prefix)]:
+            self._hvac_retry_handles.pop(key).cancel()
+
+    def _rebuild_identity_table(self, table_id: int) -> None:
+        """Derive identity tokens for a table from its committed metadata.
+
+        The token is the function name and instance.  When several devices in
+        the table share both, they are numbered in device_id order ("_2", "_3").
+        """
+        self._drop_identity_table(table_id)
+        groups: dict[tuple[int, int], list[int]] = {}
+        for meta in self._metadata_raw.values():
+            if meta.table_id != table_id:
+                continue
+            groups.setdefault(
+                (meta.function_name, meta.function_instance), []
+            ).append(meta.device_id)
+        for (function_name, function_instance), device_ids in groups.items():
+            for ordinal, device_id in enumerate(sorted(device_ids), start=1):
+                token = f"fn{function_name:04x}_{function_instance:02x}"
+                if ordinal > 1:
+                    token = f"{token}_{ordinal}"
+                self._identity_by_key[_device_key(table_id, device_id)] = token
+        self._identity_tables.add(table_id)
+
+        # A row that now holds a different device (or none) still has the
+        # previous occupant's state cached under its address.  Drop it, or the
+        # new occupant would show that state and platforms sweeping the caches
+        # would create an entity of the previous occupant's type for it.
+        prefix = f"{table_id:02x}:"
+        for key in [k for k in self._identity_last_by_key if k.startswith(prefix)]:
+            if self._identity_by_key.get(key) != self._identity_last_by_key[key]:
+                del self._identity_last_by_key[key]
+                self._forget_device_state(key)
+        for key, token in self._identity_by_key.items():
+            if key.startswith(prefix):
+                self._identity_last_by_key[key] = token
+
+    def _forget_device_state(self, key: str) -> None:
+        """Drop everything cached for the device address *key* ("tt:dd")."""
+        for store in (
+            self.relays, self.dimmable_lights, self.rgb_lights, self.covers,
+            self.hvac_zones, self.tanks, self.device_online, self.device_locks,
+            self.generators, self.hour_meters, self.levelers, self.tank_alerts,
+            self.observed_hvac_capability, self._last_dtc_codes,
+            self._pending_hvac, self._hvac_zone_states,
+            self._last_known_dimmable_brightness, self._last_known_rgb_color,
+        ):
+            store.pop(key, None)
+        retry = self._hvac_retry_handles.pop(key, None)
+        if retry is not None:
+            # Would otherwise fire at this address, i.e. at its new occupant.
+            retry.cancel()
+
+    def _repoint_identities(self, table_id: int) -> None:
+        """Point every identity token found in *table_id* at its address there.
+
+        Tokens that are no longer in the table lose their address.  Their old
+        row may belong to a different device now, so their entities must not
+        keep reading or commanding it.
+        """
+        prefix = f"{table_id:02x}:"
+        moved = 0
+        present: set[str] = set()
+        for key, token in self._identity_by_key.items():
+            if not key.startswith(prefix):
+                continue
+            present.add(token)
+            address = (table_id, int(key[3:], 16))
+            previous = self._identity_last_address.get(token)
+            self._identity_last_address[token] = address
+            if self._identity_address.get(token) == address:
+                continue
+            self._identity_address[token] = address
+            if previous is not None and previous[1] != address[1]:
+                moved += 1
+                _LOGGER.info(
+                    "Device %s moved %02X:%02X → %02X:%02X",
+                    self.device_names.get(key, token),
+                    previous[0], previous[1], address[0], address[1],
+                )
+        is_current = table_id == self._current_table_id()
+        for token, address in list(self._identity_address.items()):
+            if token in present:
+                continue
+            # Gone from this table — or, when this is the gateway's current
+            # table, still pointing into a table that is no longer in use.
+            if address[0] == table_id or is_current:
+                del self._identity_address[token]
+                _LOGGER.info(
+                    "Device %s is no longer in table %d (was %02X:%02X); "
+                    "its entities are unavailable",
+                    token, table_id, address[0], address[1],
+                )
+        if moved:
+            _LOGGER.warning(
+                "Gateway renumbered %d device(s) in table %d; entities follow "
+                "their devices to the new addresses",
+                moved,
+                table_id,
+            )
+
+    def _commit_identity_table(self, table_id: int) -> None:
+        """Handle a full metadata commit: refresh identities and wake platforms."""
+        self._rebuild_identity_table(table_id)
+        current = self._current_table_id()
+        if current is None or table_id == current:
+            self._repoint_identities(table_id)
+        notice = MetadataCommitted(table_id=table_id)
+        for cb in list(self._event_callbacks):
+            try:
+                cb(notice)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Error in event callback during metadata commit")
+        self.async_set_updated_data(self._build_data())
 
     def register_event_callback(self, cb: Callable[[Any], None]) -> Callable[[], None]:
         """Register a callback for parsed events. Returns unsubscribe callable."""
@@ -5123,6 +5418,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._metadata_loaded_tables.add(completed_table)
                         self._last_metadata_crc = response_crc
                         self._cmd_correlation_stats["metadata_commit_success"] += 1
+                        self._commit_identity_table(completed_table)
                         self._resolve_bootstrap_waiter("metadata", completed_table, "completed")
                         _LOGGER.debug(
                             "Metadata completion OK for table %d (CRC=0x%08x, entries=%d)",
@@ -5317,11 +5613,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if k.startswith(prefix):
                         del self._metadata_raw[k]
                         self.device_names.pop(k, None)
+                self._suspend_identity_table(event.table_id)
                 self._metadata_requested_tables.discard(event.table_id)
                 self._metadata_loaded_tables.discard(event.table_id)
                 self._metadata_rejected_tables.discard(event.table_id)
 
+            previous_table = self._current_table_id()
             self.gateway_info = event
+            if event.table_id != previous_table and event.table_id in self._identity_tables:
+                # Back on a table whose metadata we already hold.
+                self._repoint_identities(event.table_id)
 
             self._ensure_startup_bootstrap(event.table_id)
 
@@ -5637,6 +5938,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connected = False
         self._authenticated = False
         self._decoder.reset()
+        self._identity_wait_started.clear()
         self._metadata_requested_tables.clear()
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()

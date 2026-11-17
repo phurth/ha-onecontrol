@@ -32,8 +32,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
-from .helpers import is_valid_device_id
+from .coordinator import MetadataCommitted, OneControlCoordinator
+from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.events import GeneratorStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,28 +55,23 @@ async def async_setup_entry(
         OneControlDataHealthy(coordinator, address),
     ])
 
-    discovered_gen_quiet: set[str] = set()
+    adder = DeviceEntityAdder(hass, coordinator, address, async_add_entities, "binary_sensor")
+
+    @callback
+    def _sweep() -> None:
+        """Create entities for generators already known to the coordinator."""
+        for gen in list(coordinator.generators.values()):
+            adder.offer("generator", gen.table_id, gen.device_id, OneControlGeneratorQuietHours)
 
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, GeneratorStatus):
-            if not is_valid_device_id(event.device_id):
-                return
-            key = f"{event.table_id:02x}:{event.device_id:02x}"
-            if key not in discovered_gen_quiet:
-                discovered_gen_quiet.add(key)
-                async_add_entities(
-                    [OneControlGeneratorQuietHours(coordinator, address, event.table_id, event.device_id)]
-                )
+            adder.offer("generator", event.table_id, event.device_id, OneControlGeneratorQuietHours)
+        elif isinstance(event, MetadataCommitted):
+            _sweep()
 
     coordinator.register_event_callback(_on_event)
-
-    for key, gen in coordinator.generators.items():
-        if key not in discovered_gen_quiet:
-            discovered_gen_quiet.add(key)
-            async_add_entities(
-                [OneControlGeneratorQuietHours(coordinator, address, gen.table_id, gen.device_id)]
-            )
+    _sweep()
 
 
 class OneControlGatewayConnectivity(
@@ -237,6 +232,7 @@ class OneControlDataHealthy(
 
 
 class OneControlGeneratorQuietHours(
+    OneControlDeviceEntity,
     CoordinatorEntity[OneControlCoordinator], BinarySensorEntity
 ):
     """Binary sensor for generator quiet hours mode — event 0x0A.
@@ -255,11 +251,7 @@ class OneControlGeneratorQuietHours(
         device_id: int,
     ) -> None:
         super().__init__(coordinator)
-        self._table_id = table_id
-        self._device_id = device_id
-        self._key = f"{table_id:02x}:{device_id:02x}"
-        mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_gen_quiet_{device_id:02x}"
+        self._bind_device(address, table_id, device_id, "gen_quiet")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -276,7 +268,7 @@ class OneControlGeneratorQuietHours(
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.generators
+        return self._oc_resolved and self.coordinator.data_healthy and self._key in self.coordinator.generators
 
     @property
     def is_on(self) -> bool | None:
