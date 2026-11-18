@@ -130,7 +130,7 @@ panel, that is the hardware layout rather than an integration fault.
 
 - **RGB Lights** — Color control with 7 effects (Blink, Swell, Strobe, Color Cycle, etc.)
 
-- **HVAC Climate Zones** — Heat/Cool/Heat+Cool modes, fan speed, temperature setpoints
+- **HVAC Climate Zones** — Heat/Cool/Heat+Cool modes, fan speed, temperature setpoints. The gateway does not report which modes a zone supports or how low its thermostat goes, so every zone offers all modes and 40–95 °F by default. To match your coach (for example an A/C-only zone, or a thermostat that will not go below 47 °F), open **Configure** on the integration, tick *Set modes and setpoint limits for each climate zone*, and choose the modes and range for each zone. Settings stay with the zone if the gateway renumbers its devices.
 
 - **Tank Sensors** — Fresh, grey, black tank levels (%)
 

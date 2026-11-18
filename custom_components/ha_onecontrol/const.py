@@ -172,6 +172,31 @@ CONF_COVER_TRAVEL_RETRACT = "retract"
 # only decides whether this save visits the per-cover pages.
 CONF_CONFIGURE_COVER_TRAVEL = "configure_cover_travel"
 
+# Per-zone climate settings, keyed by the zone's identity token (function name
+# + instance, e.g. "fn00c0_00"; the "tt:dd" address key on installs that key
+# entities by address):
+#   {"fn00c0_00": {"modes": ["heat", "cool", "heat_cool"], "min_temp": 47, "max_temp": 95}}
+# A zone without an entry keeps every mode and the default setpoint range.
+CONF_CLIMATE_ZONES = "climate_zones"
+CONF_ZONE_MODES = "modes"
+CONF_ZONE_MIN_TEMP = "min_temp"
+CONF_ZONE_MAX_TEMP = "max_temp"
+# Options-flow tick box: walk the per-zone pages at all.  Not persisted.
+CONF_CONFIGURE_CLIMATE_ZONES = "configure_climate_zones"
+# Options-flow field names for one zone's allowed modes.  One tick box per mode
+# so every field has a translatable label.
+CONF_ZONE_ALLOW_HEAT = "allow_heat"
+CONF_ZONE_ALLOW_COOL = "allow_cool"
+CONF_ZONE_ALLOW_HEAT_COOL = "allow_heat_cool"
+CONF_ZONE_ALLOW_AUTO = "allow_auto"
+
+# HVAC modes a zone can offer besides Off, as Home Assistant HVACMode values,
+# in display order.  "auto" is the thermostat's schedule mode.
+HVAC_ZONE_MODES = ("heat", "cool", "heat_cool", "auto")
+# Setpoint range (°F) offered when a zone has no stored limits.
+DEFAULT_HVAC_MIN_TEMP_F = 40
+DEFAULT_HVAC_MAX_TEMP_F = 95
+
 # Default cover travel time (seconds) when neither a per-cover nor a
 # per-direction override is set.  Preserves the pre-option behaviour.
 DEFAULT_COVER_SAFETY_TIMEOUT = 6.0

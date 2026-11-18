@@ -14,12 +14,38 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .climate_zones import (
+    stored_zone_overrides,
+    zone_override,
+    zone_override_defaults,
+    zone_settings,
+)
+from .const import (
+    DOMAIN,
+    HVAC_CAP_AC,
+    HVAC_CAP_ELECTRIC_HEAT,
+    HVAC_CAP_GAS,
+    HVAC_CAP_HEAT_PUMP,
+    HVAC_CAP_MULTISPEED_FAN,
+)
 from .coordinator import OneControlCoordinator
 from .protocol.dtc_codes import get_name as dtc_get_name
 
 # Keys to redact from config entry data (PII / secrets)
 TO_REDACT_CONFIG = {"gateway_pin", "bluetooth_pin"}
+
+_HVAC_CAPABILITY_NAMES = (
+    (HVAC_CAP_GAS, "gas"),
+    (HVAC_CAP_AC, "ac"),
+    (HVAC_CAP_HEAT_PUMP, "heat_pump"),
+    (HVAC_CAP_MULTISPEED_FAN, "multispeed_fan"),
+    (HVAC_CAP_ELECTRIC_HEAT, "electric_heat"),
+)
+
+
+def _capability_names(capability: int) -> list[str]:
+    """Decode learned HVAC capability bits into names."""
+    return [name for bit, name in _HVAC_CAPABILITY_NAMES if capability & bit]
 
 
 async def async_get_config_entry_diagnostics(
@@ -134,6 +160,7 @@ async def async_get_config_entry_diagnostics(
     # ── HVAC zones ───────────────────────────────────────────────
     hvacs = {}
     for key, zone in coordinator.hvac_zones.items():
+        zone_id = coordinator.entity_identity(zone.table_id, zone.device_id) or key
         hvacs[key] = {
             "heat_mode": zone.heat_mode,
             "fan_mode": zone.fan_mode,
@@ -141,6 +168,19 @@ async def async_get_config_entry_diagnostics(
             "low_trip": zone.low_trip_f,
             "high_trip": zone.high_trip_f,
             "name": coordinator.device_name(zone.table_id, zone.device_id),
+            # What the zone is doing and which heat source it uses, the
+            # capability learned from its status so far (HVAC_CAP_* bits), and
+            # the per-zone settings in effect (see climate_zones.py).
+            "zone_status": zone.zone_status,
+            "heat_source": zone.heat_source,
+            "learned_capability": coordinator.observed_hvac_capability.get(key, 0),
+            "learned_capability_names": _capability_names(
+                coordinator.observed_hvac_capability.get(key, 0)
+            ),
+            "settings_key": zone_id,
+            "settings": zone_override(zone_settings(entry.options, zone_id))
+            or zone_override_defaults(),
+            "settings_overridden": zone_id in stored_zone_overrides(entry.options),
         }
 
     # ── Tanks ────────────────────────────────────────────────────

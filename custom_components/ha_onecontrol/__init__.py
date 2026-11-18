@@ -13,6 +13,7 @@ from homeassistant.helpers import entity_registry as er
 from .const import (
     CONF_BLUETOOTH_PIN,
     CONF_BONDED_SOURCE,
+    CONF_CLIMATE_ZONES,
     CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
     CONF_PAIRING_METHOD,
@@ -54,8 +55,15 @@ def _reload_snapshot(entry: ConfigEntry) -> tuple[dict, dict]:
     authenticates and reads it on every connect, so it needs no reload.
     Reloading for it tore the entry down seconds after the first connect,
     while the old coordinator was still discovering devices (issue #16).
+
+    CONF_CLIMATE_ZONES is read live by the climate entities, so a change only
+    needs their state refreshed (see _async_update_listener).
     """
-    options = {k: v for k, v in entry.options.items() if k != CONF_BONDED_SOURCE}
+    options = {
+        k: v
+        for k, v in entry.options.items()
+        if k not in (CONF_BONDED_SOURCE, CONF_CLIMATE_ZONES)
+    }
     return dict(entry.data), options
 
 
@@ -64,6 +72,12 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     key = (entry.entry_id, "reload_snapshot")
     snapshot = _reload_snapshot(entry)
     if hass.data[DOMAIN].get(key) == snapshot:
+        # Nothing that needs a reconnect changed.  Per-zone climate settings
+        # are read live by the climate entities, so refreshing their state is
+        # enough — a reload would drop the gateway connection for nothing.
+        coordinator = hass.data[DOMAIN].get(entry.entry_id)
+        if coordinator is not None:
+            coordinator.async_update_listeners()
         return
     await hass.config_entries.async_reload(entry.entry_id)
 
