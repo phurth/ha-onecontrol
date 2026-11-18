@@ -215,6 +215,15 @@ def test_zone_form_fields_have_translations() -> None:
         assert "zone_min_not_below_max" in options["error"], path
 
 
+def test_option_texts_use_real_line_breaks() -> None:
+    """A doubly escaped newline shows up in the dialog as a literal "\\n"."""
+    for path in (COMPONENT / "strings.json", COMPONENT / "translations" / "en.json"):
+        steps = json.loads(path.read_text(encoding="utf-8"))["options"]["step"]
+        for name, step in steps.items():
+            assert "\\n" not in step["description"], (path.name, name)
+        assert "\n\n" in steps["init"]["description"], path.name
+
+
 def test_zone_temp_field_serialises_for_the_frontend() -> None:
     """A schema the frontend cannot serialise means the page never appears."""
     script = textwrap.dedent(
