@@ -22,6 +22,8 @@ from homeassistant.const import CONF_ADDRESS
 from .const import (
     CONF_ADVERTISED_GATEWAY_VERSION,
     CONF_BLUETOOTH_PIN,
+    CONF_CLIMATE_ZONES,
+    CONF_CONFIGURE_CLIMATE_ZONES,
     CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
     CONF_CONFIGURE_COVER_TRAVEL,
@@ -31,6 +33,16 @@ from .const import (
     CONF_COVER_TRAVEL_RETRACT,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
+    CONF_ZONE_ALLOW_AUTO,
+    CONF_ZONE_ALLOW_COOL,
+    CONF_ZONE_ALLOW_HEAT,
+    CONF_ZONE_ALLOW_HEAT_COOL,
+    CONF_ZONE_HAS_GAS,
+    CONF_ZONE_HAS_HEAT_PUMP,
+    CONF_ZONE_MAX_TEMP,
+    CONF_ZONE_MIN_TEMP,
+    DEFAULT_HVAC_MAX_TEMP_F,
+    DEFAULT_HVAC_MIN_TEMP_F,
     DEFAULT_COVER_SAFETY_TIMEOUT,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
@@ -40,6 +52,12 @@ from .const import (
     LIPPERT_MANUFACTURER_ID,
     LIPPERT_MANUFACTURER_ID_ALT,
     X180T_DISCOVERY_SERVICE_UUID,
+)
+from .climate_zones import (
+    ZoneSettings,
+    stored_zone_overrides,
+    zone_override,
+    zone_settings,
 )
 from .protocol.advertisement import PairingMethod, parse_gateway_advertisement
 
@@ -57,6 +75,27 @@ _PAIRING_METHOD_UNSET = "unset"
 # be serialised for the frontend — a plain Python validator cannot be.
 _COVER_TRAVEL_FIELD = vol.Any(
     None, vol.All(vol.Coerce(float), vol.Range(min=1.0, max=60.0))
+)
+
+
+# One climate zone's setpoint limit (°F).  Module-level and built from
+# voluptuous primitives for the same reason as the travel-time field.
+_ZONE_TEMP_FIELD = vol.All(
+    vol.Coerce(int),
+    vol.Range(min=DEFAULT_HVAC_MIN_TEMP_F, max=DEFAULT_HVAC_MAX_TEMP_F),
+)
+
+# Options-flow tick box → stored mode name, in display order.
+_ZONE_MODE_FIELDS = (
+    (CONF_ZONE_ALLOW_HEAT, "heat"),
+    (CONF_ZONE_ALLOW_COOL, "cool"),
+    (CONF_ZONE_ALLOW_HEAT_COOL, "heat_cool"),
+    (CONF_ZONE_ALLOW_AUTO, "auto"),
+)
+# Options-flow tick box → stored heat source name, in display order.
+_ZONE_HEAT_SOURCE_FIELDS = (
+    (CONF_ZONE_HAS_GAS, "gas"),
+    (CONF_ZONE_HAS_HEAT_PUMP, "heat_pump"),
 )
 
 
@@ -416,6 +455,11 @@ class OneControlOptionsFlow(OptionsFlow):
     label and the page can name the cover it edits.  The user only walks those
     pages when they tick the box on the first page, so changing the fallback
     does not mean stepping through every cover.
+
+    Climate zones work the same way: a tick box on the first page walks one
+    page per discovered HVAC zone, where the zone's allowed modes and setpoint
+    range can be narrowed and its heat sources declared (``climate_zones``,
+    see ``climate_zones.py``).  A zone left at the defaults stores nothing.
     """
 
     def _coordinator(self) -> Any:
@@ -458,10 +502,36 @@ class OneControlOptionsFlow(OptionsFlow):
                 out[key] = dict(value)
         return out
 
+    def _discovered_zones(self) -> list[tuple[str, str]]:
+        """Return discovered HVAC zones as (settings key, friendly name).
+
+        The settings key is the zone's identity token, so stored settings
+        follow the zone through a table renumbering; installs that key
+        entities by address use the "tt:dd" key.  A zone whose identity is not
+        known yet is left out — it has no entity to configure either.
+        """
+        coordinator = self._coordinator()
+        if coordinator is None:
+            return []
+        out: list[tuple[str, str]] = []
+        for key in sorted(coordinator.hvac_zones):
+            try:
+                table_s, device_s = key.split(":")
+                table_id, device_id = int(table_s, 16), int(device_s, 16)
+            except ValueError:
+                continue
+            zone_id = coordinator.entity_identity(table_id, device_id)
+            if zone_id is None:
+                if coordinator.identity_mode != "legacy":
+                    continue
+                zone_id = key
+            out.append((zone_id, coordinator.device_name(table_id, device_id)))
+        return sorted(out, key=lambda zone: zone[1])
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the options: cover-control toggle, fallback travel time."""
+        """Manage the options: cover control, travel time, climate zones."""
         current = self.config_entry.options
 
         def _schema() -> vol.Schema:
@@ -482,6 +552,9 @@ class OneControlOptionsFlow(OptionsFlow):
                         CONF_CONFIGURE_COVER_TRAVEL,
                         default=bool(current.get(CONF_COVER_TRAVEL)),
                     ): bool,
+                    vol.Required(
+                        CONF_CONFIGURE_CLIMATE_ZONES, default=False
+                    ): bool,
                 }
             )
 
@@ -498,9 +571,18 @@ class OneControlOptionsFlow(OptionsFlow):
                 else []
             )
             self._travel_index = 0
+            # Same for climate zones: start from what is stored, walk only
+            # the zones the gateway has discovered, and only when asked to.
+            self._zones_merged = stored_zone_overrides(current)
+            self._zone_pages = (
+                self._discovered_zones()
+                if user_input.get(CONF_CONFIGURE_CLIMATE_ZONES)
+                else []
+            )
+            self._zone_index = 0
             if self._travel_covers:
                 return await self.async_step_travel()
-            return self._create_options(self._travel_merged)
+            return await self._after_travel()
 
         return self.async_show_form(
             step_id="init",
@@ -531,7 +613,7 @@ class OneControlOptionsFlow(OptionsFlow):
             self._travel_index = index + 1
             if self._travel_index < len(covers):
                 return await self.async_step_travel()
-            return self._create_options(self._travel_merged)
+            return await self._after_travel()
 
         previous = self._existing_overrides().get(cover_key, {})
         fields: dict[Any, Any] = {}
@@ -561,7 +643,72 @@ class OneControlOptionsFlow(OptionsFlow):
             },
         )
 
-    def _create_options(self, cover_travel: dict[str, dict[str, float]]) -> ConfigFlowResult:
+    async def _after_travel(self) -> ConfigFlowResult:
+        """Continue with the climate zone pages, or finish."""
+        if self._zone_index < len(self._zone_pages):
+            return await self.async_step_climate_zone()
+        return self._create_options()
+
+    async def async_step_climate_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect one climate zone's modes, setpoint range and heat sources."""
+        zones = self._zone_pages
+        index = self._zone_index
+        zone_id, zone_name = zones[index]
+        errors: dict[str, str] = {}
+
+        # What the form shows: the stored settings, or — when re-shown after
+        # an error — what the user just entered.
+        shown = zone_settings({CONF_CLIMATE_ZONES: self._zones_merged}, zone_id)
+
+        if user_input is not None:
+            entered = ZoneSettings(
+                modes=tuple(
+                    mode for field, mode in _ZONE_MODE_FIELDS if user_input.get(field)
+                ),
+                min_temp=int(user_input[CONF_ZONE_MIN_TEMP]),
+                max_temp=int(user_input[CONF_ZONE_MAX_TEMP]),
+                heat_sources=tuple(
+                    source
+                    for field, source in _ZONE_HEAT_SOURCE_FIELDS
+                    if user_input.get(field)
+                ),
+            )
+            if entered.min_temp >= entered.max_temp:
+                errors["base"] = "zone_min_not_below_max"
+                shown = entered
+            else:
+                override = zone_override(entered)
+                if override is None:
+                    # Back at the defaults: store nothing for this zone.
+                    self._zones_merged.pop(zone_id, None)
+                else:
+                    self._zones_merged[zone_id] = override
+                self._zone_index = index + 1
+                return await self._after_travel()
+
+        fields: dict[Any, Any] = {
+            vol.Required(field, default=mode in shown.modes): bool
+            for field, mode in _ZONE_MODE_FIELDS
+        }
+        fields[vol.Required(CONF_ZONE_MIN_TEMP, default=shown.min_temp)] = _ZONE_TEMP_FIELD
+        fields[vol.Required(CONF_ZONE_MAX_TEMP, default=shown.max_temp)] = _ZONE_TEMP_FIELD
+        for field, source in _ZONE_HEAT_SOURCE_FIELDS:
+            fields[vol.Required(field, default=source in shown.heat_sources)] = bool
+
+        return self.async_show_form(
+            step_id="climate_zone",
+            data_schema=vol.Schema(fields),
+            errors=errors,
+            description_placeholders={
+                "name": zone_name,
+                "index": str(index + 1),
+                "total": str(len(zones)),
+            },
+        )
+
+    def _create_options(self) -> ConfigFlowResult:
         """Build and persist the options entry.
 
         Merges onto the existing options so unrelated keys (e.g. the bonded
@@ -572,8 +719,12 @@ class OneControlOptionsFlow(OptionsFlow):
             CONF_ENABLE_COVER_CONTROL: self._enable_cover_control,
             CONF_COVER_SAFETY_TIMEOUT: self._fallback_travel,
         }
-        if cover_travel:
-            options[CONF_COVER_TRAVEL] = cover_travel
+        if self._travel_merged:
+            options[CONF_COVER_TRAVEL] = self._travel_merged
         else:
             options.pop(CONF_COVER_TRAVEL, None)
+        if self._zones_merged:
+            options[CONF_CLIMATE_ZONES] = self._zones_merged
+        else:
+            options.pop(CONF_CLIMATE_ZONES, None)
         return self.async_create_entry(data=options)

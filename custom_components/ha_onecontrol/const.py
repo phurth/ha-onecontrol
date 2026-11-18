@@ -172,6 +172,40 @@ CONF_COVER_TRAVEL_RETRACT = "retract"
 # only decides whether this save visits the per-cover pages.
 CONF_CONFIGURE_COVER_TRAVEL = "configure_cover_travel"
 
+# Per-zone climate settings, keyed by the zone's identity token (function name
+# + instance, e.g. "fn00c0_00"; the "tt:dd" address key on installs that key
+# entities by address):
+#   {"fn00c0_00": {"modes": ["heat", "cool", "heat_cool"], "min_temp": 47,
+#                  "max_temp": 95, "heat_sources": ["gas", "heat_pump"]}}
+# A zone without an entry keeps every mode, the default setpoint range, and
+# heat-source presets driven by learned capability alone.
+CONF_CLIMATE_ZONES = "climate_zones"
+CONF_ZONE_MODES = "modes"
+CONF_ZONE_HEAT_SOURCES = "heat_sources"
+CONF_ZONE_MIN_TEMP = "min_temp"
+CONF_ZONE_MAX_TEMP = "max_temp"
+# Options-flow tick box: walk the per-zone pages at all.  Not persisted.
+CONF_CONFIGURE_CLIMATE_ZONES = "configure_climate_zones"
+# Options-flow field names for one zone's allowed modes.  One tick box per mode
+# so every field has a translatable label.
+CONF_ZONE_ALLOW_HEAT = "allow_heat"
+CONF_ZONE_ALLOW_COOL = "allow_cool"
+CONF_ZONE_ALLOW_HEAT_COOL = "allow_heat_cool"
+CONF_ZONE_ALLOW_AUTO = "allow_auto"
+# Options-flow field names for the heat sources a zone is known to have.
+CONF_ZONE_HAS_GAS = "has_gas"
+CONF_ZONE_HAS_HEAT_PUMP = "has_heat_pump"
+
+# HVAC modes a zone can offer besides Off, as Home Assistant HVACMode values,
+# in display order.  "auto" is the thermostat's schedule mode.
+HVAC_ZONE_MODES = ("heat", "cool", "heat_cool", "auto")
+# Heat sources a zone can be declared to have, in display order.  Each one
+# makes its "Prefer …" preset available without waiting for it to be learned.
+HVAC_ZONE_HEAT_SOURCES = ("gas", "heat_pump")
+# Setpoint range (°F) offered when a zone has no stored limits.
+DEFAULT_HVAC_MIN_TEMP_F = 40
+DEFAULT_HVAC_MAX_TEMP_F = 95
+
 # Default cover travel time (seconds) when neither a per-cover nor a
 # per-direction override is set.  Preserves the pre-option behaviour.
 DEFAULT_COVER_SAFETY_TIMEOUT = 6.0

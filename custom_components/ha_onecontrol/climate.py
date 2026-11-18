@@ -41,6 +41,7 @@ from .const import (
     HVAC_PRESET_NONE,
     HVAC_SETPOINT_DEBOUNCE_S,
 )
+from .climate_zones import ZoneSettings, zone_settings
 from .coordinator import MetadataCommitted, OneControlCoordinator
 from .entity import DeviceEntityAdder, OneControlDeviceEntity
 from .protocol.events import HvacZone
@@ -98,15 +99,21 @@ async def async_setup_entry(
     _sweep()
 
 
+# Stored zone mode name → HA HVACMode
+_MODE_BY_NAME = {
+    "heat": HVACMode.HEAT,
+    "cool": HVACMode.COOL,
+    "heat_cool": HVACMode.HEAT_COOL,
+    "auto": HVACMode.AUTO,
+}
+
+
 class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoordinator], ClimateEntity):
     """A OneControl HVAC zone."""
 
     _attr_has_entity_name = True
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL, HVACMode.AUTO]
     _attr_fan_modes = ["auto", "high", "low"]
-    _attr_min_temp = 40
-    _attr_max_temp = 95
 
     def __init__(
         self,
@@ -140,6 +147,53 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         return self.coordinator.hvac_zones.get(self._key)
 
     @property
+    def _settings(self) -> ZoneSettings:
+        """This zone's modes and setpoint range from the integration options.
+
+        Read on every access so a change in the options applies without a
+        reload.  Keyed by the zone's identity token, so the settings follow
+        the zone when the gateway renumbers its table.
+        """
+        return zone_settings(
+            self.coordinator.entry.options, self._oc_ident or self._key
+        )
+
+    @property
+    def _capability(self) -> int:
+        """HVAC_CAP_* bits: learned from the zone's status, plus declared ones.
+
+        Capability is only learned once a zone has run on, or been set to, a
+        heat source — so a zone with both gas and a heat pump offers just one
+        "Prefer …" preset until the other has been chosen on the coach's own
+        controls.  Heat sources declared in the options are available at once.
+        """
+        learned = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        return learned | self._settings.capability
+
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        """Off, the modes allowed for this zone, and the mode it reports.
+
+        The reported mode is always listed, even when the options exclude it,
+        so the entity's state stays valid if the zone is put in that mode from
+        the coach's own controls.
+        """
+        modes = [HVACMode.OFF]
+        modes.extend(_MODE_BY_NAME[name] for name in self._settings.modes)
+        current = self.hvac_mode
+        if current not in modes:
+            modes.append(current)
+        return modes
+
+    @property
+    def min_temp(self) -> float:
+        return self._settings.min_temp
+
+    @property
+    def max_temp(self) -> float:
+        return self._settings.max_temp
+
+    @property
     def supported_features(self) -> ClimateEntityFeature:
         """Dynamic feature set: single vs dual setpoint, preset mode when capable."""
         features = ClimateEntityFeature.FAN_MODE
@@ -148,7 +202,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
             features |= ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
         elif mode != HVACMode.OFF:
             features |= ClimateEntityFeature.TARGET_TEMPERATURE
-        cap = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        cap = self._capability
         if cap & (HVAC_CAP_GAS | HVAC_CAP_HEAT_PUMP):
             features |= ClimateEntityFeature.PRESET_MODE
         return features
@@ -187,7 +241,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
 
     @property
     def preset_modes(self) -> list[str] | None:
-        cap = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        cap = self._capability
         if not (cap & (HVAC_CAP_GAS | HVAC_CAP_HEAT_PUMP)):
             return None
         modes = [HVAC_PRESET_NONE]
@@ -202,7 +256,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         zone = self._zone
         if zone is None:
             return None
-        cap = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        cap = self._capability
         if not (cap & (HVAC_CAP_GAS | HVAC_CAP_HEAT_PUMP)):
             return None
         return {0: HVAC_PRESET_GAS, 1: HVAC_PRESET_HEAT_PUMP}.get(

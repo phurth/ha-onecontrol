@@ -210,6 +210,7 @@ Brightness control in HA is implemented by scaling R/G/B channel values proporti
 - Switch entities map relay actions and status.
 - Light entities include dimmable and RGB variants.
 - Climate entities model per-zone HVAC mode/fan/setpoint state.
+- Per-zone climate settings (`climate_zones.py`, options key `climate_zones`): the options flow can narrow a zone's offered HVAC modes and its setpoint range. Keyed by the zone's identity token (function name + instance; the `tt:dd` address key on address-keyed installs) so they survive a table renumbering. A zone without an entry keeps all modes and 40–95 °F. The mode a zone currently reports is always listed. A zone's heat sources (`heat_sources`: gas, heat pump) can be declared as well; they are OR-ed into the learned capability so the matching "Prefer …" presets are offered before they have been learned, and never hide a learned one. Entities read the options live, so saving them refreshes entity state without reloading the entry (the key is excluded from the reload snapshot). Modes are not derived from `observed_hvac_capability`: that is also learned from the mode a zone is *set to*, so offering Heat once would make it look supported.
 - Sensor/binary/button entities expose tanks, system status, lockout, diagnostics, and controls.
 
 ## 7. Command and Control Surface
