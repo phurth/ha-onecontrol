@@ -24,22 +24,42 @@ from typing import Any
 
 from .const import (
     CONF_CLIMATE_ZONES,
+    CONF_ZONE_HEAT_SOURCES,
     CONF_ZONE_MAX_TEMP,
     CONF_ZONE_MIN_TEMP,
     CONF_ZONE_MODES,
     DEFAULT_HVAC_MAX_TEMP_F,
     DEFAULT_HVAC_MIN_TEMP_F,
+    HVAC_CAP_GAS,
+    HVAC_CAP_HEAT_PUMP,
+    HVAC_ZONE_HEAT_SOURCES,
     HVAC_ZONE_MODES,
 )
+
+_HEAT_SOURCE_CAPABILITY = {"gas": HVAC_CAP_GAS, "heat_pump": HVAC_CAP_HEAT_PUMP}
 
 
 @dataclass(frozen=True)
 class ZoneSettings:
-    """What one climate zone offers: modes besides Off, and its setpoint range."""
+    """What one climate zone offers.
+
+    ``modes`` are the HVAC modes besides Off.  ``heat_sources`` are the heat
+    sources the zone is declared to have; they only ever add to what is
+    learned from the zone's status, never hide a learned one.
+    """
 
     modes: tuple[str, ...] = HVAC_ZONE_MODES
     min_temp: int = DEFAULT_HVAC_MIN_TEMP_F
     max_temp: int = DEFAULT_HVAC_MAX_TEMP_F
+    heat_sources: tuple[str, ...] = ()
+
+    @property
+    def capability(self) -> int:
+        """HVAC_CAP_* bits for the declared heat sources."""
+        bits = 0
+        for source in self.heat_sources:
+            bits |= _HEAT_SOURCE_CAPABILITY[source]
+        return bits
 
 
 DEFAULT_ZONE_SETTINGS = ZoneSettings()
@@ -56,12 +76,14 @@ def _as_temp(value: object, default: int) -> int:
     return max(DEFAULT_HVAC_MIN_TEMP_F, min(DEFAULT_HVAC_MAX_TEMP_F, temp))
 
 
-def _as_modes(value: object) -> tuple[str, ...]:
-    """Coerce a stored mode list: known modes only, in canonical order."""
+def _as_choices(
+    value: object, known: tuple[str, ...], default: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Coerce a stored list of names: known ones only, in canonical order."""
     if isinstance(value, str) or not isinstance(value, Iterable):
-        return HVAC_ZONE_MODES
-    chosen = {mode for mode in value if isinstance(mode, str)}
-    return tuple(mode for mode in HVAC_ZONE_MODES if mode in chosen)
+        return default
+    chosen = {name for name in value if isinstance(name, str)}
+    return tuple(name for name in known if name in chosen)
 
 
 def zone_settings(options: Mapping[str, Any] | None, zone_id: str | None) -> ZoneSettings:
@@ -78,12 +100,19 @@ def zone_settings(options: Mapping[str, Any] | None, zone_id: str | None) -> Zon
     raw = zones.get(zone_id)
     if not isinstance(raw, Mapping):
         return DEFAULT_ZONE_SETTINGS
-    modes = _as_modes(raw.get(CONF_ZONE_MODES, HVAC_ZONE_MODES))
+    modes = _as_choices(
+        raw.get(CONF_ZONE_MODES, HVAC_ZONE_MODES), HVAC_ZONE_MODES, HVAC_ZONE_MODES
+    )
+    heat_sources = _as_choices(
+        raw.get(CONF_ZONE_HEAT_SOURCES, ()), HVAC_ZONE_HEAT_SOURCES, ()
+    )
     min_temp = _as_temp(raw.get(CONF_ZONE_MIN_TEMP), DEFAULT_HVAC_MIN_TEMP_F)
     max_temp = _as_temp(raw.get(CONF_ZONE_MAX_TEMP), DEFAULT_HVAC_MAX_TEMP_F)
     if min_temp >= max_temp:
         min_temp, max_temp = DEFAULT_HVAC_MIN_TEMP_F, DEFAULT_HVAC_MAX_TEMP_F
-    return ZoneSettings(modes=modes, min_temp=min_temp, max_temp=max_temp)
+    return ZoneSettings(
+        modes=modes, min_temp=min_temp, max_temp=max_temp, heat_sources=heat_sources
+    )
 
 
 def _as_dict(settings: ZoneSettings) -> dict[str, Any]:
@@ -91,6 +120,7 @@ def _as_dict(settings: ZoneSettings) -> dict[str, Any]:
         CONF_ZONE_MODES: list(settings.modes),
         CONF_ZONE_MIN_TEMP: settings.min_temp,
         CONF_ZONE_MAX_TEMP: settings.max_temp,
+        CONF_ZONE_HEAT_SOURCES: list(settings.heat_sources),
     }
 
 

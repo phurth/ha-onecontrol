@@ -52,12 +52,12 @@
     "step": {
       "init": {
         "title": "OneControl Options",
-        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\n**Travel time** is how long one open/close press runs the motor. Set a fallback here and, if this coach has more than one cover, tick the box to set a per-cover value for each. A failsafe safety stop is derived from the travel time and applied automatically, so a dropped stop command cannot leave a motor running indefinitely.\n\nOnly enable cover control if you understand and accept the risk.\n\n**Climate zones:** to limit which modes a zone offers, or how low or high its setpoint can go, tick the last box.",
+        "description": "Motor control of awnings and slides is **disabled by default**.\n\nThe awning and slide are driven by H-bridge motors with no limit switches and no automatic supervision. Enabling cover control lets Home Assistant open, close and stop them, but a stuck button or a dropped connection could keep a motor running and damage the awning or slide.\n\n**Travel time** is how long one open/close press runs the motor. Set a fallback here and, if this coach has more than one cover, tick the box to set a per-cover value for each. A failsafe safety stop is derived from the travel time and applied automatically, so a dropped stop command cannot leave a motor running indefinitely.\n\nOnly enable cover control if you understand and accept the risk.\n\n**Climate zones:** to choose which modes and heat-source presets a zone offers, or how low or high its setpoint can go, tick the last box.",
         "data": {
           "enable_cover_control": "Enable awning/slide (cover) control",
           "cover_safety_timeout": "Cover travel time, fallback (seconds)",
           "configure_cover_travel": "Set a travel time for each cover",
-          "configure_climate_zones": "Set modes and setpoint limits for each climate zone"
+          "configure_climate_zones": "Set modes, setpoint limits and heat sources for each climate zone"
         }
       },
       "travel": {
@@ -70,14 +70,16 @@
       },
       "climate_zone": {
         "title": "Climate Zone Settings",
-        "description": "Settings for **{name}** (zone {index} of {total}). Untick the modes this zone does not have, for example Heat on a zone with no furnace, or Auto if the thermostat has no schedule mode. Off is always available, and the mode a zone currently reports is always shown. Setpoints are in °F. These pages are only offered while the gateway has discovered the zones; stored values are kept for zones that are offline.",
+        "description": "Settings for **{name}** (zone {index} of {total}).\n\n**Modes:** untick the ones this zone does not have, for example Heat on a zone with no heat source, or Auto if the thermostat has no schedule mode. Off is always available, and the mode a zone currently reports is always shown.\n\n**Setpoints** are in °F.\n\n**Heat sources:** a \"Prefer Gas\" or \"Prefer Heat Pump\" preset normally appears only after the zone has used that heat source. Tick the ones this zone has to offer their presets straight away.\n\nThese pages are only offered while the gateway has discovered the zones; stored values are kept for zones that are offline.",
         "data": {
           "allow_heat": "Offer Heat",
           "allow_cool": "Offer Cool",
           "allow_heat_cool": "Offer Heat/Cool",
           "allow_auto": "Offer Auto (schedule)",
           "min_temp": "Lowest setpoint (°F)",
-          "max_temp": "Highest setpoint (°F)"
+          "max_temp": "Highest setpoint (°F)",
+          "has_gas": "Has gas heat (offer Prefer Gas)",
+          "has_heat_pump": "Has a heat pump (offer Prefer Heat Pump)"
         }
       }
     },

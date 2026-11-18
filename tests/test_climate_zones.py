@@ -82,9 +82,29 @@ def test_default_settings_store_nothing() -> None:
     assert zone_override(DEFAULT_ZONE_SETTINGS) is None
     settings = ZoneSettings(("heat", "cool", "heat_cool"), 47, 95)
     override = zone_override(settings)
-    assert override == {"modes": ["heat", "cool", "heat_cool"], "min_temp": 47, "max_temp": 95}
+    assert override == {
+        "modes": ["heat", "cool", "heat_cool"], "min_temp": 47, "max_temp": 95, "heat_sources": [],
+    }
     json.dumps(override)  # must be storable in the config entry
     assert zone_settings({"climate_zones": {MAIN: override}}, MAIN) == settings
+    # Declaring a heat source is a setting too, even with everything else default.
+    only_sources = ZoneSettings(heat_sources=("gas", "heat_pump"))
+    assert zone_override(only_sources)["heat_sources"] == ["gas", "heat_pump"]
+    assert zone_settings({"climate_zones": {MAIN: zone_override(only_sources)}}, MAIN) == only_sources
+
+
+def test_declared_heat_sources() -> None:
+    def resolve(raw: object) -> ZoneSettings:
+        return zone_settings({"climate_zones": {MAIN: {"heat_sources": raw}}}, MAIN)
+
+    assert DEFAULT_ZONE_SETTINGS.heat_sources == () and DEFAULT_ZONE_SETTINGS.capability == 0
+    assert resolve(["heat_pump", "gas"]).heat_sources == ("gas", "heat_pump")
+    assert resolve(["gas"]).capability == 0x01
+    assert resolve(["heat_pump"]).capability == 0x04
+    assert resolve(["gas", "heat_pump"]).capability == 0x05
+    # Unknown names and malformed values declare nothing.
+    assert resolve(["electric", 3]).heat_sources == ()
+    assert resolve("gas").heat_sources == () == resolve(None).heat_sources
 
 
 def test_stored_overrides_are_copied() -> None:
@@ -165,6 +185,30 @@ def test_settings_follow_the_zone_through_a_renumbering(platforms) -> None:  # n
     assert len(bedroom.hvac_modes) == 5 and bedroom.min_temp == 40
 
 
+def test_declared_heat_sources_offer_their_presets(platforms) -> None:  # noqa: F811
+    """A zone with gas and a heat pump that has only ever used gas."""
+    options: dict = {}
+    rig, main, _mode = _climate_rig(platforms, options)
+    c = rig.coordinator
+    # Nothing learned, nothing declared: no presets (today's behaviour).
+    assert main.preset_modes is None
+    # Learned gas only: the heat pump preset is missing until it has been used.
+    c.observed_hvac_capability[main._key] = 0x01
+    assert main.preset_modes == ["none", "Prefer Gas"]
+
+    options["climate_zones"] = {MAIN: {"heat_sources": ["heat_pump"]}}
+    assert main.preset_modes == ["none", "Prefer Gas", "Prefer Heat Pump"]
+    # Declared sources only add: with nothing learned, the declared one shows…
+    c.observed_hvac_capability.clear()
+    assert main.preset_modes == ["none", "Prefer Heat Pump"]
+    # …and a learned one is never hidden by leaving its box unticked.
+    c.observed_hvac_capability[main._key] = 0x05
+    options["climate_zones"] = {MAIN: {"heat_sources": []}}
+    assert main.preset_modes == ["none", "Prefer Gas", "Prefer Heat Pump"]
+    # Other zones are unaffected.
+    assert rig.entity("climate.bedroom_climate_zone").preset_modes is None
+
+
 def test_address_keyed_install_uses_the_address_key(platforms) -> None:  # noqa: F811
     """IDS-CAN BLE: no function ID, so settings are keyed by "tt:dd"."""
     rig = Rig(platforms)
@@ -202,9 +246,10 @@ def test_zone_form_fields_have_translations() -> None:
         for name in (
             "CONF_ZONE_ALLOW_HEAT", "CONF_ZONE_ALLOW_COOL", "CONF_ZONE_ALLOW_HEAT_COOL",
             "CONF_ZONE_ALLOW_AUTO", "CONF_ZONE_MIN_TEMP", "CONF_ZONE_MAX_TEMP",
+            "CONF_ZONE_HAS_GAS", "CONF_ZONE_HAS_HEAT_PUMP",
         )
     }
-    assert len(fields) == 6
+    assert len(fields) == 8
     for path in (COMPONENT / "strings.json", COMPONENT / "translations" / "en.json"):
         options = json.loads(path.read_text(encoding="utf-8"))["options"]
         step = options["step"]["climate_zone"]

@@ -159,6 +159,18 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         )
 
     @property
+    def _capability(self) -> int:
+        """HVAC_CAP_* bits: learned from the zone's status, plus declared ones.
+
+        Capability is only learned once a zone has run on, or been set to, a
+        heat source — so a zone with both gas and a heat pump offers just one
+        "Prefer …" preset until the other has been chosen on the coach's own
+        controls.  Heat sources declared in the options are available at once.
+        """
+        learned = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        return learned | self._settings.capability
+
+    @property
     def hvac_modes(self) -> list[HVACMode]:
         """Off, the modes allowed for this zone, and the mode it reports.
 
@@ -190,7 +202,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
             features |= ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
         elif mode != HVACMode.OFF:
             features |= ClimateEntityFeature.TARGET_TEMPERATURE
-        cap = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        cap = self._capability
         if cap & (HVAC_CAP_GAS | HVAC_CAP_HEAT_PUMP):
             features |= ClimateEntityFeature.PRESET_MODE
         return features
@@ -229,7 +241,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
 
     @property
     def preset_modes(self) -> list[str] | None:
-        cap = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        cap = self._capability
         if not (cap & (HVAC_CAP_GAS | HVAC_CAP_HEAT_PUMP)):
             return None
         modes = [HVAC_PRESET_NONE]
@@ -244,7 +256,7 @@ class OneControlClimate(OneControlDeviceEntity, CoordinatorEntity[OneControlCoor
         zone = self._zone
         if zone is None:
             return None
-        cap = self.coordinator.observed_hvac_capability.get(self._key, 0)
+        cap = self._capability
         if not (cap & (HVAC_CAP_GAS | HVAC_CAP_HEAT_PUMP)):
             return None
         return {0: HVAC_PRESET_GAS, 1: HVAC_PRESET_HEAT_PUMP}.get(

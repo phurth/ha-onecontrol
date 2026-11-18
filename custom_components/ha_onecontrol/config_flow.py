@@ -37,6 +37,8 @@ from .const import (
     CONF_ZONE_ALLOW_COOL,
     CONF_ZONE_ALLOW_HEAT,
     CONF_ZONE_ALLOW_HEAT_COOL,
+    CONF_ZONE_HAS_GAS,
+    CONF_ZONE_HAS_HEAT_PUMP,
     CONF_ZONE_MAX_TEMP,
     CONF_ZONE_MIN_TEMP,
     DEFAULT_HVAC_MAX_TEMP_F,
@@ -89,6 +91,11 @@ _ZONE_MODE_FIELDS = (
     (CONF_ZONE_ALLOW_COOL, "cool"),
     (CONF_ZONE_ALLOW_HEAT_COOL, "heat_cool"),
     (CONF_ZONE_ALLOW_AUTO, "auto"),
+)
+# Options-flow tick box → stored heat source name, in display order.
+_ZONE_HEAT_SOURCE_FIELDS = (
+    (CONF_ZONE_HAS_GAS, "gas"),
+    (CONF_ZONE_HAS_HEAT_PUMP, "heat_pump"),
 )
 
 
@@ -451,8 +458,8 @@ class OneControlOptionsFlow(OptionsFlow):
 
     Climate zones work the same way: a tick box on the first page walks one
     page per discovered HVAC zone, where the zone's allowed modes and setpoint
-    range can be narrowed (``climate_zones``, see ``climate_zones.py``).  A
-    zone left at the defaults stores nothing.
+    range can be narrowed and its heat sources declared (``climate_zones``,
+    see ``climate_zones.py``).  A zone left at the defaults stores nothing.
     """
 
     def _coordinator(self) -> Any:
@@ -645,7 +652,7 @@ class OneControlOptionsFlow(OptionsFlow):
     async def async_step_climate_zone(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Collect one climate zone's allowed modes and setpoint range."""
+        """Collect one climate zone's modes, setpoint range and heat sources."""
         zones = self._zone_pages
         index = self._zone_index
         zone_id, zone_name = zones[index]
@@ -662,6 +669,11 @@ class OneControlOptionsFlow(OptionsFlow):
                 ),
                 min_temp=int(user_input[CONF_ZONE_MIN_TEMP]),
                 max_temp=int(user_input[CONF_ZONE_MAX_TEMP]),
+                heat_sources=tuple(
+                    source
+                    for field, source in _ZONE_HEAT_SOURCE_FIELDS
+                    if user_input.get(field)
+                ),
             )
             if entered.min_temp >= entered.max_temp:
                 errors["base"] = "zone_min_not_below_max"
@@ -682,6 +694,8 @@ class OneControlOptionsFlow(OptionsFlow):
         }
         fields[vol.Required(CONF_ZONE_MIN_TEMP, default=shown.min_temp)] = _ZONE_TEMP_FIELD
         fields[vol.Required(CONF_ZONE_MAX_TEMP, default=shown.max_temp)] = _ZONE_TEMP_FIELD
+        for field, source in _ZONE_HEAT_SOURCE_FIELDS:
+            fields[vol.Required(field, default=source in shown.heat_sources)] = bool
 
         return self.async_show_form(
             step_id="climate_zone",
