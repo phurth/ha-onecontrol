@@ -70,6 +70,14 @@ async def async_get_config_entry_diagnostics(
         "is_x180t_gateway": coordinator.is_x180t_gateway,
         "pin_bond_attempted": getattr(coordinator, "_pin_bond_attempted", None),
         "has_can_write": coordinator._has_can_write,
+        # Which local adapter(s) hold the BlueZ bond, whether connections are
+        # pinned to them, and the path the current link actually uses.
+        "bluetooth_path": {
+            "bonded_adapters": dict(coordinator.bonded_adapters),
+            "pinning_active": coordinator.pinning_active,
+            "fallback_source": coordinator.fallback_source,
+            "connected_through": coordinator.connection_source,
+        },
         "consecutive_reconnect_failures": coordinator._consecutive_failures,
         "pending_metadata_cmdids": len(coordinator._pending_metadata_cmdids),
         "pending_get_devices_cmdids": len(coordinator._pending_get_devices_cmdids),

@@ -116,9 +116,13 @@ def _make_pinned_client_class(base: type) -> type:
             address_or_ble_device: Any,
             *args: Any,
             pinned_sources: Any = (),
+            fallback_sources: Any = (),
             **kwargs: Any,
         ) -> None:
             self._oc_pinned = frozenset(normalize_source(s) for s in pinned_sources)
+            self._oc_fallback = frozenset(
+                normalize_source(s) for s in fallback_sources
+            ) - self._oc_pinned
             self._oc_address = str(
                 getattr(address_or_ble_device, "address", address_or_ble_device)
             )
@@ -127,7 +131,7 @@ def _make_pinned_client_class(base: type) -> type:
         def _async_get_best_available_backend_and_device(
             self, *args: Any, **kwargs: Any
         ) -> Any:
-            if not self._oc_pinned:
+            if not (self._oc_pinned or self._oc_fallback):
                 return super()._async_get_best_available_backend_and_device(
                     *args, **kwargs
                 )
@@ -138,18 +142,29 @@ def _make_pinned_client_class(base: type) -> type:
                 manager = get_manager()
             address = self._oc_address
             candidates = list(manager.async_scanner_devices_by_address(address, True))
-            usable = pinned_candidates(candidates, self._oc_pinned)
-            others = [c for c in candidates if c not in usable]
             stock = stock_choice(candidates)
-            for candidate in usable:
-                backend = getattr(self, _BACKEND_METHOD)(
-                    manager, candidate.scanner, candidate.ble_device
-                )
-                if backend is not None:
+            heard = False
+            # Tier 1: the adapter(s) holding the bond right now.  Tier 2: a path
+            # that has authenticated before (a proxy holding its own bond),
+            # only when no tier-1 adapter can take the connection.
+            for tier, role in (
+                (self._oc_pinned, "the adapter holding the bond"),
+                (self._oc_fallback, "a path that authenticated before"),
+            ):
+                usable = pinned_candidates(candidates, tier)
+                heard = heard or bool(usable)
+                for candidate in usable:
+                    backend = getattr(self, _BACKEND_METHOD)(
+                        manager, candidate.scanner, candidate.ble_device
+                    )
+                    if backend is None:
+                        continue
+                    others = [c for c in candidates if c is not candidate]
                     _LOGGER.info(
-                        "%s: connecting through %s, the adapter holding the bond%s%s",
+                        "%s: connecting through %s, %s%s%s",
                         address,
                         _describe(candidate),
+                        role,
                         (
                             "; not using " + ", ".join(_describe(c) for c in others)
                             if others
@@ -162,16 +177,16 @@ def _make_pinned_client_class(base: type) -> type:
                         ),
                     )
                     return backend
-            pinned_text = ", ".join(sorted(self._oc_pinned))
-            if usable:
+            allowed_text = ", ".join(sorted(self._oc_pinned | self._oc_fallback))
+            if heard:
                 msg = (
-                    f"{address}: the adapter holding the bond ({pinned_text}) "
-                    "has no free connection slot"
+                    f"{address}: no free connection slot on the path(s) able to "
+                    f"authenticate ({allowed_text})"
                 )
             else:
                 msg = (
-                    f"{address}: the adapter holding the bond ({pinned_text}) "
-                    "has not heard the device recently"
+                    f"{address}: the path(s) able to authenticate ({allowed_text}) "
+                    "have not heard the device recently"
                 )
             raise PinnedAdapterUnavailable(msg)
 

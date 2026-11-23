@@ -143,7 +143,7 @@ def test_log_names_the_path_home_assistant_would_have_used(caplog) -> None:
 def test_pinned_adapter_not_hearing_the_device_is_refused() -> None:
     client = PinnedClient(GATEWAY, pinned_sources={BONDED})
 
-    with pytest.raises(PinnedAdapterUnavailable, match="has not heard"):
+    with pytest.raises(PinnedAdapterUnavailable, match="not heard"):
         client._async_get_best_available_backend_and_device(_Manager(_candidate(PROXY, -40)))
 
 
@@ -153,6 +153,29 @@ def test_pinned_adapter_without_a_slot_is_refused() -> None:
 
     with pytest.raises(PinnedAdapterUnavailable, match="no free connection slot"):
         client._async_get_best_available_backend_and_device(_Manager(_candidate(BONDED, -40)))
+
+
+def test_fallback_proxy_is_used_only_when_no_bonded_adapter_can() -> None:
+    manager = _Manager(_candidate(PROXY, -40), _candidate(OTHER, -45))
+    client = PinnedClient(GATEWAY, pinned_sources={BONDED}, fallback_sources={PROXY})
+
+    assert client._async_get_best_available_backend_and_device(manager) == f"backend via {PROXY}"
+
+
+def test_bonded_adapter_beats_a_stronger_fallback_proxy() -> None:
+    """A stale proxy bond must not win just because it is louder (habluetooth #628)."""
+    manager = _Manager(_candidate(PROXY, -40), _candidate(BONDED, -80))
+    client = PinnedClient(GATEWAY, pinned_sources={BONDED}, fallback_sources={PROXY})
+
+    assert client._async_get_best_available_backend_and_device(manager) == f"backend via {BONDED}"
+
+
+def test_fallback_alone_does_not_unpin_other_paths() -> None:
+    manager = _Manager(_candidate(OTHER, -40))
+    client = PinnedClient(GATEWAY, pinned_sources={BONDED}, fallback_sources={PROXY})
+
+    with pytest.raises(PinnedAdapterUnavailable, match="not heard"):
+        client._async_get_best_available_backend_and_device(manager)
 
 
 def test_refusal_is_a_bleak_error() -> None:
@@ -289,7 +312,11 @@ def _coordinator(**attrs: object) -> OneControlCoordinator:
         "_connect_adapter": None,
         "_pinned_sources": PINNED,
         "_pinned_device_paths": PINNED_PATHS,
+        "_fallback_sources": frozenset(),
         "_pin_refused": False,
+        "connection_source": None,
+        "fallback_source": None,
+        "bonded_adapters": {},
     }
     defaults.update(attrs)
     for name, value in defaults.items():
@@ -331,6 +358,16 @@ def test_link_that_bypassed_the_pin_is_dropped_quietly() -> None:
 
     assert client.callback_cleared, "the drop must not schedule a second reconnect"
     assert client.disconnected
+
+
+def test_link_through_a_proxy_that_authenticated_before_is_kept() -> None:
+    coordinator = _coordinator(_fallback_sources=frozenset({"CCBA9710C186"}))
+    client = _LiveClient(PROXY, None)
+
+    asyncio.run(coordinator._check_connection_path(client))
+
+    assert not client.disconnected
+    assert coordinator.connection_source == PROXY
 
 
 def test_proxy_link_records_no_local_adapter() -> None:

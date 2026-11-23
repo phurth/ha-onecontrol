@@ -74,6 +74,14 @@ through a D-Bus socket proxy, is confirmed working with no USB dongle and no Blu
 
 **Compatible hardware:** the Raspberry Pi's built-in Bluetooth adapter, or any USB Bluetooth dongle recognized by the HA host. To extend range as much as possible, a USB adapter with an antenna is highly recommended.
 
+### More than one Bluetooth adapter or proxy
+
+A bond (pairing) belongs to the one Bluetooth adapter that made it, and only that adapter can log in to the gateway. Home Assistant normally picks whichever adapter or proxy it rates best for each connection, so on a host with a second adapter or an ESPHome proxy it could connect through one without the bond, which fails (all OneControl entities go unavailable).
+
+For a gateway that pairs, the integration therefore connects **only through the adapter holding the bond**, even when another adapter or a proxy has a stronger signal. If that adapter can't reach the gateway, it waits and retries rather than trying a path that can't log in. A proxy that has logged in before (for example a pre-bonded ESP32, below) is used only when no bonded local adapter can take the connection.
+
+The gateway device gets a diagnostic **Bonded Adapter** sensor (for gateways that pair) showing the adapter's address, its `hciN` name and the path the connection currently uses. Gateways that never pair, such as most IDS-CAN gateways, are unaffected.
+
 ### ESPHome Bluetooth Proxy (not supported for PIN gateways)
 
 ESPHome proxies forward GATT operations but do not relay BLE passkey/pairing events back to the HA host. The passkey exchange must happen on the device with the BLE radio, which is the ESP32 — but the ESP32 has no way to receive the PIN from HA during a live pairing attempt.

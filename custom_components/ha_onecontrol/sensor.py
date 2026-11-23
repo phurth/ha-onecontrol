@@ -123,9 +123,25 @@ async def async_setup_entry(
 
     coordinator.register_event_callback(_on_event)
 
+    # The bonded-adapter sensor only exists for gateways that pair: it is
+    # added the first time BlueZ reports a bond (the coordinator checks on
+    # every connect attempt and notifies listeners when that changes).
+    bonded_sensor_added = False
+
+    @callback
+    def _add_bonded_adapter_sensor() -> None:
+        nonlocal bonded_sensor_added
+        if bonded_sensor_added or not coordinator.bonded_adapters:
+            return
+        bonded_sensor_added = True
+        async_add_entities([OneControlBondedAdapterSensor(coordinator, address)])
+
+    entry.async_on_unload(coordinator.async_add_listener(_add_bonded_adapter_sensor))
+
     # Pre-discover from coordinator state
     entities.extend(_sweep())
     async_add_entities(entities)
+    _add_bonded_adapter_sensor()
 
 
 # ── Base ──────────────────────────────────────────────────────────────────
@@ -310,6 +326,48 @@ class OneControlProtocolVersionSensor(_OneControlSensorBase):
     def native_value(self) -> int | None:
         gi = self.coordinator.gateway_info
         return gi.protocol_version if gi else None
+
+
+class OneControlBondedAdapterSensor(_OneControlSensorBase):
+    """Local Bluetooth adapter holding the gateway's bond (gateways that pair).
+
+    BlueZ keeps a bond per adapter, and only that adapter can authenticate
+    with the gateway, so connections are pinned to it (see ble_pinning.py).
+    The state is the adapter's MAC address; the hciN name can change between
+    boots, so it is an attribute.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Bonded Adapter"
+    _attr_icon = "mdi:bluetooth-connect"
+
+    def __init__(self, coordinator: OneControlCoordinator, address: str) -> None:
+        super().__init__(coordinator, address)
+        self._attr_unique_id = f"{self._mac}_bonded_adapter"
+
+    @property
+    def available(self) -> bool:
+        """Bond state comes from BlueZ, not the gateway link.
+
+        It stays available while the gateway is disconnected, which is when
+        it is most useful.
+        """
+        return True
+
+    @property
+    def native_value(self) -> str | None:
+        adapters = self.coordinator.bonded_adapters
+        return ", ".join(adapters) if adapters else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        coordinator = self.coordinator
+        return {
+            "adapters": dict(coordinator.bonded_adapters),
+            "pinned": coordinator.pinning_active,
+            "fallback_source": coordinator.fallback_source,
+            "connected_through": coordinator.connection_source,
+        }
 
 
 # ── Tank Sensors ──────────────────────────────────────────────────────────

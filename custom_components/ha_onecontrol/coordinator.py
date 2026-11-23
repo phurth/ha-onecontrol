@@ -507,6 +507,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # (see ble_pinning.py).  Refreshed on every connect attempt.
         self._pinned_sources: frozenset[str] = frozenset()
         self._pinned_device_paths: frozenset[str] = frozenset()
+        # A proxy that authenticated before (it holds its own bond); allowed
+        # only when no bonded local adapter can take the connection.
+        self._fallback_sources: frozenset[str] = frozenset()
+        # {adapter MAC: "hciN"} for each local adapter holding the gateway's
+        # BlueZ bond, as of the last connect attempt (diagnostic sensor).
+        self.bonded_adapters: dict[str, str] = {}
+        # Scanner source the current link actually goes through, when known.
+        self.connection_source: str | None = None
+        # Stored source allowed as the second choice (a proxy with its own bond).
+        self.fallback_source: str | None = None
         # True when the last connect failed only because the bonded adapter
         # could not take it.  That says nothing about the bond itself, so it
         # must not count toward stale-bond removal.
@@ -2554,6 +2564,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._pairing_method == "pin"
 
     @property
+    def pinning_active(self) -> bool:
+        """True when connections are restricted to the adapter holding the bond."""
+        return bool(self._pinned_sources) and pinned_client_class() is not None
+
+    @property
     def is_x180t_gateway(self) -> bool:
         """True for Unity X180T CAN-BLE gateways."""
         return self._gateway_family == GATEWAY_FAMILY_X180T
@@ -2613,16 +2628,40 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # the bonded adapter(s); see ble_pinning.py.
         self._pinned_sources = frozenset(_normalize_source(m) for m in bonded_macs)
         self._pinned_device_paths = frozenset(bonded_paths.values())
+        bonded_adapters = {
+            mac: path.split("/")[3] if path.count("/") >= 4 else ""
+            for mac, path in sorted(bonded_paths.items())
+        }
+        if bonded_adapters != self.bonded_adapters:
+            self.bonded_adapters = bonded_adapters
+            # Let the diagnostic sensor appear/update even if this connect is
+            # refused below — that is exactly when it is most useful.
+            self.async_update_listeners()
+        # A proxy can hold its own bond (pre-bonded ESP32, see README).  The
+        # stored source is only written after a successful authentication, so
+        # a proxy there has proven it works; it is allowed as a second choice,
+        # used only when no bonded local adapter can take the connection.
+        local_norm = {_normalize_source(m) for m in local_macs}
+        self._fallback_sources = (
+            frozenset({_normalize_source(bonded_source)})
+            if self._pinned_sources
+            and bonded_source
+            and _normalize_source(bonded_source) not in local_norm
+            else frozenset()
+        )
+        self.fallback_source = bonded_source if self._fallback_sources else None
+        allowed = self._pinned_sources | self._fallback_sources
         pinned_cls = pinned_client_class() if self._pinned_sources else None
         if self._pinned_sources:
             pinned_text = ", ".join(sorted(bonded_macs))
+            if self._fallback_sources:
+                pinned_text += f"; then {bonded_source}, which authenticated before"
             if candidates_known and not any(
-                _normalize_source(c.scanner.source) in self._pinned_sources
-                for c in candidates
+                _normalize_source(c.scanner.source) in allowed for c in candidates
             ):
                 raise PinnedAdapterUnavailable(
-                    f"{self.address}: the adapter holding the bond ({pinned_text}) "
-                    "has not heard the gateway recently; not connecting through "
+                    f"{self.address}: no path able to authenticate ({pinned_text}) "
+                    "has heard the gateway recently; not connecting through "
                     "another adapter or proxy, which cannot authenticate"
                 )
             _LOGGER.info(
@@ -2822,7 +2861,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             pin_kwargs: dict[str, Any] = (
-                {"pinned_sources": self._pinned_sources} if pinned_cls else {}
+                {
+                    "pinned_sources": self._pinned_sources,
+                    "fallback_sources": self._fallback_sources,
+                }
+                if pinned_cls
+                else {}
             )
             client = await establish_connection(
                 pinned_cls or BleakClient,
@@ -2854,10 +2898,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # BlueZ bond checks and pairing below must target the adapter that
             # actually carries the link (none for a proxy).
             self._connect_adapter = path.source if path.device_path else None
+        self.connection_source = path.source
         if not self._pinned_sources:
             _LOGGER.debug("Connected to %s through %s", self.address, path.describe())
             return
-        match = path_matches_pin(path, self._pinned_sources, self._pinned_device_paths)
+        match = path_matches_pin(
+            path,
+            self._pinned_sources | self._fallback_sources,
+            self._pinned_device_paths,
+        )
         if match is None:
             _LOGGER.debug(
                 "Connected to %s; could not tell which adapter carries the link",
@@ -2866,8 +2915,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         if match:
             _LOGGER.info(
-                "Connected to %s through %s, the adapter holding its bond",
-                self.address, path.describe(),
+                "Connected to %s through %s, %s",
+                self.address,
+                path.describe(),
+                "the adapter holding its bond"
+                if path.device_path in self._pinned_device_paths
+                or (path.source and _normalize_source(path.source) in self._pinned_sources)
+                else "a path that authenticated before",
             )
             return
         _LOGGER.warning(
@@ -6078,6 +6132,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Handle unexpected BLE disconnect — schedule reconnect with backoff."""
         _LOGGER.debug("OneControl %s disconnected (instance=%s)", self.address, self._instance_tag)
         self._stop_heartbeat()
+        self.connection_source = None
         self._connected = False
         self._authenticated = False
         self._decoder.reset()

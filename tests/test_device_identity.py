@@ -209,6 +209,14 @@ _MISSING = object()
 class _Coordinator(OneControlCoordinator):
     data_healthy = True
 
+    def async_add_listener(self, update_callback, context=None):
+        self._test_listeners.append(update_callback)
+        return lambda: self._test_listeners.remove(update_callback)
+
+    def async_update_listeners(self) -> None:
+        for listener in list(self._test_listeners):
+            listener()
+
 
 def make_coordinator() -> OneControlCoordinator:
     c = object.__new__(_Coordinator)
@@ -232,6 +240,11 @@ def make_coordinator() -> OneControlCoordinator:
     c.observed_hvac_capability, c._last_dtc_codes = {}, {}
     c.hass = None
     c.entry = SimpleNamespace(entry_id="e1")
+    c._test_listeners = []
+    c.bonded_adapters = {}
+    c.connection_source = None
+    c.fallback_source = None
+    c._pinned_sources = frozenset()
     c.live_legacy_unique_ids = set()
     c._can_ble_confirmed = False
     c._event_callbacks = []
@@ -257,7 +270,12 @@ class Rig:
         self.registry = registry or FakeRegistry()
         self.coordinator = make_coordinator()
         self.platforms = {m: Platform(self.registry, m) for m in PLATFORM_MODULES}
-        entry = SimpleNamespace(entry_id="e1", data={"address": ADDRESS}, options={})
+        entry = SimpleNamespace(
+            entry_id="e1",
+            data={"address": ADDRESS},
+            options={},
+            async_on_unload=lambda remove: None,
+        )
         hass = SimpleNamespace(data={PLATFORM_DOMAIN: {"e1": self.coordinator}})
         entity_module = sys.modules["custom_components.ha_onecontrol.entity"]
         entity_module.er.async_get = lambda _hass: self.registry
@@ -751,3 +769,41 @@ def test_real_metadata_frames_build_identities() -> None:
     assert notices == [MetadataCommitted(table_id=0xDC)]
     assert c.device_entity_ready(0xDC, 0x09) is True
     assert c.entity_identity(0xDC, 0x09) == "fn0005_00"
+
+
+# ── Bonded adapter diagnostic sensor ──────────────────────────────────
+
+
+def _bonded_sensors(rig: "Rig") -> list:
+    return [
+        entity
+        for uid, entity in rig.platforms["sensor"].loaded.items()
+        if uid.endswith("_bonded_adapter")
+    ]
+
+
+def test_bonded_adapter_sensor_only_for_gateways_that_pair(platforms) -> None:
+    rig = Rig(platforms)
+
+    rig.coordinator.async_update_listeners()
+
+    assert _bonded_sensors(rig) == []
+
+
+def test_bonded_adapter_sensor_appears_once_a_bond_is_known(platforms) -> None:
+    rig = Rig(platforms)
+    coordinator = rig.coordinator
+    coordinator.bonded_adapters = {"00:01:95:CC:53:88": "hci0"}
+    coordinator.connection_source = "00:01:95:CC:53:88"
+    coordinator._pinned_sources = frozenset({"000195CC5388"})
+
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+
+    (sensor,) = _bonded_sensors(rig)
+    assert sensor.native_value == "00:01:95:CC:53:88"
+    assert sensor.available is True
+    attributes = sensor.extra_state_attributes
+    assert attributes["adapters"] == {"00:01:95:CC:53:88": "hci0"}
+    assert attributes["connected_through"] == "00:01:95:CC:53:88"
+    assert attributes["fallback_source"] is None
