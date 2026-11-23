@@ -77,6 +77,34 @@ def _describe(candidate: Any) -> str:
     return f"{name} (RSSI {rssi})"
 
 
+def stock_choice(candidates: list[Any]) -> Any | None:
+    """Return the candidate Home Assistant's own ranking would try first.
+
+    Mirrors habluetooth's ordering (signal strength, then its connection-path
+    score, which penalises busy adapters, recent failures and full slots).
+    Only used to log whether the pin changed the outcome; returns None if the
+    candidates do not offer that scoring.
+    """
+    try:
+        ranked = sorted(
+            candidates,
+            key=lambda c: getattr(c.advertisement, "rssi", None) or NO_RSSI,
+            reverse=True,
+        )
+        if len(ranked) > 1:
+            rssi_diff = (ranked[0].advertisement.rssi or NO_RSSI) - (
+                ranked[1].advertisement.rssi or NO_RSSI
+            )
+            ranked = sorted(
+                ranked,
+                key=lambda c: c.score_connection_path(rssi_diff),
+                reverse=True,
+            )
+        return ranked[0] if ranked else None
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+
+
 def _make_pinned_client_class(base: type) -> type:
     """Build the pinned client as a subclass of Home Assistant's wrapper *base*."""
 
@@ -112,18 +140,24 @@ def _make_pinned_client_class(base: type) -> type:
             candidates = list(manager.async_scanner_devices_by_address(address, True))
             usable = pinned_candidates(candidates, self._oc_pinned)
             others = [c for c in candidates if c not in usable]
+            stock = stock_choice(candidates)
             for candidate in usable:
                 backend = getattr(self, _BACKEND_METHOD)(
                     manager, candidate.scanner, candidate.ble_device
                 )
                 if backend is not None:
                     _LOGGER.info(
-                        "%s: connecting through %s, the adapter holding the bond%s",
+                        "%s: connecting through %s, the adapter holding the bond%s%s",
                         address,
                         _describe(candidate),
                         (
                             "; not using " + ", ".join(_describe(c) for c in others)
                             if others
+                            else ""
+                        ),
+                        (
+                            f" (Home Assistant would have used {_describe(stock)})"
+                            if stock is not None and stock is not candidate
                             else ""
                         ),
                     )

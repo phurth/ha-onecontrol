@@ -113,6 +113,33 @@ def test_second_bonded_adapter_is_used_when_the_first_has_no_slot() -> None:
     assert client._async_get_best_available_backend_and_device(manager) == f"backend via {second}"
 
 
+def _scored(source: str, rssi: int, score: float):
+    candidate = _candidate(source, rssi)
+    candidate.score_connection_path = lambda rssi_diff: score
+    return candidate
+
+
+def test_stock_choice_follows_home_assistants_score() -> None:
+    """A busy local adapter loses to a weaker proxy in Home Assistant's ranking."""
+    busy_local = _scored(BONDED, -43, score=-66.2)
+    proxy = _scored(PROXY, -66, score=-66.0)
+
+    assert ble_pinning.stock_choice([busy_local, proxy]) is proxy
+
+
+def test_stock_choice_is_none_without_scoring() -> None:
+    assert ble_pinning.stock_choice([_candidate(BONDED, -40), _candidate(PROXY, -60)]) is None
+
+
+def test_log_names_the_path_home_assistant_would_have_used(caplog) -> None:
+    caplog.set_level("INFO")
+    manager = _Manager(_scored(BONDED, -43, score=-66.2), _scored(PROXY, -66, score=-66.0))
+    client = PinnedClient(GATEWAY, pinned_sources={BONDED})
+
+    assert client._async_get_best_available_backend_and_device(manager) == f"backend via {BONDED}"
+    assert f"Home Assistant would have used {PROXY}" in caplog.text
+
+
 def test_pinned_adapter_not_hearing_the_device_is_refused() -> None:
     client = PinnedClient(GATEWAY, pinned_sources={BONDED})
 
