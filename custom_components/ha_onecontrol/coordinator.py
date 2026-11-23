@@ -36,9 +36,16 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .helpers import is_valid_device_id
+from .ble_pinning import (
+    PinnedAdapterUnavailable,
+    connection_path,
+    path_matches_pin,
+    pinned_client_class,
+)
 from .ble_agent import (
     PinAgentContext,
     async_get_bonded_adapter_macs,
+    async_get_bonded_device_paths,
     async_get_local_adapter_macs,
     async_is_locally_bonded,
     is_pin_pairing_supported,
@@ -161,6 +168,21 @@ def _is_insufficient_auth(exc: Exception) -> bool:
 
 def _normalize_source(source: str) -> str:
     return source.upper().replace(":", "")
+
+
+def _is_pin_refusal(exc: BaseException | None) -> bool:
+    """True if *exc*, or an exception it wraps, is a pinned-adapter refusal.
+
+    bleak-retry-connector re-raises connect failures as its own exception
+    types (``raise … from exc``), so the cause chain has to be walked.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, PinnedAdapterUnavailable):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _pick_local_candidate(
@@ -480,6 +502,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # None when routed through a proxy.  Bond checks, pairing and bond
         # removal are scoped to it — BlueZ keeps bonds per adapter.
         self._connect_adapter: str | None = None
+        # Adapter(s) holding the gateway's BlueZ bond, as normalized MACs and as
+        # BlueZ device paths.  When set, connections go only through them
+        # (see ble_pinning.py).  Refreshed on every connect attempt.
+        self._pinned_sources: frozenset[str] = frozenset()
+        self._pinned_device_paths: frozenset[str] = frozenset()
+        # True when the last connect failed only because the bonded adapter
+        # could not take it.  That says nothing about the bond itself, so it
+        # must not count toward stale-bond removal.
+        self._pin_refused = False
 
         self._client: BleakClient | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
@@ -2377,6 +2408,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
             try:
                 await self._try_connect(attempt)
+                self._pin_refused = False
                 return
             except Exception as exc:
                 last_exc = exc
@@ -2402,6 +2434,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if self._closed:
             return
+
+        # Every attempt was refused because the adapter holding the bond could
+        # not take the connection (not hearing the gateway, or no free slot).
+        # That says nothing about the bond, and the fallbacks below would only
+        # try paths that cannot authenticate (or pair on another adapter), so
+        # just let the reconnect backoff try again.
+        self._pin_refused = _is_pin_refusal(last_exc)
+        if self._pin_refused:
+            _LOGGER.warning(
+                "Could not connect to %s through the adapter holding its bond; "
+                "will retry: %s",
+                self.address, last_exc,
+            )
+            raise last_exc
 
         # Stale bond detection: if BlueZ reported "already bonded" at any point
         # this session but all connection attempts still failed, the bond is stale
@@ -2449,6 +2495,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "Re-pair attempt after stale bond removal failed for %s: %s",
                         self.address, stale_exc,
                     )
+
+        # A bonded gateway is already pinned to the adapter holding its bond.
+        # The fallback below walks every local adapter — including ones without
+        # the bond, where it would attempt a pairing — and does not actually
+        # pin the path, so it can only make things worse here.
+        if self._pinned_sources:
+            raise last_exc
 
         # All HA-routed attempts failed — try direct HCI adapters as fallback.
         # This handles the case where the ESPHome BT proxy has no free slots
@@ -2527,17 +2580,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connect_adapter = None
         bonded_source: str | None = self.entry.options.get(CONF_BONDED_SOURCE)
 
+        candidates_known = True
         try:
             candidates = bluetooth.async_scanner_devices_by_address(
                 self.hass, self.address, connectable=True
             )
         except Exception:  # API unavailable on this HA version
             candidates = []
+            candidates_known = False
 
         # Check whether BlueZ holds a local bond for this device.  If so,
         # prefer a local HCI adapter scanner over any proxy — the LTK is only
         # usable via the local radio, and only via the adapter that holds it.
-        bonded_macs = await async_get_bonded_adapter_macs(self.address)
+        bonded_paths = await async_get_bonded_device_paths(self.address)
+        bonded_macs = set(bonded_paths)
         locally_bonded = bool(bonded_macs)
         local_macs = await async_get_local_adapter_macs()
         candidate_sources = [c.scanner.source for c in candidates]
@@ -2546,6 +2602,36 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "candidate_sources=%s",
             self.address, locally_bonded, bonded_macs, local_macs, candidate_sources,
         )
+
+        # ── Pin a bonded gateway to the adapter holding its bond ─────────────
+        # Home Assistant routes every connection itself and ignores which
+        # adapter's BLEDevice we pass in, so preferring an adapter below does
+        # not decide the path.  A bonded link only authenticates through the
+        # adapter that holds the bond: any other adapter or proxy fails with
+        # insufficient authentication (or, on a second local adapter, can hang
+        # a GATT read).  The pinned client restricts Home Assistant's choice to
+        # the bonded adapter(s); see ble_pinning.py.
+        self._pinned_sources = frozenset(_normalize_source(m) for m in bonded_macs)
+        self._pinned_device_paths = frozenset(bonded_paths.values())
+        pinned_cls = pinned_client_class() if self._pinned_sources else None
+        if self._pinned_sources:
+            pinned_text = ", ".join(sorted(bonded_macs))
+            if candidates_known and not any(
+                _normalize_source(c.scanner.source) in self._pinned_sources
+                for c in candidates
+            ):
+                raise PinnedAdapterUnavailable(
+                    f"{self.address}: the adapter holding the bond ({pinned_text}) "
+                    "has not heard the gateway recently; not connecting through "
+                    "another adapter or proxy, which cannot authenticate"
+                )
+            _LOGGER.info(
+                "Connecting to %s only through the adapter holding its bond (%s)%s",
+                self.address,
+                pinned_text,
+                "" if pinned_cls else " — pinning unavailable on this Home "
+                "Assistant version, will check the path after connecting",
+            )
 
         # ── PIN gateways must always use a local HCI adapter ────────────────
         # BlueZ D-Bus pairing (required for PIN/passkey exchange) does not work
@@ -2560,9 +2646,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 device = _pin_local.ble_device
                 self._current_connect_source = _pin_local.scanner.source
                 _LOGGER.info(
-                    "PIN gateway %s: forcing local HCI adapter %s "
+                    "PIN gateway %s: %s local HCI adapter %s "
                     "(proxy pairing unsupported)",
-                    self.address, self._current_connect_source,
+                    self.address,
+                    "pinned to" if self._pinned_sources else "preferring",
+                    self._current_connect_source,
                 )
             else:
                 _LOGGER.warning(
@@ -2733,12 +2821,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("D-Bus not available — skipping pre-pairing")
 
         try:
+            pin_kwargs: dict[str, Any] = (
+                {"pinned_sources": self._pinned_sources} if pinned_cls else {}
+            )
             client = await establish_connection(
-                BleakClient,
+                pinned_cls or BleakClient,
                 device,
                 self.address,
                 disconnected_callback=self._on_disconnect,
+                **pin_kwargs,
             )
+            await self._check_connection_path(client)
             await self._finish_connect(client)
         except Exception:
             # Ensure PIN agent is cleaned up if we never reach _finish_connect
@@ -2746,6 +2839,56 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._pin_agent_ctx.cleanup()
                 self._pin_agent_ctx = None
             raise
+
+    async def _check_connection_path(self, client: BleakClient) -> None:
+        """Record which path the link really took; refuse one that bypassed the pin.
+
+        Home Assistant picks the path at connect time, so this is the first
+        point where it is known.  The pinned client should never land elsewhere;
+        this check catches a Home Assistant version where the pin no longer
+        takes effect, before an unauthenticated link reaches authentication.
+        """
+        path = connection_path(client)
+        if path.source:
+            self._current_connect_source = path.source
+            # BlueZ bond checks and pairing below must target the adapter that
+            # actually carries the link (none for a proxy).
+            self._connect_adapter = path.source if path.device_path else None
+        if not self._pinned_sources:
+            _LOGGER.debug("Connected to %s through %s", self.address, path.describe())
+            return
+        match = path_matches_pin(path, self._pinned_sources, self._pinned_device_paths)
+        if match is None:
+            _LOGGER.debug(
+                "Connected to %s; could not tell which adapter carries the link",
+                self.address,
+            )
+            return
+        if match:
+            _LOGGER.info(
+                "Connected to %s through %s, the adapter holding its bond",
+                self.address, path.describe(),
+            )
+            return
+        _LOGGER.warning(
+            "Connected to %s through %s, which does not hold the bond — "
+            "disconnecting and retrying through the bonded adapter",
+            self.address, path.describe(),
+        )
+        # A deliberate drop must not also schedule a reconnect: the connect
+        # ladder that called us retries on its own.
+        try:
+            client.set_disconnected_callback(None)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await asyncio.wait_for(client.disconnect(), _STALLED_DISCONNECT_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            pass
+        raise PinnedAdapterUnavailable(
+            f"{self.address}: Home Assistant connected through {path.describe()}, "
+            "not the adapter holding the bond"
+        )
 
     async def _try_connect_direct(self, adapter: str) -> None:
         """Connect directly via a local HCI adapter, bypassing HA routing.
@@ -6063,9 +6206,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return  # Already reconnected by another path
 
             # For PIN gateways, remove stale bond after 3 consecutive failures
-            # (suggests the bond keys are out of sync with the gateway)
+            # (suggests the bond keys are out of sync with the gateway).  Not
+            # when the last failure was only the bonded adapter being unable to
+            # take the connection — that is no evidence against the bond.
             if (
                 self.is_pin_gateway
+                and not self._pin_refused
                 and self._consecutive_failures >= 3
                 and self._consecutive_failures % 3 == 0
             ):

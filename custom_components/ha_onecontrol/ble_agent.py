@@ -852,8 +852,13 @@ def _device_path_in(
 
 def _bonded_adapter_macs_in(objects: dict, address: str) -> set[str]:
     """Return the MACs of the adapters whose device object for *address* is paired."""
+    return set(_bonded_device_paths_in(objects, address))
+
+
+def _bonded_device_paths_in(objects: dict, address: str) -> dict[str, str]:
+    """Map each adapter MAC holding a bond for *address* to its device object path."""
     mac_suffix = address.upper().replace(":", "_")
-    macs: set[str] = set()
+    paths: dict[str, str] = {}
     for path_str, interfaces in objects.items():
         path = str(path_str)
         if mac_suffix not in path or DEVICE_IFACE not in interfaces:
@@ -863,8 +868,34 @@ def _bonded_adapter_macs_in(objects: dict, address: str) -> set[str]:
         adapter_ifaces = objects.get(path.rsplit("/", 1)[0], {})
         addr = _unwrap(adapter_ifaces.get(ADAPTER_IFACE, {}).get("Address"))
         if addr is not None:
-            macs.add(str(addr).upper())
-    return macs
+            paths[str(addr).upper()] = path
+    return paths
+
+
+async def async_get_bonded_device_paths(device_address: str) -> dict[str, str]:
+    """Return ``{adapter MAC: BlueZ device path}`` for each adapter bonded to *device_address*.
+
+    The device path (``/org/bluez/hciN/dev_…``) is what a connection through
+    that adapter uses, so it identifies the adapter a link really went through.
+    Returns an empty dict if D-Bus is unavailable or on any error.
+    """
+    if not _DBUS_AVAILABLE:
+        return {}
+
+    from dbus_fast import BusType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            return _bonded_device_paths_in(await _managed_objects(bus), device_address)
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        _LOGGER.debug(
+            "async_get_bonded_device_paths(%s) failed: %s", device_address, exc
+        )
+        return {}
 
 
 async def _managed_objects(bus: Any) -> dict:
