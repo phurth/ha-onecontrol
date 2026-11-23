@@ -226,6 +226,16 @@ _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
 # Upper bound on disconnect() when the heartbeat drops a stalled link; past it
 # the coordinator tears down without waiting for BlueZ.
 _STALLED_DISCONNECT_TIMEOUT_S = 10.0
+# Upper bound on everything after the radio link is up: path check, MTU,
+# authentication reads/writes, pairing and notification setup.  A GATT call
+# that never returns (seen when a gateway drops an unencrypted link mid-read)
+# would otherwise hold _connect_lock for good and block every reconnect.
+# Generous, because PIN bonding can legitimately take a while.
+_FINISH_CONNECT_TIMEOUT_S = 90.0
+# A MyRvLink link that has produced no frame at all this long after connecting
+# is dropped and retried; nothing else would notice it (the heartbeat only
+# starts once the gateway has answered).
+_FIRST_FRAME_TIMEOUT_S = 60.0
 
 # Seconds to wait after metadata loads before seeding entities for silent
 # (always-off) devices.  Lets the initial BLE event burst settle first.
@@ -649,6 +659,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── Data freshness tracking ──────────────────────────────────
         self._last_event_time: float = 0.0  # monotonic timestamp
+        # Monotonic time of the last frame actually received from the gateway
+        # (unlike _last_event_time, not set by authentication).
+        self._last_frame_time: float = 0.0
 
         # ── DTC fault deduplication ──────────────────────────────────
         self._last_dtc_codes: dict[str, int] = {}  # key → last known dtc_code
@@ -2102,6 +2115,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._start_heartbeat()
         except asyncio.CancelledError:
             raise
+        except Exception as exc:  # noqa: BLE001
+            # A failed write here used to end the task before the heartbeat
+            # started, leaving a "connected" link nothing would ever check.
+            _LOGGER.warning(
+                "Startup queries for table %d failed (%s) — dropping the link to retry",
+                table_id,
+                exc,
+            )
+            self.hass.async_create_task(self._drop_stalled_link(self._client))
         finally:
             if self._startup_bootstrap_table_id == table_id:
                 self._startup_bootstrap_task = None
@@ -2428,7 +2450,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if self._client:
                     try:
-                        await self._client.disconnect()
+                        await asyncio.wait_for(
+                            self._client.disconnect(), _STALLED_DISCONNECT_TIMEOUT_S
+                        )
                     except Exception:
                         pass
                     self._client = None
@@ -2875,13 +2899,35 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 disconnected_callback=self._on_disconnect,
                 **pin_kwargs,
             )
-            await self._check_connection_path(client)
-            await self._finish_connect(client)
+            await self._complete_connect(client)
         except Exception:
             # Ensure PIN agent is cleaned up if we never reach _finish_connect
             if self._pin_agent_ctx:
                 await self._pin_agent_ctx.cleanup()
                 self._pin_agent_ctx = None
+            raise
+
+    async def _complete_connect(self, client: BleakClient) -> None:
+        """Check the path and finish connecting, within _FINISH_CONNECT_TIMEOUT_S.
+
+        On timeout the link is dropped and TimeoutError propagates, so the
+        connect ladder retries instead of waiting forever on a GATT call.
+        """
+        try:
+            async with asyncio.timeout(_FINISH_CONNECT_TIMEOUT_S):
+                await self._check_connection_path(client)
+                await self._finish_connect(client)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Connecting to %s stalled: a Bluetooth operation did not return "
+                "within %.0fs of the link coming up — dropping the link and retrying",
+                self.address,
+                _FINISH_CONNECT_TIMEOUT_S,
+            )
+            try:
+                await asyncio.wait_for(client.disconnect(), _STALLED_DISCONNECT_TIMEOUT_S)
+            except Exception:  # noqa: BLE001
+                pass
             raise
 
     async def _check_connection_path(self, client: BleakClient) -> None:
@@ -3319,6 +3365,34 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         CONF_BONDED_SOURCE: self._current_connect_source,
                     },
                 )
+
+        # MyRvLink: make sure the gateway actually talks on this link.  The
+        # CAN BLE path has its own keepalive with stall detection.
+        if not self._is_can_ble:
+            self.hass.async_create_background_task(
+                self._first_frame_watchdog(client, time.monotonic()),
+                f"ha_onecontrol_first_frame_{self._instance_tag}",
+            )
+
+    async def _first_frame_watchdog(self, client: BleakClient, started: float) -> None:
+        """Drop a link that has produced no frame _FIRST_FRAME_TIMEOUT_S after connecting.
+
+        The heartbeat (the only other stale-data check) starts only after the
+        gateway has answered, so a link whose notifications never arrive would
+        otherwise sit "connected" with every entity unavailable until restart.
+        """
+        await asyncio.sleep(_FIRST_FRAME_TIMEOUT_S)
+        if self._closed or self._client is not client or not self._connected:
+            return
+        if self._last_frame_time >= started:
+            return
+        _LOGGER.warning(
+            "No data from %s within %.0fs of connecting — dropping the link and "
+            "reconnecting",
+            self.address,
+            _FIRST_FRAME_TIMEOUT_S,
+        )
+        await self._drop_stalled_link(client)
 
     async def _discover_services(
         self,
@@ -5187,17 +5261,25 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _enable_notifications(self, client: BleakClient) -> None:
-        """Subscribe to DATA_READ and SEED characteristics."""
+        """Subscribe to DATA_READ and SEED characteristics.
+
+        Without DATA_READ nothing ever arrives (no GatewayInformation, so no
+        bootstrap and no heartbeat), and PIN gateways cannot authenticate
+        without SEED.  Those failures fail the connect attempt so it is
+        retried, rather than leaving a connected link that never recovers.
+        """
         try:
             await client.start_notify(DATA_READ_CHAR_UUID, self._on_data_read)
             _LOGGER.warning("Subscribed to DATA_READ (0x0034)")
         except BleakError as exc:
-            _LOGGER.warning("Failed to subscribe DATA_READ: %s", exc)
+            raise BleakError(f"Failed to subscribe DATA_READ: {exc}") from exc
 
         try:
             await client.start_notify(SEED_CHAR_UUID, self._on_seed_notification)
             _LOGGER.warning("Subscribed to SEED (0x0011)")
         except BleakError as exc:
+            if self.is_pin_gateway:
+                raise BleakError(f"Failed to subscribe SEED: {exc}") from exc
             _LOGGER.warning("Failed to subscribe SEED: %s", exc)
 
     async def _async_has_proven_bond(self) -> bool:
@@ -5535,6 +5617,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Track data freshness
         self._last_event_time = time.monotonic()
+        self._last_frame_time = self._last_event_time
 
         event_type = frame[0]
 
