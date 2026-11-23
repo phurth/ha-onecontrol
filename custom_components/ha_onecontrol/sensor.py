@@ -332,7 +332,7 @@ class OneControlBondedAdapterSensor(_OneControlSensorBase):
     """Local Bluetooth adapter holding the gateway's bond (gateways that pair).
 
     BlueZ keeps a bond per adapter, and only that adapter can authenticate
-    with the gateway, so connections are pinned to it (see ble_pinning.py).
+    with the gateway, so connections are pinned to it (see the ha-ble-pinning library).
     The state is the adapter's MAC address; the hciN name can change between
     boots, so it is an attribute.
     """

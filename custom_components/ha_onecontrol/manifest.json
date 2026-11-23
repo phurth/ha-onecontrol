@@ -28,7 +28,8 @@
   "issue_tracker": "https://github.com/phurth/ha-onecontrol/issues",
   "requirements": [
     "bleak>=0.21.0",
-    "bleak-retry-connector>=3.1.0"
+    "bleak-retry-connector>=3.1.0",
+    "ha-ble-pinning==0.1.0"
   ],
-  "version": "1.0.58"
+  "version": "1.0.59"
 }

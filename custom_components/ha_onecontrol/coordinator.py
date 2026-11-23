@@ -36,7 +36,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .helpers import is_valid_device_id
-from .ble_pinning import (
+from ha_ble_pinning import (
     PinnedAdapterUnavailable,
     connection_path,
     path_matches_pin,
@@ -504,7 +504,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connect_adapter: str | None = None
         # Adapter(s) holding the gateway's BlueZ bond, as normalized MACs and as
         # BlueZ device paths.  When set, connections go only through them
-        # (see ble_pinning.py).  Refreshed on every connect attempt.
+        # (see the ha-ble-pinning library).  Refreshed on every connect attempt.
         self._pinned_sources: frozenset[str] = frozenset()
         self._pinned_device_paths: frozenset[str] = frozenset()
         # A proxy that authenticated before (it holds its own bond); allowed
@@ -2625,7 +2625,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # adapter that holds the bond: any other adapter or proxy fails with
         # insufficient authentication (or, on a second local adapter, can hang
         # a GATT read).  The pinned client restricts Home Assistant's choice to
-        # the bonded adapter(s); see ble_pinning.py.
+        # the bonded adapter(s); see the ha-ble-pinning library.
         self._pinned_sources = frozenset(_normalize_source(m) for m in bonded_macs)
         self._pinned_device_paths = frozenset(bonded_paths.values())
         bonded_adapters = {

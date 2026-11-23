@@ -32,8 +32,8 @@ from custom_components.ha_onecontrol.protocol.events import (
     TankLevel,
 )
 
-ADDRESS = "24:DC:C3:ED:27:66"
-MAC = "24dcc3ed2766"
+ADDRESS = "AA:BB:CC:DD:EE:02"
+MAC = "aabbccddee02"
 PLATFORM_DOMAIN = "ha_onecontrol"
 
 # (function_name, function_instance, kind, friendly name) by row order.
@@ -793,17 +793,17 @@ def test_bonded_adapter_sensor_only_for_gateways_that_pair(platforms) -> None:
 def test_bonded_adapter_sensor_appears_once_a_bond_is_known(platforms) -> None:
     rig = Rig(platforms)
     coordinator = rig.coordinator
-    coordinator.bonded_adapters = {"00:01:95:CC:53:88": "hci0"}
-    coordinator.connection_source = "00:01:95:CC:53:88"
-    coordinator._pinned_sources = frozenset({"000195CC5388"})
+    coordinator.bonded_adapters = {"11:11:11:11:11:11": "hci0"}
+    coordinator.connection_source = "11:11:11:11:11:11"
+    coordinator._pinned_sources = frozenset({"111111111111"})
 
     coordinator.async_update_listeners()
     coordinator.async_update_listeners()
 
     (sensor,) = _bonded_sensors(rig)
-    assert sensor.native_value == "00:01:95:CC:53:88"
+    assert sensor.native_value == "11:11:11:11:11:11"
     assert sensor.available is True
     attributes = sensor.extra_state_attributes
-    assert attributes["adapters"] == {"00:01:95:CC:53:88": "hci0"}
-    assert attributes["connected_through"] == "00:01:95:CC:53:88"
+    assert attributes["adapters"] == {"11:11:11:11:11:11": "hci0"}
+    assert attributes["connected_through"] == "11:11:11:11:11:11"
     assert attributes["fallback_source"] is None

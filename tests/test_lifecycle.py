@@ -312,17 +312,17 @@ def _reload_hass(entry):
 
 
 def test_bonded_source_write_does_not_reload() -> None:
-    entry = _entry({CONF_BONDED_SOURCE: "A0:AD:9F:71:28:58"})
+    entry = _entry({CONF_BONDED_SOURCE: "22:22:22:22:22:22"})
     hass, reloads = _reload_hass(entry)
 
-    entry.options = {CONF_BONDED_SOURCE: "3C:3B:AD:78:01:B3"}
+    entry.options = {CONF_BONDED_SOURCE: "11:11:11:11:11:11"}
     asyncio.run(integration._async_update_listener(hass, entry))
 
     assert reloads == []
 
 
 def test_user_option_change_still_reloads() -> None:
-    entry = _entry({CONF_BONDED_SOURCE: "A0:AD:9F:71:28:58"})
+    entry = _entry({CONF_BONDED_SOURCE: "22:22:22:22:22:22"})
     hass, reloads = _reload_hass(entry)
 
     entry.options = {**entry.options, CONF_ENABLE_COVER_CONTROL: True}
